@@ -196,6 +196,7 @@ class CostModule:
             session_id,
             tokens=input_tokens + output_tokens,
             usd=usd,
+            model=model,
         )
 
     async def track(
@@ -205,6 +206,7 @@ class CostModule:
         *,
         tokens: int = 0,
         usd: float = 0.0,
+        model: str | None = None,
     ) -> None:
         """Record post-call usage. NEVER raises.
 
@@ -223,7 +225,7 @@ class CostModule:
             return
         try:
             await self._store.track(
-                agent_id, session_id, tokens=tokens, usd=usd
+                agent_id, session_id, tokens=tokens, usd=usd, model=model,
             )
         except Exception as exc:  # noqa: BLE001 - non-breaking guarantee
             logger.error(
@@ -232,6 +234,25 @@ class CostModule:
                 agent_id=agent_id,
                 session_id=str(session_id),
             )
+
+    async def model_breakdown(self, agent_id: str) -> dict[str, dict[str, float]]:
+        """Return per-model usage for today.
+
+        Returns ``{model: {"usd": X, "tokens": Y}}`` for the given agent.
+        Defensive: if storage fails, returns empty dict and logs the error.
+        """
+        try:
+            if hasattr(self._store, "get_model_breakdown"):
+                result: dict[str, dict[str, float]] = await self._store.get_model_breakdown(agent_id)
+                return result
+            return {}
+        except Exception as exc:
+            logger.error(
+                "cost.model_breakdown_failed",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+            )
+            return {}
 
     async def check_or_raise(
         self,

@@ -30,6 +30,7 @@ class CostStore(ABC):
         *,
         tokens: int,
         usd: float,
+        model: str | None = None,
     ) -> None:
         """Atomically add ``tokens`` and ``usd`` to the session AND daily counters.
 
@@ -61,6 +62,15 @@ class CostStore(ABC):
         """Return the timestamp of the first track() call for this session, or None."""
         return None
 
+    async def get_model_breakdown(
+        self, agent_id: str
+    ) -> dict[str, dict[str, float]]:
+        """Return per-model daily usage for today: {model: {usd: X, tokens: Y}}.
+
+        Returns an empty dict if this backend does not support model tracking.
+        """
+        return {}
+
     async def close(self) -> None:
         """Release resources. Override if needed."""
         return None
@@ -73,6 +83,8 @@ class InMemoryCostStore(CostStore):
         self._session_usage: dict[tuple[str, UUID], tuple[float, int]] = {}
         self._session_started: dict[tuple[str, UUID], datetime] = {}
         self._agent_daily: dict[str, tuple[float, int, datetime]] = {}
+        # Per-model usage: {(agent_id, model): (usd, tokens, day)}
+        self._model_usage: dict[tuple[str, str], tuple[float, int, datetime]] = {}
         self._lock = asyncio.Lock()
 
     async def track(
@@ -82,6 +94,7 @@ class InMemoryCostStore(CostStore):
         *,
         tokens: int,
         usd: float,
+        model: str | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
         day = _utc_day_start(now)
@@ -98,6 +111,27 @@ class InMemoryCostStore(CostStore):
             if d_day < day:
                 d_usd, d_tok, d_day = 0.0, 0, day
             self._agent_daily[agent_id] = (d_usd + usd, d_tok + tokens, d_day)
+
+            # Track per-model usage
+            if model is not None:
+                mkey = (agent_id, model)
+                m_usd, m_tok, m_day = self._model_usage.get(mkey, (0.0, 0, day))
+                if m_day < day:
+                    m_usd, m_tok, m_day = 0.0, 0, day
+                self._model_usage[mkey] = (m_usd + usd, m_tok + tokens, m_day)
+
+    async def get_model_breakdown(
+        self, agent_id: str,
+    ) -> dict[str, dict[str, float]]:
+        """Return per-model usage for today: {model: {usd: X, tokens: Y}}."""
+        now = datetime.now(timezone.utc)
+        day = _utc_day_start(now)
+        result: dict[str, dict[str, float]] = {}
+        async with self._lock:
+            for (aid, model), (m_usd, m_tok, m_day) in self._model_usage.items():
+                if aid == agent_id and m_day >= day:
+                    result[model] = {"usd": m_usd, "tokens": float(m_tok)}
+        return result
 
     async def get_session_usage(
         self,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codeatelier-governance"
-version = "0.1.5"
+version = "0.3.0"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -83,6 +83,8 @@ include-package-data = true
 "codeatelier_governance.cost" = ["*.sql"]
 "codeatelier_governance.gates" = ["*.sql"]
 "codeatelier_governance.console" = ["*.sql"]
+"codeatelier_governance.loop" = ["*.sql"]
+"codeatelier_governance.presence" = ["*.sql"]
 
 [tool.ruff]
 line-length = 100

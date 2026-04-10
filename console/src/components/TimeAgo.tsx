@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 
-function formatRelative(iso: string): { text: string; style?: string } {
+function formatRelative(iso: string): { text: string } {
   const d = new Date(iso);
   const now = Date.now();
   const diff = now - d.getTime();
@@ -32,10 +32,14 @@ function formatRelative(iso: string): { text: string; style?: string } {
   return { text: `${days}d ago` };
 }
 
-export function TimeAgo({ iso, label }: { iso: string | null; label?: string }) {
-  const [display, setDisplay] = useState<{ text: string; style?: string }>({
-    text: "",
-  });
+export function TimeAgo({
+  iso,
+  label,
+}: {
+  iso: string | null;
+  label?: string;
+}) {
+  const [display, setDisplay] = useState<{ text: string }>({ text: "" });
 
   useEffect(() => {
     if (!iso) return;
@@ -44,11 +48,13 @@ export function TimeAgo({ iso, label }: { iso: string | null; label?: string }) 
     return () => clearInterval(interval);
   }, [iso]);
 
-  if (!iso) return <span className="text-[var(--muted)]">—</span>;
+  if (!iso) return <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>;
 
   return (
     <span title={new Date(iso).toLocaleString()} className="cursor-help">
-      {label && <span className="text-[var(--muted)]">{label} </span>}
+      {label && (
+        <span style={{ color: "var(--text-tertiary)" }}>{label} </span>
+      )}
       {display.text}
     </span>
   );

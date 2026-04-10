@@ -30,6 +30,8 @@ _DDL_FILES = [
     _PKG_ROOT / "cost" / "ddl.sql",
     _PKG_ROOT / "gates" / "ddl.sql",
     _PKG_ROOT / "console" / "ddl.sql",
+    _PKG_ROOT / "loop" / "ddl.sql",
+    _PKG_ROOT / "presence" / "ddl.sql",
 ]
 
 

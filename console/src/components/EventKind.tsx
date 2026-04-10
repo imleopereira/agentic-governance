@@ -1,24 +1,35 @@
 "use client";
 
-const KIND_COLORS: Record<string, string> = {
-  "llm.call": "text-blue-400",
-  "llm.result": "text-blue-300",
-  "llm.error": "text-red-400",
-  "tool.call": "text-purple-400",
-  "tool.result": "text-purple-300",
-  "tool.error": "text-red-400",
-  "scope.violation": "text-red-500 font-medium",
-  "budget.exceeded": "text-red-500 font-medium",
-  "budget.check_failed": "text-red-400",
-  "approval.requested": "text-yellow-400",
-  "approval.granted": "text-green-400",
-  "approval.denied": "text-red-400",
-  "chain.degraded_start": "text-orange-400",
-  "agent.start": "text-cyan-400",
-  "agent.end": "text-cyan-300",
+/**
+ * Color-coded event kind labels using the Code Atelier palette.
+ * Uses the violet accent for primary actions, semantic colors for outcomes.
+ */
+const KIND_STYLES: Record<string, { color: string; bold?: boolean }> = {
+  "llm.call": { color: "var(--accent-light)" },
+  "llm.result": { color: "var(--accent)" },
+  "llm.error": { color: "var(--danger)" },
+  "tool.call": { color: "#93C5D7" },  // brand cyan
+  "tool.result": { color: "#7BB3C7" },
+  "tool.error": { color: "var(--danger)" },
+  "scope.violation": { color: "var(--danger)", bold: true },
+  "budget.exceeded": { color: "var(--danger)", bold: true },
+  "budget.check_failed": { color: "var(--danger)" },
+  "approval.requested": { color: "var(--warn)" },
+  "approval.granted": { color: "var(--success)" },
+  "approval.denied": { color: "var(--danger)" },
+  "chain.degraded_start": { color: "#F97316" },
+  "agent.start": { color: "var(--accent-light)" },
+  "agent.end": { color: "var(--accent)" },
 };
 
 export function EventKind({ kind }: { kind: string }) {
-  const color = KIND_COLORS[kind] ?? "text-[var(--fg)]";
-  return <span className={color}>{kind}</span>;
+  const style = KIND_STYLES[kind];
+  return (
+    <span
+      className={`text-xs font-mono ${style?.bold ? "font-semibold" : ""}`}
+      style={{ color: style?.color ?? "var(--fg)" }}
+    >
+      {kind}
+    </span>
+  );
 }

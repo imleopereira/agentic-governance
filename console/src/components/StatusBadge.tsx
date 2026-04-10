@@ -1,15 +1,37 @@
 "use client";
 
 export function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    PASS: "bg-green-900/50 text-green-400 border-green-800",
-    WARN: "bg-yellow-900/50 text-yellow-400 border-yellow-800",
-    FAIL: "bg-red-900/50 text-red-400 border-red-800",
+  const styles: Record<string, { bg: string; color: string; border: string }> = {
+    PASS: {
+      bg: "rgba(34, 197, 94, 0.08)",
+      color: "var(--success)",
+      border: "rgba(34, 197, 94, 0.3)",
+    },
+    WARN: {
+      bg: "rgba(234, 179, 8, 0.08)",
+      color: "var(--warn)",
+      border: "rgba(234, 179, 8, 0.3)",
+    },
+    FAIL: {
+      bg: "rgba(239, 68, 68, 0.08)",
+      color: "var(--danger)",
+      border: "rgba(239, 68, 68, 0.3)",
+    },
   };
-  const cls = colors[status] ?? "bg-gray-900/50 text-gray-400 border-gray-800";
+  const s = styles[status] ?? {
+    bg: "rgba(255, 255, 255, 0.04)",
+    color: "var(--text-tertiary)",
+    border: "var(--border)",
+  };
   return (
     <span
-      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border ${cls}`}
+      className="inline-flex items-center px-2 py-0.5 text-xs font-medium border"
+      style={{
+        background: s.bg,
+        color: s.color,
+        borderColor: s.border,
+        borderRadius: "var(--radius-sm)",
+      }}
     >
       {status}
     </span>

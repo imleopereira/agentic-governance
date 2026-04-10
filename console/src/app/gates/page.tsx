@@ -31,7 +31,12 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   return (
     <button
       onClick={copy}
-      className="text-xs px-2 py-1 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition"
+      className="text-xs px-2 py-1 border transition-colors"
+      style={{
+        borderColor: copied ? "var(--accent)" : "var(--border)",
+        color: copied ? "var(--accent)" : "var(--text-tertiary)",
+        borderRadius: "var(--radius-sm)",
+      }}
     >
       {copied ? "Copied!" : label}
     </button>
@@ -59,7 +64,6 @@ function GateActionButtons({ requestId }: { requestId: string }) {
           error: null,
           success: `${result.resolution.charAt(0).toUpperCase() + result.resolution.slice(1)} successfully`,
         });
-        // Refetch pending and recent lists
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ["gates-pending"] }),
           queryClient.invalidateQueries({ queryKey: ["gates-recent"] }),
@@ -75,7 +79,7 @@ function GateActionButtons({ requestId }: { requestId: string }) {
 
   if (status.success) {
     return (
-      <span className="text-xs text-green-400 font-medium">
+      <span className="text-xs font-medium" style={{ color: "var(--success)" }}>
         {status.success}
       </span>
     );
@@ -87,20 +91,32 @@ function GateActionButtons({ requestId }: { requestId: string }) {
         <button
           onClick={() => handleAction("grant")}
           disabled={status.loading !== null}
-          className="text-xs px-3 py-1 rounded border border-green-700 bg-green-900/40 text-green-400 hover:bg-green-800/60 hover:border-green-600 disabled:opacity-50 transition font-medium"
+          className="text-xs px-3 py-1 border font-medium disabled:opacity-50 transition-colors"
+          style={{
+            borderColor: "rgba(34, 197, 94, 0.4)",
+            background: "rgba(34, 197, 94, 0.08)",
+            color: "var(--success)",
+            borderRadius: "var(--radius-sm)",
+          }}
         >
           {status.loading === "grant" ? "Granting..." : "Grant"}
         </button>
         <button
           onClick={() => handleAction("deny")}
           disabled={status.loading !== null}
-          className="text-xs px-3 py-1 rounded border border-red-700 bg-red-900/40 text-red-400 hover:bg-red-800/60 hover:border-red-600 disabled:opacity-50 transition font-medium"
+          className="text-xs px-3 py-1 border font-medium disabled:opacity-50 transition-colors"
+          style={{
+            borderColor: "rgba(239, 68, 68, 0.4)",
+            background: "rgba(239, 68, 68, 0.08)",
+            color: "var(--danger)",
+            borderRadius: "var(--radius-sm)",
+          }}
         >
           {status.loading === "deny" ? "Denying..." : "Deny"}
         </button>
       </div>
       {status.error && (
-        <span className="text-xs text-red-400 max-w-[200px] truncate" title={status.error}>
+        <span className="text-xs max-w-[200px] truncate" style={{ color: "var(--danger)" }} title={status.error}>
           {status.error}
         </span>
       )}
@@ -122,8 +138,8 @@ export default function GatesPage() {
     <div className="space-y-8">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold mb-1">Approval Gates</h1>
-          <p className="text-sm text-[var(--muted)]">
+          <h1 className="text-2xl font-bold tracking-tight mb-1">Approval Gates</h1>
+          <p className="text-sm" style={{ color: "var(--text-tertiary)" }}>
             Pending and recently resolved human-in-the-loop approvals.
           </p>
         </div>
@@ -134,7 +150,15 @@ export default function GatesPage() {
         <div className="flex items-center gap-2 mb-3">
           <h2 className="text-lg font-semibold">Pending Approvals</h2>
           {pending && pending.length > 0 && (
-            <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-900/50 text-yellow-400 border border-yellow-800">
+            <span
+              className="text-xs px-2 py-0.5 border font-medium"
+              style={{
+                background: "rgba(234, 179, 8, 0.1)",
+                borderColor: "rgba(234, 179, 8, 0.3)",
+                color: "var(--warn)",
+                borderRadius: "var(--radius-sm)",
+              }}
+            >
               {pending.length}
             </span>
           )}
@@ -145,9 +169,12 @@ export default function GatesPage() {
             <CardSkeleton />
           </div>
         ) : pending?.length === 0 ? (
-          <div className="text-center py-8 rounded-lg border border-dashed border-[var(--border)]">
-            <p className="text-[var(--muted)]">No pending approvals</p>
-            <p className="text-xs text-[var(--muted)] mt-1">
+          <div
+            className="text-center py-8 border border-dashed"
+            style={{ borderColor: "var(--border)", borderRadius: "var(--radius-md)" }}
+          >
+            <p style={{ color: "var(--text-tertiary)" }}>No pending approvals</p>
+            <p className="text-xs mt-1" style={{ color: "var(--text-tertiary)" }}>
               Agents requesting HITL approval will appear here.
             </p>
           </div>
@@ -156,7 +183,12 @@ export default function GatesPage() {
             {pending?.map((p) => (
               <div
                 key={p.request_id}
-                className="rounded-lg border border-yellow-800/50 bg-[var(--card)] p-4"
+                className="border p-4"
+                style={{
+                  borderColor: "rgba(234, 179, 8, 0.2)",
+                  background: "var(--card)",
+                  borderRadius: "var(--radius-md)",
+                }}
               >
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1">
@@ -164,12 +196,12 @@ export default function GatesPage() {
                       <p className="font-semibold text-sm">{p.kind}</p>
                       <StatusBadge status="WARN" />
                     </div>
-                    <p className="text-xs text-[var(--muted)]">
-                      Agent: <span className="text-[var(--fg)]">{p.agent_id}</span>
+                    <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
+                      Agent: <span style={{ color: "var(--fg)" }}>{p.agent_id}</span>
                       {" | "}
                       Request: <span className="font-mono">{p.request_id.slice(0, 12)}...</span>
                     </p>
-                    <p className="text-xs text-[var(--muted)] mt-1">
+                    <p className="text-xs mt-1" style={{ color: "var(--text-tertiary)" }}>
                       Created: <TimeAgo iso={p.created_at} />
                       {" | "}
                       Expires: <TimeAgo iso={p.expires_at} />
@@ -177,10 +209,7 @@ export default function GatesPage() {
                   </div>
                   <div className="flex flex-col gap-1.5 items-end">
                     <GateActionButtons requestId={p.request_id} />
-                    <CopyButton
-                      text={p.request_id}
-                      label="Copy request ID"
-                    />
+                    <CopyButton text={p.request_id} label="Copy request ID" />
                   </div>
                 </div>
               </div>
@@ -194,26 +223,30 @@ export default function GatesPage() {
         {recentLoading ? (
           <TableSkeleton rows={5} />
         ) : recent?.length === 0 ? (
-          <p className="text-[var(--muted)] text-center py-8">
-            No approvals resolved yet.
-          </p>
+          <div
+            className="text-center py-8 border border-dashed"
+            style={{ borderColor: "var(--border)", borderRadius: "var(--radius-md)" }}
+          >
+            <p style={{ color: "var(--text-tertiary)" }}>No approvals resolved yet.</p>
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-left text-[var(--muted)] border-b border-[var(--border)]">
-                  <th className="py-2 pr-3">Kind</th>
-                  <th className="py-2 pr-3">Agent</th>
-                  <th className="py-2 pr-3">Resolution</th>
-                  <th className="py-2 pr-3">Request ID</th>
-                  <th className="py-2 pr-3">Resolved</th>
+                <tr className="text-left border-b" style={{ borderColor: "var(--border)", color: "var(--text-tertiary)" }}>
+                  <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Kind</th>
+                  <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Agent</th>
+                  <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Resolution</th>
+                  <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Request ID</th>
+                  <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Resolved</th>
                 </tr>
               </thead>
               <tbody>
                 {recent?.map((g) => (
                   <tr
                     key={g.request_id}
-                    className="border-b border-[var(--border)] hover:bg-white/5 transition-colors"
+                    className="border-b hover:bg-white/[0.03] transition-colors"
+                    style={{ borderColor: "var(--border)" }}
                   >
                     <td className="py-2 pr-3">{g.kind}</td>
                     <td className="py-2 pr-3">{g.agent_id}</td>
@@ -225,7 +258,7 @@ export default function GatesPage() {
                     <td className="py-2 pr-3 font-mono text-xs">
                       {g.request_id.slice(0, 12)}...
                     </td>
-                    <td className="py-2 pr-3 text-xs text-[var(--muted)]">
+                    <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                       <TimeAgo iso={g.resolved_at} />
                     </td>
                   </tr>

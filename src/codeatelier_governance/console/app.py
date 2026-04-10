@@ -38,7 +38,7 @@ except ImportError as exc:
         "Install with: pip install codeatelier-governance[console]"
     ) from exc
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -213,19 +213,28 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 class LoginRequest(BaseModel):
     """Login request body."""
-    username: str
-    password: str
+
+    model_config = ConfigDict(strict=True)
+
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
 
 
 class CreateUserRequest(BaseModel):
     """Create user request body."""
-    username: str
-    password: str
+
+    model_config = ConfigDict(strict=True)
+
+    username: str = Field(max_length=256)
+    password: str = Field(max_length=1024)
     role: str = "viewer"
 
 
 class UpdateUserRequest(BaseModel):
     """Update user request body."""
+
+    model_config = ConfigDict(strict=True)
+
     role: str | None = None
     disabled: bool | None = None
 
@@ -1138,3 +1147,78 @@ async def governance_posture() -> dict[str, Any]:
         "agent_count": len(posture),
         "agents": posture,
     }
+
+
+@app.get("/api/cost/models", dependencies=[Depends(authenticate)])
+async def cost_model_breakdown(
+    agent_id: str | None = Query(None, min_length=1),
+) -> list[dict[str, Any]]:
+    """Per-model cost breakdown for today.
+
+    Returns rows from ``governance_cost_model_daily`` for the current UTC
+    day. Filter by ``agent_id`` when provided; returns all agents otherwise.
+    """
+    assert engine is not None
+    try:
+        clauses: list[str] = ["day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"]
+        params: dict[str, Any] = {}
+        if agent_id:
+            clauses.append("agent_id = :agent_id")
+            params["agent_id"] = agent_id
+        where_sql = " AND ".join(clauses)
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT agent_id, model, usd_used, tokens_used, last_updated "
+                    f"FROM governance_cost_model_daily WHERE {where_sql} "
+                    "ORDER BY usd_used DESC"
+                ),
+                params,
+            )
+            return [
+                {
+                    "agent_id": row["agent_id"],
+                    "model": row["model"],
+                    "usd_used_today": float(row["usd_used"]),
+                    "tokens_used_today": int(row["tokens_used"]),
+                    "last_updated": row["last_updated"].isoformat()
+                    if row["last_updated"]
+                    else None,
+                }
+                for row in res.mappings()
+            ]
+    except Exception:
+        # Table may not exist yet if migration hasn't been run
+        return []
+
+
+@app.get("/api/agents/presence", dependencies=[Depends(authenticate)])
+async def agent_presence() -> list[dict[str, Any]]:
+    """List all agents with their presence status."""
+    assert engine is not None
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT agent_id, status, last_heartbeat, started_at, metadata_json "
+                    "FROM governance_agent_presence "
+                    "ORDER BY agent_id"
+                )
+            )
+            return [
+                {
+                    "agent_id": row["agent_id"],
+                    "status": row["status"],
+                    "last_heartbeat": row["last_heartbeat"].isoformat()
+                    if row["last_heartbeat"]
+                    else None,
+                    "started_at": row["started_at"].isoformat()
+                    if row["started_at"]
+                    else None,
+                    "metadata": row["metadata_json"],
+                }
+                for row in res.mappings()
+            ]
+    except Exception:
+        # Table may not exist yet if migration hasn't been run
+        return []

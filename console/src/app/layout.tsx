@@ -1,7 +1,23 @@
 import type { Metadata } from "next";
+import { Inter, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
 import { WalkthroughProvider } from "@/components/Walkthrough";
+import { AppShell } from "@/components/AppShell";
+
+const inter = Inter({
+  variable: "--font-inter",
+  subsets: ["latin"],
+  weight: ["300", "400", "500", "600", "700"],
+  display: "swap",
+});
+
+const jetbrainsMono = JetBrains_Mono({
+  variable: "--font-jetbrains-mono",
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  display: "swap",
+});
 
 export const metadata: Metadata = {
   title: "Governance Console — Code Atelier",
@@ -14,47 +30,11 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
+    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
       <body className="min-h-screen">
         <Providers>
           <WalkthroughProvider>
-            <nav className="border-b border-[var(--border)] px-6 py-3 flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <span className="font-bold text-lg">Governance Console</span>
-                <span className="text-xs text-[var(--muted)]">v0.2.0</span>
-              </div>
-              <div className="flex gap-4 text-sm">
-                <a
-                  href="/"
-                  className="hover:text-[var(--accent)]"
-                  data-tour="posture"
-                >
-                  Posture
-                </a>
-                <a
-                  href="/events"
-                  className="hover:text-[var(--accent)]"
-                  data-tour="nav-events"
-                >
-                  Audit Log
-                </a>
-                <a
-                  href="/cost"
-                  className="hover:text-[var(--accent)]"
-                  data-tour="nav-cost"
-                >
-                  Cost
-                </a>
-                <a
-                  href="/gates"
-                  className="hover:text-[var(--accent)]"
-                  data-tour="nav-gates"
-                >
-                  Gates
-                </a>
-              </div>
-            </nav>
-            <main className="max-w-7xl mx-auto px-6 py-8">{children}</main>
+            <AppShell>{children}</AppShell>
           </WalkthroughProvider>
         </Providers>
       </body>

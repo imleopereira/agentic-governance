@@ -67,11 +67,18 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         agent_id: The agent identifier for audit and scope checks.
     """
 
-    def __init__(self, sdk: GovernanceSDK, agent_id: str, enforce: bool = False) -> None:
+    def __init__(
+        self,
+        sdk: "GovernanceSDK",
+        agent_id: str,
+        enforce: bool = False,
+        session_id: UUID | None = None,
+    ) -> None:
         super().__init__()
         self._sdk = sdk
         self._agent_id = agent_id
         self._enforce = enforce
+        self._session_id = session_id
 
     # -- helpers ---------------------------------------------------------------
 
@@ -108,6 +115,27 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.scope_check_failed",
+                tool=tool_name,
+                error_type=type(exc).__name__,
+            )
+
+    async def _loop_record(self, tool_name: str) -> None:
+        """Record a tool call for loop detection. Swallows all errors.
+
+        Only fires when a ``session_id`` was provided to the handler at
+        construction time.  Pass ``session_id=`` to GovernanceCallbackHandler
+        to enable per-session loop tracking.
+        """
+        if self._session_id is None:
+            return
+        loop_module = getattr(self._sdk, "loop", None)
+        if loop_module is None:
+            return
+        try:
+            await loop_module.record_call(self._agent_id, self._session_id, tool_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "governance.langchain_handler.loop_record_failed",
                 tool=tool_name,
                 error_type=type(exc).__name__,
             )
@@ -230,10 +258,11 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        """Called when a tool starts. Runs a scope check (non-blocking)."""
+        """Called when a tool starts. Runs a scope check and loop detection."""
         try:
             tool_name = serialized.get("name", "unknown")
             _run_async(self._scope_check(str(tool_name)))
+            _run_async(self._loop_record(str(tool_name)))
             _run_async(
                 self._audit_log("tool.call", {"tool": str(tool_name)})
             )
@@ -414,6 +443,7 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         try:
             tool_name = serialized.get("name", "unknown")
             await self._scope_check(str(tool_name))
+            await self._loop_record(str(tool_name))
             await self._audit_log("tool.call", {"tool": str(tool_name)})
         except ScopeViolation:
             if self._enforce:

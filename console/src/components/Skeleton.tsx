@@ -3,14 +3,25 @@
 export function Skeleton({ className = "" }: { className?: string }) {
   return (
     <div
-      className={`animate-pulse rounded bg-white/5 ${className}`}
+      className={`animate-pulse ${className}`}
+      style={{
+        background: "rgba(255, 255, 255, 0.04)",
+        borderRadius: "var(--radius-sm)",
+      }}
     />
   );
 }
 
 export function CardSkeleton() {
   return (
-    <div className="rounded-lg border border-[var(--border)] bg-[var(--card)] p-4 space-y-3">
+    <div
+      className="border p-4 space-y-3"
+      style={{
+        borderColor: "var(--border)",
+        background: "var(--card)",
+        borderRadius: "var(--radius-md)",
+      }}
+    >
       <div className="flex justify-between">
         <Skeleton className="h-4 w-32" />
         <Skeleton className="h-4 w-16" />

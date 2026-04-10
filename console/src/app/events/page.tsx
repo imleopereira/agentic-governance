@@ -28,7 +28,8 @@ function VerifyButton({ sessionId }: { sessionId: string }) {
   if (result) {
     return (
       <span
-        className={`text-xs font-medium ${result.verified ? "text-green-400" : "text-red-400"}`}
+        className="text-xs font-medium"
+        style={{ color: result.verified ? "var(--success)" : "var(--danger)" }}
       >
         {result.verified
           ? `Chain verified (${result.event_count} events)`
@@ -42,7 +43,12 @@ function VerifyButton({ sessionId }: { sessionId: string }) {
       onClick={verify}
       disabled={loading}
       data-tour="verify"
-      className="text-xs px-3 py-1.5 rounded-lg border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition"
+      className="text-xs px-3 py-1.5 border transition-colors disabled:opacity-50"
+      style={{
+        borderColor: "var(--accent)",
+        color: "var(--accent)",
+        borderRadius: "var(--radius-sm)",
+      }}
     >
       {loading ? "Verifying..." : "Verify chain integrity"}
     </button>
@@ -72,12 +78,17 @@ function CopyableField({ label, value }: { label: string; value: string }) {
 
   return (
     <div className="space-y-0.5">
-      <p className="text-[var(--muted)] text-xs">{label}</p>
+      <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>{label}</p>
       <div className="flex items-center gap-1.5">
         <span className="font-mono text-xs break-all">{value}</span>
         <button
           onClick={copy}
-          className="shrink-0 text-[10px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] transition"
+          className="shrink-0 text-[10px] px-1.5 py-0.5 border transition-colors"
+          style={{
+            borderColor: copied ? "var(--accent)" : "var(--border)",
+            color: copied ? "var(--accent)" : "var(--text-tertiary)",
+            borderRadius: "var(--radius-sm)",
+          }}
         >
           {copied ? "Copied" : "Copy"}
         </button>
@@ -103,7 +114,6 @@ function EventDetailPanel({
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
   const [verifying, setVerifying] = useState(false);
 
-  // Close on Escape
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
       if (e.key === "Escape") onClose();
@@ -127,150 +137,141 @@ function EventDetailPanel({
   const thisEventResult = verifyResult?.events.find(
     (e) => e.event_id === event.event_id
   );
-  const model = (event.metadata as Record<string, unknown>)?.model as
-    | string
-    | undefined;
+  const model = event.model ?? (event.metadata as Record<string, unknown>)?.model as string | undefined;
 
   return (
     <>
-      {/* Overlay backdrop */}
+      <div className="fixed inset-0 bg-black/50 z-40" onClick={onClose} />
       <div
-        className="fixed inset-0 bg-black/50 z-40"
-        onClick={onClose}
-      />
-      {/* Slide-out panel */}
-      <div className="fixed top-0 right-0 h-full w-full max-w-lg bg-[var(--bg)] border-l border-[var(--border)] z-50 overflow-y-auto shadow-2xl animate-slide-in">
-        <div className="sticky top-0 bg-[var(--bg)] border-b border-[var(--border)] p-4 flex items-center justify-between">
+        className="fixed top-0 right-0 h-full w-full max-w-lg border-l z-50 overflow-y-auto shadow-2xl animate-slide-in"
+        style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+      >
+        <div
+          className="sticky top-0 border-b p-4 flex items-center justify-between"
+          style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+        >
           <h2 className="text-sm font-semibold">Event Detail</h2>
           <button
             onClick={onClose}
-            className="text-[var(--muted)] hover:text-[var(--fg)] transition text-lg leading-none"
+            className="transition text-lg leading-none"
+            style={{ color: "var(--text-tertiary)" }}
           >
             &times;
           </button>
         </div>
 
         <div className="p-4 space-y-4">
-          {/* event_id */}
           <CopyableField label="Event ID" value={event.event_id} />
 
-          {/* session_id — clickable to filter */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Session ID</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Session ID</p>
             <button
               onClick={() => {
                 onFilterSession(event.session_id);
                 onClose();
               }}
-              className="font-mono text-xs text-[var(--accent)] hover:underline break-all text-left"
+              className="font-mono text-xs hover:underline break-all text-left"
+              style={{ color: "var(--accent)" }}
             >
               {event.session_id}
             </button>
           </div>
 
-          {/* agent_id */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Agent ID</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Agent ID</p>
             <p className="text-sm">{event.agent_id}</p>
           </div>
 
-          {/* kind */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Kind</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Kind</p>
             <EventKind kind={event.kind} />
           </div>
 
-          {/* model */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Model</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Model</p>
             <p className="text-sm font-mono">
-              {model ?? <span className="text-[var(--muted)]">&mdash;</span>}
+              {model ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
             </p>
           </div>
 
-          {/* input_hash / output_hash */}
           <div className="grid grid-cols-1 gap-3">
             <div className="space-y-0.5">
-              <p className="text-[var(--muted)] text-xs">Input Hash</p>
+              <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Input Hash</p>
               <p className="font-mono text-xs break-all">
-                {event.input_hash ?? <span className="text-[var(--muted)]">&mdash;</span>}
+                {event.input_hash ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
               </p>
             </div>
             <div className="space-y-0.5">
-              <p className="text-[var(--muted)] text-xs">Output Hash</p>
+              <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Output Hash</p>
               <p className="font-mono text-xs break-all">
-                {event.output_hash ?? <span className="text-[var(--muted)]">&mdash;</span>}
+                {event.output_hash ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
               </p>
             </div>
           </div>
 
-          {/* Full metadata */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Metadata (full)</p>
-            <pre className="font-mono text-xs bg-black/30 rounded p-3 max-h-64 overflow-auto whitespace-pre-wrap">
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Metadata (full)</p>
+            <pre
+              className="font-mono text-xs p-3 max-h-64 overflow-auto whitespace-pre-wrap"
+              style={{
+                background: "rgba(0, 0, 0, 0.3)",
+                borderRadius: "var(--radius-sm)",
+              }}
+            >
               {JSON.stringify(event.metadata, null, 2)}
             </pre>
           </div>
 
-          {/* prev_hash — clickable */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Prev Hash</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Prev Hash</p>
             {event.prev_hash ? (
               <button
-                onClick={() => {
-                  // Find event with matching hmac_value and jump to it
-                  onJumpToEvent(event.prev_hash!);
-                }}
-                className="font-mono text-xs text-[var(--accent)] hover:underline break-all text-left"
+                onClick={() => onJumpToEvent(event.prev_hash!)}
+                className="font-mono text-xs hover:underline break-all text-left"
+                style={{ color: "var(--accent)" }}
                 title="Jump to predecessor event"
               >
                 {event.prev_hash}
               </button>
             ) : (
-              <p className="font-mono text-xs text-[var(--muted)]">&mdash; (chain head)</p>
+              <p className="font-mono text-xs" style={{ color: "var(--text-tertiary)" }}>
+                &mdash; (chain head)
+              </p>
             )}
           </div>
 
-          {/* HMAC */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">HMAC Value</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>HMAC Value</p>
             <p className="font-mono text-xs break-all">
-              {event.hmac_value ?? <span className="text-[var(--muted)]">&mdash;</span>}
+              {event.hmac_value ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
             </p>
           </div>
 
-          {/* chain_seq */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Chain Sequence</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Chain Sequence</p>
             <p className="text-sm font-mono">{event.chain_seq}</p>
           </div>
 
-          {/* created_at */}
           <div className="space-y-0.5">
-            <p className="text-[var(--muted)] text-xs">Created At</p>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Created At</p>
             <p className="text-sm font-mono">
-              {event.created_at ?? <span className="text-[var(--muted)]">&mdash;</span>}
+              {event.created_at ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
             </p>
           </div>
 
-          {/* Verify button */}
-          <div className="pt-2 border-t border-[var(--border)]">
+          <div className="pt-2 border-t" style={{ borderColor: "var(--border)" }}>
             {verifyResult ? (
               <div className="space-y-2">
                 <div
-                  className={`text-xs font-medium ${
-                    thisEventResult?.verified ? "text-green-400" : "text-red-400"
-                  }`}
+                  className="text-xs font-medium"
+                  style={{ color: thisEventResult?.verified ? "var(--success)" : "var(--danger)" }}
                 >
                   This event:{" "}
-                  {thisEventResult?.verified
-                    ? "HMAC verified"
-                    : "HMAC FAILED"}
+                  {thisEventResult?.verified ? "HMAC verified" : "HMAC FAILED"}
                 </div>
                 <div
-                  className={`text-xs ${
-                    verifyResult.verified ? "text-green-400" : "text-red-400"
-                  }`}
+                  className="text-xs"
+                  style={{ color: verifyResult.verified ? "var(--success)" : "var(--danger)" }}
                 >
                   Session chain:{" "}
                   {verifyResult.verified
@@ -282,7 +283,12 @@ function EventDetailPanel({
               <button
                 onClick={verifyEvent}
                 disabled={verifying}
-                className="w-full text-xs px-3 py-2 rounded-lg border border-[var(--accent)] text-[var(--accent)] hover:bg-[var(--accent)]/10 disabled:opacity-50 transition"
+                className="w-full text-xs px-3 py-2 border transition-colors disabled:opacity-50"
+                style={{
+                  borderColor: "var(--accent)",
+                  color: "var(--accent)",
+                  borderRadius: "var(--radius-sm)",
+                }}
               >
                 {verifying ? "Verifying..." : "Verify this event"}
               </button>
@@ -319,26 +325,28 @@ export default function EventsPage() {
   });
 
   const handleClose = useCallback(() => setSelectedEvent(null), []);
-
   const handleFilterSession = useCallback((sid: string) => {
     setSessionFilter(sid);
   }, []);
-
   const handleJumpToEvent = useCallback(
     (prevHash: string) => {
-      // Find the event whose hmac_value matches the prev_hash
       const target = events?.find((e) => e.hmac_value === prevHash);
-      if (target) {
-        setSelectedEvent(target);
-      }
+      if (target) setSelectedEvent(target);
     },
     [events]
   );
 
+  const inputStyle = {
+    background: "var(--card)",
+    borderColor: "var(--border)",
+    borderRadius: "var(--radius-sm)",
+    color: "var(--fg)",
+  };
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold">Audit Log Explorer</h1>
+        <h1 className="text-2xl font-bold tracking-tight">Audit Log Explorer</h1>
         <LiveBadge />
       </div>
 
@@ -347,19 +355,22 @@ export default function EventsPage() {
           placeholder="Filter by agent_id"
           value={agentFilter}
           onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
-          className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-48 focus:border-[var(--accent)] outline-none transition"
+          className="border px-3 py-2 text-sm w-48 outline-none transition-colors focus:border-[var(--accent)]"
+          style={inputStyle}
         />
         <input
           placeholder="Filter by kind"
           value={kindFilter}
           onChange={(e) => { setKindFilter(e.target.value); setPage(0); }}
-          className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-48 focus:border-[var(--accent)] outline-none transition"
+          className="border px-3 py-2 text-sm w-48 outline-none transition-colors focus:border-[var(--accent)]"
+          style={inputStyle}
         />
         <input
           placeholder="Filter by session_id"
           value={sessionFilter}
           onChange={(e) => { setSessionFilter(e.target.value); setPage(0); }}
-          className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-64 focus:border-[var(--accent)] outline-none transition"
+          className="border px-3 py-2 text-sm w-64 outline-none transition-colors focus:border-[var(--accent)]"
+          style={inputStyle}
         />
         {(agentFilter || kindFilter || sessionFilter) && (
           <button
@@ -369,7 +380,8 @@ export default function EventsPage() {
               setSessionFilter("");
               setPage(0);
             }}
-            className="text-xs text-[var(--muted)] hover:text-white transition"
+            className="text-xs transition-colors hover:text-white"
+            style={{ color: "var(--text-tertiary)" }}
           >
             Clear filters
           </button>
@@ -377,8 +389,17 @@ export default function EventsPage() {
       </div>
 
       {sessionFilter && (
-        <div className="flex items-center gap-3 p-3 rounded-lg bg-[var(--card)] border border-[var(--border)]">
-          <span className="text-sm text-[var(--muted)]">Session {sessionFilter.slice(0, 8)}...:</span>
+        <div
+          className="flex items-center gap-3 p-3 border"
+          style={{
+            background: "var(--card)",
+            borderColor: "var(--border)",
+            borderRadius: "var(--radius-md)",
+          }}
+        >
+          <span className="text-sm" style={{ color: "var(--text-tertiary)" }}>
+            Session {sessionFilter.slice(0, 8)}...:
+          </span>
           <VerifyButton sessionId={sessionFilter} />
         </div>
       )}
@@ -387,7 +408,7 @@ export default function EventsPage() {
         <TableSkeleton rows={10} />
       ) : !events || events.length === 0 ? (
         <div className="text-center py-12">
-          <p className="text-[var(--muted)]">
+          <p style={{ color: "var(--text-tertiary)" }}>
             {agentFilter || kindFilter || sessionFilter
               ? "No events match your filters."
               : "No audit events yet. Start logging from the SDK."}
@@ -397,14 +418,14 @@ export default function EventsPage() {
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-[var(--muted)] border-b border-[var(--border)]">
-                <th className="py-2 pr-3 w-12">#</th>
-                <th className="py-2 pr-3">Kind</th>
-                <th className="py-2 pr-3">Agent</th>
-                <th className="py-2 pr-3">Model</th>
-                <th className="py-2 pr-3">Session</th>
-                <th className="py-2 pr-3">Metadata</th>
-                <th className="py-2 pr-3 w-24">Time</th>
+              <tr className="text-left border-b" style={{ borderColor: "var(--border)", color: "var(--text-tertiary)" }}>
+                <th className="py-2 pr-3 w-12 font-medium text-xs uppercase tracking-wider">#</th>
+                <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Kind</th>
+                <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Agent</th>
+                <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Model</th>
+                <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Session</th>
+                <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Metadata</th>
+                <th className="py-2 pr-3 w-24 font-medium text-xs uppercase tracking-wider">Time</th>
               </tr>
             </thead>
             <tbody>
@@ -412,17 +433,18 @@ export default function EventsPage() {
                 <tr
                   key={e.event_id}
                   onClick={() => setSelectedEvent(e)}
-                  className="border-b border-[var(--border)] hover:bg-white/5 transition-colors cursor-pointer"
+                  className="border-b hover:bg-white/[0.03] transition-colors cursor-pointer"
+                  style={{ borderColor: "var(--border)" }}
                 >
-                  <td className="py-2 pr-3 text-[var(--muted)] text-xs">
+                  <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                     {e.chain_seq}
                   </td>
                   <td className="py-2 pr-3">
                     <EventKind kind={e.kind} />
                   </td>
                   <td className="py-2 pr-3 text-sm">{e.agent_id}</td>
-                  <td className="py-2 pr-3 text-xs font-mono text-[var(--muted)]">
-                    {(e.metadata as Record<string, unknown>)?.model as string ?? "\u2014"}
+                  <td className="py-2 pr-3 text-xs font-mono" style={{ color: "var(--text-tertiary)" }}>
+                    {e.model ?? (e.metadata as Record<string, unknown>)?.model as string ?? "\u2014"}
                   </td>
                   <td className="py-2 pr-3">
                     <button
@@ -430,7 +452,8 @@ export default function EventsPage() {
                         ev.stopPropagation();
                         setSessionFilter(e.session_id);
                       }}
-                      className="text-[var(--accent)] hover:underline font-mono text-xs"
+                      className="hover:underline font-mono text-xs"
+                      style={{ color: "var(--accent)" }}
                     >
                       {e.session_id.slice(0, 8)}...
                     </button>
@@ -438,7 +461,7 @@ export default function EventsPage() {
                   <td className="py-2 pr-3 max-w-xs">
                     <MetadataViewer data={e.metadata as Record<string, unknown>} />
                   </td>
-                  <td className="py-2 pr-3 text-xs text-[var(--muted)]">
+                  <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                     <TimeAgo iso={e.created_at} />
                   </td>
                 </tr>
@@ -447,11 +470,12 @@ export default function EventsPage() {
           </table>
           <div className="flex items-center justify-between mt-3">
             <div className="flex items-center gap-2">
-              <label className="text-xs text-[var(--muted)]">Page size:</label>
+              <label className="text-xs" style={{ color: "var(--text-tertiary)" }}>Page size:</label>
               <select
                 value={pageSize}
                 onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
-                className="bg-[var(--card)] border border-[var(--border)] rounded px-2 py-1 text-xs focus:border-[var(--accent)] outline-none"
+                className="border px-2 py-1 text-xs outline-none"
+                style={inputStyle}
               >
                 <option value={25}>25</option>
                 <option value={50}>50</option>
@@ -462,27 +486,36 @@ export default function EventsPage() {
               <button
                 onClick={() => setPage((p) => Math.max(0, p - 1))}
                 disabled={page === 0}
-                className="text-xs px-3 py-1.5 rounded-lg border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition"
+                className="text-xs px-3 py-1.5 border disabled:opacity-30 transition-colors"
+                style={{
+                  borderColor: "var(--border)",
+                  color: "var(--text-tertiary)",
+                  borderRadius: "var(--radius-sm)",
+                }}
               >
                 Prev
               </button>
-              <span className="text-xs text-[var(--muted)]">Page {page + 1}</span>
+              <span className="text-xs" style={{ color: "var(--text-tertiary)" }}>Page {page + 1}</span>
               <button
                 onClick={() => setPage((p) => p + 1)}
                 disabled={!events || events.length < pageSize}
-                className="text-xs px-3 py-1.5 rounded-lg border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition"
+                className="text-xs px-3 py-1.5 border disabled:opacity-30 transition-colors"
+                style={{
+                  borderColor: "var(--border)",
+                  color: "var(--text-tertiary)",
+                  borderRadius: "var(--radius-sm)",
+                }}
               >
                 Next
               </button>
             </div>
-            <p className="text-xs text-[var(--muted)]">
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
               Showing {events.length} events (most recent first)
             </p>
           </div>
         </div>
       )}
 
-      {/* Event detail slide-out panel */}
       {selectedEvent && (
         <EventDetailPanel
           event={selectedEvent}

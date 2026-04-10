@@ -54,6 +54,7 @@ class PostgresCostStore(CostStore):
         *,
         tokens: int,
         usd: float,
+        model: str | None = None,
     ) -> None:
         # Day boundary is computed by Postgres atomically with the INSERT
         # so a track() call straddling UTC midnight cannot drop the row
@@ -98,6 +99,28 @@ class PostgresCostStore(CostStore):
                         "tokens": tokens,
                     },
                 )
+                # Per-model daily breakdown (v0.3)
+                if model is not None:
+                    await conn.execute(
+                        text(
+                            """
+                            INSERT INTO governance_cost_model_daily
+                                (agent_id, model, day_utc, usd_used, tokens_used, last_updated)
+                            VALUES (:agent_id, :model, (NOW() AT TIME ZONE 'UTC')::DATE,
+                                    :usd, :tokens, NOW())
+                            ON CONFLICT (agent_id, model, day_utc) DO UPDATE SET
+                                usd_used    = governance_cost_model_daily.usd_used    + EXCLUDED.usd_used,
+                                tokens_used = governance_cost_model_daily.tokens_used + EXCLUDED.tokens_used,
+                                last_updated = NOW()
+                            """
+                        ),
+                        {
+                            "agent_id": agent_id,
+                            "model": model,
+                            "usd": usd,
+                            "tokens": tokens,
+                        },
+                    )
         except Exception as exc:
             raise CostError(
                 f"postgres cost.track failed: {type(exc).__name__}"
@@ -160,6 +183,29 @@ class PostgresCostStore(CostStore):
         if isinstance(val, datetime):
             return val
         return None
+
+    async def get_model_breakdown(
+        self, agent_id: str
+    ) -> dict[str, dict[str, float]]:
+        """Return per-model usage for today: {model: {usd: X, tokens: Y}}."""
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT model, usd_used, tokens_used "
+                    "FROM governance_cost_model_daily "
+                    "WHERE agent_id = :agent_id "
+                    "  AND day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"
+                ),
+                {"agent_id": agent_id},
+            )
+            rows = list(res.mappings())
+        return {
+            row["model"]: {
+                "usd": float(row["usd_used"]),
+                "tokens": float(int(row["tokens_used"])),
+            }
+            for row in rows
+        }
 
     async def close(self) -> None:
         await self._engine.dispose()

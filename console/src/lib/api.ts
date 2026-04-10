@@ -1,8 +1,8 @@
 /**
  * Typed API client for the governance console backend.
  *
- * The backend runs at /api/* (proxied by Next.js rewrites in dev,
- * or configured via NEXT_PUBLIC_API_URL in production).
+ * Auth: Uses httpOnly session cookies (set by /api/auth/login).
+ * Falls back to Bearer token from localStorage for legacy compat.
  */
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "";
@@ -12,33 +12,43 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
   if (params) {
     Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
   }
-  const token = typeof window !== "undefined"
-    ? localStorage.getItem("governance_token") ?? ""
-    : "";
+  const token =
+    typeof window !== "undefined"
+      ? localStorage.getItem("governance_token") ?? ""
+      : "";
   const res = await fetch(url.toString(), {
+    credentials: "include",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
+  if (res.status === 401) {
+    // Session expired or invalid — clear stale token and let AuthProvider handle redirect
+    localStorage.removeItem("governance_token");
+    throw new Error("Authentication required");
+  }
   if (!res.ok) {
     throw new Error(`API ${path}: ${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
 
-async function post<T>(path: string): Promise<T> {
+async function post<T>(path: string, body?: unknown): Promise<T> {
   const url = new URL(`${BASE}${path}`, window.location.origin);
-  const token = typeof window !== "undefined"
-    ? localStorage.getItem("governance_token") ?? ""
-    : "";
+  const token =
+    typeof window !== "undefined"
+      ? localStorage.getItem("governance_token") ?? ""
+      : "";
   const res = await fetch(url.toString(), {
     method: "POST",
+    credentials: "include",
     headers: {
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "Content-Type": "application/json",
     },
+    body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(body || `API ${path}: ${res.status} ${res.statusText}`);
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `API ${path}: ${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
@@ -57,6 +67,7 @@ export interface AuditEvent {
   agent_id: string;
   parent_event_id: string | null;
   kind: string;
+  model?: string | null;
   input_hash: string | null;
   output_hash: string | null;
   metadata: Record<string, unknown>;
@@ -115,7 +126,12 @@ export interface PostureAgent {
     violations_today: number;
     latest_violation: { tool: string; created_at: string | null } | null;
   };
-  cost: { status: string; usd_today: number; tokens_today: number; exceeded_today: number };
+  cost: {
+    status: string;
+    usd_today: number;
+    tokens_today: number;
+    exceeded_today: number;
+  };
   gates: { status: string; pending: number };
   audit: { status: string; events_total: number };
 }
@@ -130,8 +146,15 @@ export interface Posture {
 
 export const api = {
   health: () => get<{ ok: boolean; version: string }>("/api/health"),
-  agents: (limit = 50) => get<Agent[]>("/api/agents", { limit: String(limit) }),
-  events: (params?: { agent_id?: string; kind?: string; session_id?: string; limit?: number; offset?: number }) =>
+  agents: (limit = 50) =>
+    get<Agent[]>("/api/agents", { limit: String(limit) }),
+  events: (params?: {
+    agent_id?: string;
+    kind?: string;
+    session_id?: string;
+    limit?: number;
+    offset?: number;
+  }) =>
     get<AuditEvent[]>("/api/events", {
       ...(params?.agent_id && { agent_id: params.agent_id }),
       ...(params?.kind && { kind: params.kind }),
@@ -143,7 +166,10 @@ export const api = {
     get<VerifyResult>(`/api/session/${sessionId}/verify`),
   costAgents: () => get<CostAgent[]>("/api/cost/agents"),
   costSessions: (agentId?: string) =>
-    get<CostSession[]>("/api/cost/sessions", agentId ? { agent_id: agentId } : {}),
+    get<CostSession[]>(
+      "/api/cost/sessions",
+      agentId ? { agent_id: agentId } : {}
+    ),
   gatesPending: () => get<GatePending[]>("/api/gates/pending"),
   gatesRecent: (limit = 50) =>
     get<GateResolved[]>("/api/gates/recent", { limit: String(limit) }),

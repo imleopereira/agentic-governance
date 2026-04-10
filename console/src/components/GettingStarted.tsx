@@ -4,8 +4,10 @@ export function GettingStarted() {
   return (
     <div className="max-w-2xl mx-auto py-16 text-center space-y-8">
       <div>
-        <h1 className="text-3xl font-bold mb-2">Welcome to Code Atelier Governance</h1>
-        <p className="text-[var(--muted)]">
+        <h1 className="text-3xl font-bold tracking-tight mb-2">
+          Welcome to Code Atelier Governance
+        </h1>
+        <p style={{ color: "var(--text-tertiary)" }}>
           Your dashboard is empty because no agents have logged events yet.
           Follow these steps to get your first data flowing.
         </p>
@@ -49,16 +51,17 @@ print(f"First event logged: {record.event_id}")`}
         />
       </div>
 
-      <div className="pt-4 text-sm text-[var(--muted)]">
+      <div className="pt-4 text-sm" style={{ color: "var(--text-tertiary)" }}>
         <p>
           Need help?{" "}
           <a
-            href="https://github.com/imleopereira/code-atelier-governance"
+            href="https://codeatelier.tech/governance"
             target="_blank"
             rel="noopener noreferrer"
-            className="text-[var(--accent)] hover:underline"
+            style={{ color: "var(--accent)" }}
+            className="hover:underline"
           >
-            Read the docs on GitHub
+            Read the docs
           </a>
         </p>
       </div>
@@ -79,16 +82,32 @@ function Step({
 }) {
   return (
     <div className="flex gap-4">
-      <div className="flex-shrink-0 w-8 h-8 rounded-full bg-[var(--accent)]/20 text-[var(--accent)] flex items-center justify-center text-sm font-bold">
+      <div
+        className="flex-shrink-0 w-8 h-8 flex items-center justify-center text-sm font-bold"
+        style={{
+          background: "rgba(130, 40, 245, 0.15)",
+          color: "var(--accent)",
+          borderRadius: "var(--radius-sm)",
+        }}
+      >
         {number}
       </div>
       <div className="flex-1">
         <h3 className="font-semibold mb-1">{title}</h3>
         {description && (
-          <p className="text-sm text-[var(--muted)] mb-2">{description}</p>
+          <p className="text-sm mb-2" style={{ color: "var(--text-tertiary)" }}>
+            {description}
+          </p>
         )}
         {code && (
-          <pre className="bg-black/40 rounded-lg p-3 text-sm font-mono text-[var(--fg)] overflow-x-auto whitespace-pre-wrap">
+          <pre
+            className="text-sm font-mono overflow-x-auto whitespace-pre-wrap p-3"
+            style={{
+              background: "rgba(0, 0, 0, 0.4)",
+              borderRadius: "var(--radius-md)",
+              border: "1px solid var(--border)",
+            }}
+          >
             {code}
           </pre>
         )}
