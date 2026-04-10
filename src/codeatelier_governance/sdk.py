@@ -18,6 +18,9 @@ from typing import Any
 
 from .audit.module import AuditModule
 from .audit.store import AuditStore, InMemoryAuditStore
+from .cost.module import CostModule
+from .gates.module import GatesModule
+from .scope.module import ScopeModule
 
 MIN_AUDIT_SECRET_BYTES = 32
 
@@ -74,6 +77,11 @@ class GovernanceSDK:
 
         store = self._build_audit_store(database_url)
         self.audit = AuditModule(store, secret=resolved_secret)
+        # Three enforcement modules share the audit substrate; the gates
+        # module reuses the same secret for HMAC-signed approval tokens.
+        self.scope = ScopeModule(self.audit)
+        self.cost = CostModule(self.audit)
+        self.gates = GatesModule(self.audit, secret=resolved_secret)
 
     @staticmethod
     def _resolve_audit_secret() -> bytes:

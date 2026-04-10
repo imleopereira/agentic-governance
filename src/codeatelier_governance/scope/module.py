@@ -1,0 +1,156 @@
+"""Scope enforcement module exposed via ``sdk.scope``.
+
+Public API:
+    sdk.scope.register(policy)              # called once at SDK init
+    await sdk.scope.check(agent_id, tool="...")
+    await sdk.scope.check(agent_id, api="POST https://api.x.com/...")
+    @sdk.scope.require_tool("send_email", agent_id="x")
+
+Every violation is auto-logged as an audit event with kind="scope.violation".
+Default deny: an agent with no registered policy fails every check.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import inspect
+from typing import Awaitable, Callable, ParamSpec, TypeVar
+
+from ..audit.models import AuditEvent
+from ..audit.module import AuditModule
+from .errors import PolicyNotRegistered, ScopeViolation
+from .models import ScopePolicy
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+class ScopeModule:
+    """Action scope enforcement.
+
+    Policies are registered at SDK init time. The agent's execution context
+    cannot register or modify policies — there is no public mutation API
+    other than ``register``, which is intended for application startup.
+    """
+
+    def __init__(
+        self,
+        audit: AuditModule,
+        policies: list[ScopePolicy] | None = None,
+    ) -> None:
+        self._audit = audit
+        self._policies: dict[str, ScopePolicy] = {}
+        self._lock = asyncio.Lock()
+        for policy in policies or []:
+            self._policies[policy.agent_id] = policy
+
+    def register(self, policy: ScopePolicy) -> None:
+        """Register a policy for an agent. Call at app startup, not at runtime."""
+        self._policies[policy.agent_id] = policy
+
+    def get_policy(self, agent_id: str) -> ScopePolicy | None:
+        return self._policies.get(agent_id)
+
+    async def check(
+        self,
+        agent_id: str,
+        *,
+        tool: str | None = None,
+        api: str | None = None,
+    ) -> None:
+        """Check whether ``agent_id`` is permitted to call ``tool`` or ``api``.
+
+        Raises:
+            PolicyNotRegistered: no policy exists for ``agent_id``.
+            ScopeViolation: the action is outside the registered scope.
+        """
+        if tool is None and api is None:
+            raise ValueError(
+                "scope.check: pass either tool=... or api=... (or both). "
+                "Fix: sdk.scope.check(agent_id, tool='read_invoice')"
+            )
+        policy = self._policies.get(agent_id)
+        if policy is None:
+            await self._log_violation(
+                agent_id, tool, api, reason="no policy registered"
+            )
+            raise PolicyNotRegistered(
+                f"scope check failed: no policy registered for agent_id={agent_id!r}. "
+                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., allowed_tools=...)) "
+                f"at startup."
+            )
+        if tool is not None and tool not in policy.allowed_tools:
+            await self._log_violation(
+                agent_id, tool, api, reason="tool not whitelisted"
+            )
+            raise ScopeViolation(
+                f"scope violation: tool={tool!r} is not in scope for agent={agent_id!r}"
+            )
+        if api is not None and not _api_matches(api, policy.allowed_apis):
+            await self._log_violation(
+                agent_id, tool, api, reason="api not whitelisted"
+            )
+            raise ScopeViolation(
+                f"scope violation: api={api!r} is not in scope for agent={agent_id!r}"
+            )
+
+    async def _log_violation(
+        self,
+        agent_id: str,
+        tool: str | None,
+        api: str | None,
+        reason: str,
+    ) -> None:
+        await self._audit.log(
+            AuditEvent(
+                agent_id=agent_id,
+                kind="scope.violation",
+                metadata={
+                    "tool": tool,
+                    "api": api,
+                    "reason": reason,
+                },
+            )
+        )
+
+    def require_tool(
+        self,
+        tool: str,
+        *,
+        agent_id: str,
+    ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
+        """Decorator that enforces ``tool`` is in ``agent_id``'s scope before call."""
+
+        def decorator(
+            func: Callable[P, Awaitable[R]],
+        ) -> Callable[P, Awaitable[R]]:
+            if not inspect.iscoroutinefunction(func):
+                raise TypeError(
+                    f"@scope.require_tool requires an async function; "
+                    f"{func.__name__} is sync."
+                )
+
+            @functools.wraps(func)
+            async def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+                await self.check(agent_id=agent_id, tool=tool)
+                return await func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+
+def _api_matches(api: str, patterns: frozenset[str]) -> bool:
+    """Exact match OR explicit prefix match.
+
+    A pattern ending in '*' matches any api starting with the prefix BEFORE
+    the asterisk. Glob/regex are intentionally not supported — confusion or
+    injection in the pattern syntax becomes an authorization bypass.
+    """
+    for pattern in patterns:
+        if pattern.endswith("*"):
+            if api.startswith(pattern[:-1]):
+                return True
+        elif api == pattern:
+            return True
+    return False

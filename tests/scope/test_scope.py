@@ -1,0 +1,204 @@
+"""Happy-path + exploit tests for the scope module."""
+from __future__ import annotations
+
+import asyncio
+
+import pytest
+from pydantic import ValidationError
+
+from codeatelier_governance.audit import InMemoryAuditStore
+from codeatelier_governance.scope import (
+    PolicyNotRegistered,
+    ScopeModule,
+    ScopePolicy,
+    ScopeViolation,
+)
+
+
+# ---------------------------------------------------------------------------
+# Happy path
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_allowed_tool_passes(scope: ScopeModule) -> None:
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_tools=frozenset({"read_invoice", "send_email"}),
+        )
+    )
+    await scope.check(agent_id="a", tool="read_invoice")  # no raise
+
+
+@pytest.mark.asyncio
+async def test_disallowed_tool_raises_and_logs(
+    scope: ScopeModule, audit_store: InMemoryAuditStore
+) -> None:
+    scope.register(
+        ScopePolicy(agent_id="a", allowed_tools=frozenset({"read_invoice"}))
+    )
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="a", tool="delete_customer")
+    await asyncio.sleep(0.1)
+    events = list(audit_store._events.values())  # type: ignore[attr-defined]
+    violations = [e for e in events if e.kind == "scope.violation"]
+    assert len(violations) == 1
+    assert violations[0].metadata["tool"] == "delete_customer"
+    assert violations[0].metadata["reason"] == "tool not whitelisted"
+
+
+@pytest.mark.asyncio
+async def test_unknown_agent_default_denies(
+    scope: ScopeModule, audit_store: InMemoryAuditStore
+) -> None:
+    with pytest.raises(PolicyNotRegistered):
+        await scope.check(agent_id="ghost", tool="anything")
+    await asyncio.sleep(0.1)
+    events = [
+        e
+        for e in audit_store._events.values()  # type: ignore[attr-defined]
+        if e.kind == "scope.violation"
+    ]
+    assert events[0].metadata["reason"] == "no policy registered"
+
+
+@pytest.mark.asyncio
+async def test_api_exact_match(scope: ScopeModule) -> None:
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_apis=frozenset({"POST https://api.stripe.com/v1/charges"}),
+        )
+    )
+    await scope.check(agent_id="a", api="POST https://api.stripe.com/v1/charges")
+
+
+@pytest.mark.asyncio
+async def test_api_prefix_match(scope: ScopeModule) -> None:
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_apis=frozenset({"GET https://api.stripe.com/v1/customers/*"}),
+        )
+    )
+    await scope.check(
+        agent_id="a", api="GET https://api.stripe.com/v1/customers/cus_123"
+    )
+    with pytest.raises(ScopeViolation):
+        await scope.check(
+            agent_id="a", api="DELETE https://api.stripe.com/v1/customers/cus_123"
+        )
+
+
+@pytest.mark.asyncio
+async def test_decorator_blocks_disallowed(scope: ScopeModule) -> None:
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"read"})))
+
+    @scope.require_tool("delete", agent_id="a")
+    async def dangerous() -> str:
+        return "should not run"
+
+    with pytest.raises(ScopeViolation):
+        await dangerous()
+
+
+@pytest.mark.asyncio
+async def test_decorator_allows_whitelisted(scope: ScopeModule) -> None:
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"read"})))
+
+    @scope.require_tool("read", agent_id="a")
+    async def safe() -> str:
+        return "ok"
+
+    assert await safe() == "ok"
+
+
+@pytest.mark.asyncio
+async def test_check_requires_tool_or_api(scope: ScopeModule) -> None:
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"x"})))
+    with pytest.raises(ValueError, match="tool=... or api=..."):
+        await scope.check(agent_id="a")
+
+
+# ---------------------------------------------------------------------------
+# Exploit / cybersecurity tests
+# ---------------------------------------------------------------------------
+def test_policy_is_frozen() -> None:
+    """An attacker who gets a reference to a policy cannot mutate it."""
+    p = ScopePolicy(agent_id="a", allowed_tools=frozenset({"read"}))
+    with pytest.raises(ValidationError):
+        p.agent_id = "evil"  # type: ignore[misc]
+
+
+def test_policy_rejects_oversized_tool_set() -> None:
+    huge = frozenset({f"tool_{i}" for i in range(2000)})
+    with pytest.raises(ValueError):
+        ScopePolicy(agent_id="a", allowed_tools=huge)
+
+
+def test_policy_rejects_empty_tool_name() -> None:
+    with pytest.raises(ValueError):
+        ScopePolicy(agent_id="a", allowed_tools=frozenset({""}))
+
+
+@pytest.mark.asyncio
+async def test_regex_chars_in_tool_name_are_literal(scope: ScopeModule) -> None:
+    """A whitelist entry like 'read.*' must NOT match 'read_anything'."""
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"read.*"})))
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="a", tool="read_invoice")
+    # exact 'read.*' is allowed (it's a valid string in the whitelist)
+    await scope.check(agent_id="a", tool="read.*")
+
+
+@pytest.mark.asyncio
+async def test_glob_chars_in_api_are_literal_unless_explicit_prefix(
+    scope: ScopeModule,
+) -> None:
+    scope.register(
+        ScopePolicy(agent_id="a", allowed_apis=frozenset({"POST https://api.x.com/*"}))
+    )
+    # Prefix match: anything starting with the prefix
+    await scope.check(agent_id="a", api="POST https://api.x.com/anything")
+    # But the literal "POST https://api.evil.com/*" must NOT match
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="a", api="POST https://api.evil.com/x")
+
+
+@pytest.mark.asyncio
+async def test_decorator_rejects_sync_function(scope: ScopeModule) -> None:
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"x"})))
+    with pytest.raises(TypeError, match="async function"):
+
+        @scope.require_tool("x", agent_id="a")
+        def sync_fn() -> None:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_concurrent_checks_all_log_independently(
+    scope: ScopeModule, audit_store: InMemoryAuditStore
+) -> None:
+    scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"x"})))
+    # 20 concurrent denied calls
+    results = await asyncio.gather(
+        *(
+            asyncio.create_task(_attempt_violation(scope))
+            for _ in range(20)
+        )
+    )
+    assert all(isinstance(r, ScopeViolation) for r in results)
+    await asyncio.sleep(0.2)
+    violations = [
+        e
+        for e in audit_store._events.values()  # type: ignore[attr-defined]
+        if e.kind == "scope.violation"
+    ]
+    assert len(violations) == 20
+
+
+async def _attempt_violation(scope: ScopeModule) -> Exception:
+    try:
+        await scope.check(agent_id="a", tool="forbidden")
+    except ScopeViolation as exc:
+        return exc
+    return RuntimeError("expected violation")
