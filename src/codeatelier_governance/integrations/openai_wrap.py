@@ -1,0 +1,269 @@
+"""OpenAI SDK wrapper that patches a client to emit governance events.
+
+Usage::
+
+    from openai import OpenAI
+    from codeatelier_governance import GovernanceSDK
+    from codeatelier_governance.integrations.openai_wrap import wrap_openai
+
+    sdk = GovernanceSDK(database_url="postgresql://...")
+    client = wrap_openai(OpenAI(), sdk=sdk, agent_id="my-agent")
+    # client.chat.completions.create() now emits audit events
+
+The wrapper monkey-patches the client in-place and returns it so existing
+references keep working.
+
+Observation surfaces (audit.log, cost.track) never raise. The enforcement
+surface (cost.check_or_raise) DOES raise BudgetExceeded by contract.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+from typing import Any
+from uuid import uuid4
+
+import structlog
+
+from codeatelier_governance.audit.models import AuditEvent
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from codeatelier_governance.sdk import GovernanceSDK
+
+logger = structlog.get_logger(__name__)
+
+
+def _extract_token_usage(response: Any) -> dict[str, int]:
+    """Extract token usage from an OpenAI response object."""
+    usage: dict[str, int] = {}
+    if hasattr(response, "usage") and response.usage is not None:
+        u = response.usage
+        if hasattr(u, "prompt_tokens"):
+            usage["prompt_tokens"] = int(u.prompt_tokens)
+        if hasattr(u, "completion_tokens"):
+            usage["completion_tokens"] = int(u.completion_tokens)
+        if hasattr(u, "total_tokens"):
+            usage["total_tokens"] = int(u.total_tokens)
+    return usage
+
+
+def _estimate_usd(model: str, usage: dict[str, int]) -> float:
+    """Rough cost estimate based on model name and token counts.
+
+    Returns 0.0 if the model is unknown or usage is empty. Callers should
+    register accurate pricing via BudgetPolicy for production use.
+    """
+    prompt = usage.get("prompt_tokens", 0)
+    completion = usage.get("completion_tokens", 0)
+
+    # Rough per-1k-token pricing (input/output) for common models.
+    pricing: dict[str, tuple[float, float]] = {
+        "gpt-4o": (0.0025, 0.01),
+        "gpt-4o-mini": (0.00015, 0.0006),
+        "gpt-4-turbo": (0.01, 0.03),
+        "gpt-4": (0.03, 0.06),
+        "gpt-3.5-turbo": (0.0005, 0.0015),
+    }
+
+    for prefix, (inp_rate, out_rate) in pricing.items():
+        if model.startswith(prefix):
+            return (prompt * inp_rate + completion * out_rate) / 1000.0
+
+    return 0.0
+
+
+def _has_running_loop() -> bool:
+    """Check if there is a running event loop."""
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+async def _safe_audit_log(sdk: GovernanceSDK, agent_id: str, kind: str, metadata: dict[str, Any]) -> None:
+    """Audit log that swallows all errors (observation surface)."""
+    try:
+        await sdk.audit.log(
+            AuditEvent(agent_id=agent_id, kind=kind, metadata=metadata)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "governance.openai_wrap.audit_log_failed",
+            kind=kind,
+            error_type=type(exc).__name__,
+        )
+
+
+async def _safe_cost_track(sdk: GovernanceSDK, agent_id: str, tokens: int, usd: float) -> None:
+    """Track cost, swallowing all errors (observation surface)."""
+    try:
+        session_id = uuid4()
+        await sdk.cost.track(agent_id, session_id, tokens=tokens, usd=usd)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "governance.openai_wrap.cost_track_failed",
+            error_type=type(exc).__name__,
+        )
+
+
+def _wrap_sync_create(
+    original: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Wrap a sync chat.completions.create method.
+
+    If called from within an existing async event loop (e.g. from a test
+    or a framework that nests sync in async), the wrapper returns a
+    coroutine instead so callers can await it. When there is no running
+    loop, it uses ``asyncio.run`` for each governance call.
+    """
+
+    async def _async_impl(*args: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model", "unknown")
+
+        session_id = uuid4()
+        await sdk.cost.check_or_raise(agent_id, session_id)
+
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+
+        try:
+            response = original(*args, **kwargs)
+        except Exception as exc:
+            await _safe_audit_log(
+                sdk, agent_id, "llm.error",
+                {"model": model, "error_type": type(exc).__name__},
+            )
+            raise
+
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        usd = _estimate_usd(str(model), usage)
+
+        await _safe_audit_log(
+            sdk, agent_id, "llm.result",
+            {"model": model, "token_usage": usage},
+        )
+        if total_tokens > 0:
+            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+
+        return response
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _has_running_loop():
+            # Inside an event loop: return a coroutine for the caller to await.
+            return _async_impl(*args, **kwargs)
+
+        model = kwargs.get("model", "unknown")
+
+        session_id = uuid4()
+        asyncio.run(sdk.cost.check_or_raise(agent_id, session_id))
+
+        asyncio.run(_safe_audit_log(sdk, agent_id, "llm.call", {"model": model}))
+
+        try:
+            response = original(*args, **kwargs)
+        except Exception as exc:
+            asyncio.run(
+                _safe_audit_log(
+                    sdk, agent_id, "llm.error",
+                    {"model": model, "error_type": type(exc).__name__},
+                )
+            )
+            raise
+
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        usd = _estimate_usd(str(model), usage)
+
+        asyncio.run(
+            _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": model, "token_usage": usage},
+            )
+        )
+        if total_tokens > 0:
+            asyncio.run(_safe_cost_track(sdk, agent_id, total_tokens, usd))
+
+        return response
+
+    return wrapper
+
+
+def _wrap_async_create(
+    original: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Wrap an async chat.completions.create method."""
+
+    @functools.wraps(original)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model", "unknown")
+
+        # Enforcement: check budget BEFORE the call.
+        session_id = uuid4()
+        await sdk.cost.check_or_raise(agent_id, session_id)
+
+        # Observation: audit log pre-call.
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+
+        try:
+            response = await original(*args, **kwargs)
+        except Exception as exc:
+            await _safe_audit_log(
+                sdk, agent_id, "llm.error",
+                {"model": model, "error_type": type(exc).__name__},
+            )
+            raise
+
+        # Observation: audit log + cost track post-call.
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        usd = _estimate_usd(str(model), usage)
+
+        await _safe_audit_log(
+            sdk, agent_id, "llm.result",
+            {"model": model, "token_usage": usage},
+        )
+        if total_tokens > 0:
+            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+
+        return response
+
+    return wrapper
+
+
+def wrap_openai(
+    client: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Patch an OpenAI client to emit governance audit events.
+
+    Supports both ``openai.OpenAI`` (sync) and ``openai.AsyncOpenAI`` (async).
+    The client is monkey-patched in-place and returned so existing references
+    continue to work.
+
+    Args:
+        client: An ``openai.OpenAI`` or ``openai.AsyncOpenAI`` instance.
+        sdk: The initialized GovernanceSDK instance.
+        agent_id: The agent identifier for audit and cost tracking.
+
+    Returns:
+        The same client object, patched in-place.
+    """
+    completions = client.chat.completions
+
+    is_async = asyncio.iscoroutinefunction(getattr(completions, "create", None))
+
+    if is_async:
+        completions.create = _wrap_async_create(completions.create, sdk, agent_id)
+    else:
+        completions.create = _wrap_sync_create(completions.create, sdk, agent_id)
+
+    return client

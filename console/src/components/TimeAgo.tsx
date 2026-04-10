@@ -1,0 +1,55 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+function formatRelative(iso: string): { text: string; style?: string } {
+  const d = new Date(iso);
+  const now = Date.now();
+  const diff = now - d.getTime();
+
+  // Future timestamp (e.g. expires_at)
+  if (diff < 0) {
+    const absDiff = Math.abs(diff);
+    const secs = Math.floor(absDiff / 1000);
+    if (secs < 60) return { text: `in ${secs}s` };
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return { text: `in ${mins}m` };
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return { text: `in ${hours}h` };
+    const days = Math.floor(hours / 24);
+    return { text: `in ${days}d` };
+  }
+
+  // Past timestamp
+  const secs = Math.floor(diff / 1000);
+  if (secs < 5) return { text: "just now" };
+  if (secs < 60) return { text: `${secs}s ago` };
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return { text: `${mins}m ago` };
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return { text: `${hours}h ago` };
+  const days = Math.floor(hours / 24);
+  return { text: `${days}d ago` };
+}
+
+export function TimeAgo({ iso, label }: { iso: string | null; label?: string }) {
+  const [display, setDisplay] = useState<{ text: string; style?: string }>({
+    text: "",
+  });
+
+  useEffect(() => {
+    if (!iso) return;
+    setDisplay(formatRelative(iso));
+    const interval = setInterval(() => setDisplay(formatRelative(iso)), 10_000);
+    return () => clearInterval(interval);
+  }, [iso]);
+
+  if (!iso) return <span className="text-[var(--muted)]">—</span>;
+
+  return (
+    <span title={new Date(iso).toLocaleString()} className="cursor-help">
+      {label && <span className="text-[var(--muted)]">{label} </span>}
+      {display.text}
+    </span>
+  );
+}

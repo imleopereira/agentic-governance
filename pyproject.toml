@@ -47,6 +47,16 @@ otel = [
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
 ]
+console = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+]
+langchain = [
+    "langchain-core>=0.2",
+]
+openai = [
+    "openai>=1.0",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -56,6 +66,9 @@ dev = [
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
 ]
+
+[project.scripts]
+governance = "codeatelier_governance.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
