@@ -16,12 +16,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+otel = [
+    "opentelemetry-api>=1.30,<2.0",
+    "opentelemetry-sdk>=1.30,<2.0",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "ruff",
     "mypy",
     "coverage",
+    "opentelemetry-api>=1.30,<2.0",
+    "opentelemetry-sdk>=1.30,<2.0",
 ]
 
 [tool.setuptools.packages.find]

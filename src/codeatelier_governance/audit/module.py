@@ -88,6 +88,24 @@ class AuditModule:
         self._session_locks: dict[UUID, asyncio.Lock] = {}
         self._last_hmac: dict[UUID, str | None] = {}
         self._initialized_sessions: set[UUID] = set()
+        self._subscribers: list[
+            Callable[[AuditEventRecord], Awaitable[None]]
+        ] = []
+
+    def subscribe(
+        self,
+        callback: Callable[[AuditEventRecord], Awaitable[None]],
+    ) -> None:
+        """Register a callback invoked after every successful log.
+
+        Subscribers run AFTER the record is enqueued for write — a failing
+        subscriber must never break the audit chain or the host application.
+        Exceptions raised by subscribers are caught, logged, and swallowed.
+
+        Used by the OTel exporter and any other consumer that wants to fan
+        audit events out to a secondary system (e.g. metrics, dashboards).
+        """
+        self._subscribers.append(callback)
 
     # --- lifecycle ----------------------------------------------------------
     async def start(self) -> None:
@@ -156,6 +174,18 @@ class AuditModule:
             )
             self._last_hmac[session_id] = mac
             await self._writer.enqueue(record)
+        # Subscribers run OUTSIDE the per-session lock so a slow exporter
+        # cannot block other sessions' chain construction. A failing
+        # subscriber must never break the audit log itself.
+        for sub in self._subscribers:
+            try:
+                await sub(record)
+            except Exception as exc:
+                logger.error(
+                    "audit.subscriber_error",
+                    error_type=type(exc).__name__,
+                    event_id=str(record.event_id),
+                )
         return record
 
     async def trace(self, event_id: UUID) -> list[AuditEventRecord]:
