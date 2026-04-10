@@ -1,5 +1,11 @@
 # Code Atelier Governance SDK
 
+> **v0.1.0 — Developer Preview.** The audit module is multi-worker correct.
+> The cost, gates, and full chain-integrity guarantees are correct for
+> single-process deployments only — multi-worker correctness ships in
+> v0.1.5 (target: two weeks). For multi-worker deployments today, run a
+> single worker per agent type or wait for v0.1.5.
+
 **Enforcement gates for AI agents — five lines, in-process, just Postgres.**
 
 Most LLM observability tools tell you what your agent did, after the fact.

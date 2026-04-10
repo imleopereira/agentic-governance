@@ -79,9 +79,16 @@ class GovernanceSDK:
         self.audit = AuditModule(store, secret=resolved_secret)
         # Three enforcement modules share the audit substrate; the gates
         # module reuses the same secret for HMAC-signed approval tokens.
+        # When a database_url is provided, all enforcement modules use
+        # Postgres-backed stores for multi-process correctness; otherwise
+        # in-memory single-process stores.
+        cost_store = self._build_cost_store(database_url)
+        gates_store = self._build_gates_store(database_url)
         self.scope = ScopeModule(self.audit)
-        self.cost = CostModule(self.audit)
-        self.gates = GatesModule(self.audit, secret=resolved_secret)
+        self.cost = CostModule(self.audit, store=cost_store)
+        self.gates = GatesModule(
+            self.audit, secret=resolved_secret, store=gates_store
+        )
 
     @staticmethod
     def _resolve_audit_secret() -> bytes:
@@ -113,6 +120,26 @@ class GovernanceSDK:
         from .audit.postgres_store import PostgresAuditStore
 
         return PostgresAuditStore(database_url)
+
+    @staticmethod
+    def _build_cost_store(database_url: str | None):  # type: ignore[no-untyped-def]
+        from .cost.store import InMemoryCostStore
+
+        if database_url is None:
+            return InMemoryCostStore()
+        from .cost.postgres_store import PostgresCostStore
+
+        return PostgresCostStore(database_url)
+
+    @staticmethod
+    def _build_gates_store(database_url: str | None):  # type: ignore[no-untyped-def]
+        from .gates.store import InMemoryGatesStore
+
+        if database_url is None:
+            return InMemoryGatesStore()
+        from .gates.postgres_store import PostgresGatesStore
+
+        return PostgresGatesStore(database_url)
 
     async def start(self) -> None:
         """Start background tasks (audit batch flusher, etc)."""

@@ -116,13 +116,18 @@ def test_policy_is_frozen() -> None:
 
 
 @pytest.mark.asyncio
-async def test_track_rejects_negative_delta(cost: CostModule) -> None:
-    """Counters are monotonic — agent cannot 'refund' to evade budget."""
+async def test_track_rejects_negative_delta_silently(cost: CostModule) -> None:
+    """Counters are monotonic — agent cannot 'refund' to evade budget.
+
+    Negative deltas are logged-and-dropped (non-breaking observation contract)
+    rather than raised (which would break the host call flow). The counter
+    must NOT change when a negative delta is rejected.
+    """
     cost.register(BudgetPolicy(agent_id="a", per_session_usd=1.0))
     sid = uuid4()
     await cost.track("a", sid, usd=0.5)
-    with pytest.raises(ValueError, match="non-negative"):
-        await cost.track("a", sid, usd=-0.5)
+    # Must NOT raise — observation surfaces never break the host call.
+    await cost.track("a", sid, usd=-0.5)
     snap = await cost.snapshot("a", sid)
     assert snap.session_usd_used == pytest.approx(0.5)
 

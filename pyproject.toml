@@ -8,11 +8,12 @@ version = "0.1.0"
 description = "Enterprise-grade governance SDK for AI agent deployments"
 requires-python = ">=3.11"
 dependencies = [
-    "sqlalchemy>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
     "pydantic>=2.0",
     "structlog>=24.0",
     "alembic>=1.13",
+    "greenlet>=3.0",
 ]
 
 [project.optional-dependencies]

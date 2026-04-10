@@ -17,9 +17,9 @@ This is the public surface developers interact with:
 """
 from __future__ import annotations
 
-import asyncio
 import functools
 import hashlib
+import inspect
 import json
 from contextlib import AbstractContextManager
 from datetime import datetime, timezone
@@ -84,13 +84,18 @@ class AuditModule:
             )
         self._store = store
         self._secret = secret
+        # Writer is kept for the BatchingWriter test path and degraded-mode
+        # fallback. The chain construction itself goes through the store's
+        # insert_with_chain_lock method, which serializes across processes.
         self._writer = writer or BatchingWriter(primary=store)
-        self._session_locks: dict[UUID, asyncio.Lock] = {}
-        self._last_hmac: dict[UUID, str | None] = {}
-        self._initialized_sessions: set[UUID] = set()
         self._subscribers: list[
             Callable[[AuditEventRecord], Awaitable[None]]
         ] = []
+        # Sessions where the primary store was unreachable on the first
+        # attempt. The next successful log in those sessions will emit an
+        # additional ``chain.degraded_start`` event so the discontinuity is
+        # visible to auditors.
+        self._degraded_starts: set[UUID] = set()
 
     def subscribe(
         self,
@@ -125,27 +130,80 @@ class AuditModule:
     async def log(self, event: AuditEvent) -> AuditEventRecord:
         """Log an audit event. Returns the stored record with chain fields.
 
-        The event is enqueued for async write; this call returns once the
-        chain fields (event_id, prev_hash, hmac, created_at) are computed and
-        the row is in the in-flight buffer. Actual DB persistence happens in
-        the background flush loop.
+        **Non-breaking guarantee:** this method NEVER raises. Audit is an
+        observation surface, not an enforcement gate — if our internal
+        storage is on fire, the host application call must continue. On
+        catastrophic failure (both primary and fallback unreachable, or any
+        unexpected internal exception) we log a critical-level message and
+        return a placeholder record with ``hmac="0"*64`` and a
+        ``metadata["audit.unavailable"] = True`` flag so the caller can
+        detect the degraded state if they care to. The host call always
+        gets a record back.
+
+        Chain construction is atomic with the insert via the store's
+        ``insert_with_chain_lock`` method — under PostgresAuditStore this is
+        backed by a per-session ``pg_advisory_xact_lock``, which serializes
+        chain operations for the session globally across all worker
+        processes connected to the same database. Different sessions never
+        block each other.
+
+        On primary store unavailability the call falls through to the
+        in-memory fallback writer and emits a ``chain.degraded_start``
+        marker on the next successful primary log so auditors can find
+        every gap.
+        """
+        try:
+            return await self._log_unsafe(event)
+        except Exception as exc:  # noqa: BLE001 - non-breaking guarantee
+            logger.critical(
+                "audit.log_completely_failed",
+                error_type=type(exc).__name__,
+                agent_id=event.agent_id,
+                kind=event.kind,
+            )
+            return self._placeholder_record(event)
+
+    def _placeholder_record(self, event: AuditEvent) -> AuditEventRecord:
+        """Build a placeholder record returned when storage is unrecoverable.
+
+        The record is NOT in any store. Its hmac is all zeros so verification
+        will fail loudly if anyone trusts it. The metadata carries an
+        ``audit.unavailable=True`` flag so callers can detect the situation.
+        Returning this rather than raising keeps the host application's
+        flow alive — the audit substrate has failed but the user's call is
+        unaffected.
         """
         session_id = event.session_id or context.current_session() or uuid4()
         parent_id = event.parent_event_id or context.current_parent()
-        event_id = uuid4()
+        marker_metadata = dict(event.metadata)
+        marker_metadata["audit.unavailable"] = True
+        return AuditEventRecord(
+            event_id=uuid4(),
+            session_id=session_id,
+            agent_id=event.agent_id,
+            parent_event_id=parent_id,
+            kind=event.kind,
+            input_hash=event.input_hash,
+            output_hash=event.output_hash,
+            metadata=marker_metadata,
+            prev_hash=None,
+            hmac="0" * 64,
+            created_at=datetime.now(timezone.utc),
+        )
+
+    async def _log_unsafe(self, event: AuditEvent) -> AuditEventRecord:
+        """Inner log path that may raise. Wrapped by ``log`` for safety."""
+        session_id = event.session_id or context.current_session() or uuid4()
+        parent_id = event.parent_event_id or context.current_parent()
         created_at = datetime.now(timezone.utc)
 
-        lock = self._session_locks.setdefault(session_id, asyncio.Lock())
-        async with lock:
-            if session_id not in self._initialized_sessions:
-                # On first log() in a session, hydrate from the store so we
-                # continue any chain that already exists in the DB.
-                self._last_hmac[session_id] = await self._store.get_last_hmac(
-                    session_id
-                )
-                self._initialized_sessions.add(session_id)
-            prev_hash = self._last_hmac.get(session_id)
+        # If we've previously failed on this session AND the primary is
+        # back up, emit a chain.degraded_start marker as the next event so
+        # auditors can find the discontinuity.
+        emit_marker = session_id in self._degraded_starts
 
+        async def build_record(prev_hash: str | None) -> AuditEventRecord:
+            event_id = uuid4()
             mac = compute_event_hmac(
                 secret=self._secret,
                 event_id=event_id,
@@ -159,7 +217,7 @@ class AuditModule:
                 prev_hash=prev_hash,
                 created_at=created_at,
             )
-            record = AuditEventRecord(
+            return AuditEventRecord(
                 event_id=event_id,
                 session_id=session_id,
                 agent_id=event.agent_id,
@@ -172,10 +230,80 @@ class AuditModule:
                 hmac=mac,
                 created_at=created_at,
             )
-            self._last_hmac[session_id] = mac
-            await self._writer.enqueue(record)
-        # Subscribers run OUTSIDE the per-session lock so a slow exporter
-        # cannot block other sessions' chain construction. A failing
+
+        async def build_marker(prev_hash: str | None) -> AuditEventRecord:
+            marker_id = uuid4()
+            marker_ts = datetime.now(timezone.utc)
+            marker_metadata: dict[str, Any] = {
+                "reason": "store unreachable at session start"
+            }
+            marker_hmac = compute_event_hmac(
+                secret=self._secret,
+                event_id=marker_id,
+                session_id=session_id,
+                agent_id=event.agent_id,
+                parent_event_id=None,
+                kind="chain.degraded_start",
+                input_hash=None,
+                output_hash=None,
+                metadata=marker_metadata,
+                prev_hash=prev_hash,
+                created_at=marker_ts,
+            )
+            return AuditEventRecord(
+                event_id=marker_id,
+                session_id=session_id,
+                agent_id=event.agent_id,
+                parent_event_id=None,
+                kind="chain.degraded_start",
+                input_hash=None,
+                output_hash=None,
+                metadata=marker_metadata,
+                prev_hash=prev_hash,
+                hmac=marker_hmac,
+                created_at=marker_ts,
+            )
+
+        try:
+            if emit_marker:
+                # Primary previously failed. Try emitting a recovery marker
+                # on the primary first; the user's event then links to it.
+                # Only clear the degraded flag if the marker emit succeeds.
+                await self._store.insert_with_chain_lock(session_id, build_marker)
+                self._degraded_starts.discard(session_id)
+            record = await self._store.insert_with_chain_lock(
+                session_id, build_record
+            )
+        except Exception as exc:
+            # Primary store is unreachable. Fall through to the
+            # BatchingWriter's in-memory fallback so the host application
+            # keeps working. On the FIRST degraded event in a session, also
+            # emit a chain.degraded_start marker on the fallback so auditors
+            # can find the discontinuity.
+            logger.warning(
+                "audit.degraded_chain_write",
+                session_id=str(session_id),
+                error_type=type(exc).__name__,
+            )
+            is_first_degraded_event = session_id not in self._degraded_starts
+            self._degraded_starts.add(session_id)
+            fallback_store = self._writer.fallback
+            if is_first_degraded_event:
+                try:
+                    await fallback_store.insert_with_chain_lock(
+                        session_id, build_marker
+                    )
+                except Exception as marker_exc:  # noqa: BLE001 - best effort
+                    logger.error(
+                        "audit.fallback_marker_failed",
+                        session_id=str(session_id),
+                        error_type=type(marker_exc).__name__,
+                    )
+            record = await fallback_store.insert_with_chain_lock(
+                session_id, build_record
+            )
+
+        # Subscribers run AFTER the record lands in storage. A failing
         # subscriber must never break the audit log itself.
         for sub in self._subscribers:
             try:
@@ -225,7 +353,7 @@ class AuditModule:
         def decorator(
             func: Callable[P, Awaitable[R]],
         ) -> Callable[P, Awaitable[R]]:
-            if not asyncio.iscoroutinefunction(func):
+            if not inspect.iscoroutinefunction(func):
                 raise TypeError(
                     f"@audit.track requires an async function; "
                     f"{func.__name__} is sync. "

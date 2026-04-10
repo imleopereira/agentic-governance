@@ -8,6 +8,11 @@
 -- application role. See the REVOKE comment at the bottom.
 
 CREATE TABLE IF NOT EXISTS governance_audit_events (
+    -- chain_seq is the authoritative insertion-order key. Reading the
+    -- "latest event in this session" relies on this column, NOT created_at,
+    -- because created_at is set in the application and is not monotonic
+    -- with commit order across concurrent worker processes.
+    chain_seq       BIGSERIAL    NOT NULL,
     event_id        UUID         PRIMARY KEY,
     session_id      UUID         NOT NULL,
     agent_id        VARCHAR(256) NOT NULL,
@@ -21,10 +26,11 @@ CREATE TABLE IF NOT EXISTS governance_audit_events (
     created_at      TIMESTAMPTZ  NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_session ON governance_audit_events (session_id);
-CREATE INDEX IF NOT EXISTS idx_audit_agent   ON governance_audit_events (agent_id);
-CREATE INDEX IF NOT EXISTS idx_audit_parent  ON governance_audit_events (parent_event_id);
-CREATE INDEX IF NOT EXISTS idx_audit_created ON governance_audit_events (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_session     ON governance_audit_events (session_id);
+CREATE INDEX IF NOT EXISTS idx_audit_session_seq ON governance_audit_events (session_id, chain_seq DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_agent       ON governance_audit_events (agent_id);
+CREATE INDEX IF NOT EXISTS idx_audit_parent      ON governance_audit_events (parent_event_id);
+CREATE INDEX IF NOT EXISTS idx_audit_created     ON governance_audit_events (created_at);
 
 -- Append-only enforcement: block UPDATE and DELETE at the database level.
 CREATE OR REPLACE FUNCTION governance_audit_append_only()

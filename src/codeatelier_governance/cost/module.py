@@ -13,26 +13,30 @@ Pattern:
 
 Every breach is auto-logged as an audit event with kind="budget.exceeded".
 
-v0.1 limitations (documented, accepted):
-    * In-memory state only. Restarts lose counters. v0.2 will add Postgres
-      durability for cross-restart enforcement.
-    * Single-process. Multi-worker apps undercount. v0.2 will add a
-      shared-counter backend.
+**Non-breaking guarantee:** ``track`` is an observation surface and NEVER
+raises — internal failures (DB unreachable, validation, etc.) are logged
+and swallowed so the host application call always continues.
+``check_or_raise`` is an enforcement gate and DOES raise ``BudgetExceeded``
+by contract; that's the whole point.
+
+Multi-process correctness: when constructed with a ``PostgresCostStore``,
+counters are atomic across all worker processes via row-level UPSERT
+addition. Concurrent ``track`` calls from different workers all land with
+no lost updates.
 """
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
 from uuid import UUID
+
+import structlog
 
 from ..audit.models import AuditEvent
 from ..audit.module import AuditModule
 from .errors import BudgetExceeded
 from .models import BudgetPolicy, BudgetSnapshot
+from .store import CostStore, InMemoryCostStore
 
-
-def _utc_day_start(now: datetime) -> datetime:
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+logger = structlog.get_logger(__name__)
 
 
 class CostModule:
@@ -42,12 +46,11 @@ class CostModule:
         self,
         audit: AuditModule,
         policies: list[BudgetPolicy] | None = None,
+        store: CostStore | None = None,
     ) -> None:
         self._audit = audit
+        self._store: CostStore = store or InMemoryCostStore()
         self._policies: dict[str, BudgetPolicy] = {}
-        self._session_usage: dict[tuple[str, UUID], tuple[float, int]] = {}
-        self._agent_daily: dict[str, tuple[float, int, datetime]] = {}
-        self._lock = asyncio.Lock()
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
@@ -58,6 +61,9 @@ class CostModule:
     def get_policy(self, agent_id: str) -> BudgetPolicy | None:
         return self._policies.get(agent_id)
 
+    async def close(self) -> None:
+        await self._store.close()
+
     async def track(
         self,
         agent_id: str,
@@ -66,29 +72,32 @@ class CostModule:
         tokens: int = 0,
         usd: float = 0.0,
     ) -> None:
-        """Record post-call usage. Counters are monotonic — only ever add."""
+        """Record post-call usage. NEVER raises.
+
+        Counters are monotonic — only ever add. Negative deltas are
+        rejected via a logged warning rather than an exception, because
+        rejecting them would either silently lose the legitimate usage
+        OR break the host application — neither is acceptable.
+        """
         if tokens < 0 or usd < 0.0:
-            raise ValueError(
-                f"cost.track: tokens and usd must be non-negative "
-                f"(got tokens={tokens}, usd={usd}). "
-                f"Fix: track only positive deltas."
+            logger.warning(
+                "cost.track_negative_delta_rejected",
+                agent_id=agent_id,
+                tokens=tokens,
+                usd=usd,
             )
-        now = datetime.now(timezone.utc)
-        day = _utc_day_start(now)
-        async with self._lock:
-            cur_usd, cur_tok = self._session_usage.get(
-                (agent_id, session_id), (0.0, 0)
+            return
+        try:
+            await self._store.track(
+                agent_id, session_id, tokens=tokens, usd=usd
             )
-            self._session_usage[(agent_id, session_id)] = (
-                cur_usd + usd,
-                cur_tok + tokens,
+        except Exception as exc:  # noqa: BLE001 - non-breaking guarantee
+            logger.error(
+                "cost.track_failed",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+                session_id=str(session_id),
             )
-            d_usd, d_tok, d_day = self._agent_daily.get(
-                agent_id, (0.0, 0, day)
-            )
-            if d_day < day:
-                d_usd, d_tok, d_day = 0.0, 0, day
-            self._agent_daily[agent_id] = (d_usd + usd, d_tok + tokens, d_day)
 
     async def check_or_raise(
         self,
@@ -97,18 +106,31 @@ class CostModule:
     ) -> None:
         """Raise BudgetExceeded if any registered cap has been exceeded.
 
-        No-op for agents without a registered policy. The intended pattern
-        is to call this BEFORE the LLM/tool invocation; if it raises, the
-        invocation is skipped.
+        This is an ENFORCEMENT gate: it raises by contract. The host call
+        is expected to catch it and surface a 429 / quota error to the user.
+
+        No-op for agents without a registered policy.
         """
         policy = self._policies.get(agent_id)
         if policy is None:
-            return  # default allow for agents without a policy
-        async with self._lock:
-            s_usd, s_tok = self._session_usage.get(
-                (agent_id, session_id), (0.0, 0)
+            return
+        try:
+            s_usd, s_tok = await self._store.get_session_usage(
+                agent_id, session_id
             )
-            d_usd, d_tok, _ = self._agent_daily.get(agent_id, (0.0, 0, None))
+            d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
+        except Exception as exc:
+            # Storage failure on a check is a special case: we cannot
+            # determine whether the cap is exceeded. Default policy is to
+            # FAIL OPEN (allow the call) rather than block on uncertainty,
+            # because blocking on every storage hiccup would be worse than
+            # over-allowing during an outage. Logged so operators can react.
+            logger.error(
+                "cost.check_failed_fail_open",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+            )
+            return
 
         breach: tuple[str, float, float] | None = None
         if policy.per_session_usd is not None and s_usd > policy.per_session_usd:
@@ -165,13 +187,23 @@ class CostModule:
         agent_id: str,
         session_id: UUID,
     ) -> BudgetSnapshot:
-        """Read-only snapshot of current usage and remaining budget."""
+        """Read-only snapshot of current usage and remaining budget.
+
+        Defensive: if storage fails, returns zeros and logs the error.
+        """
         policy = self._policies.get(agent_id)
-        async with self._lock:
-            s_usd, s_tok = self._session_usage.get(
-                (agent_id, session_id), (0.0, 0)
+        try:
+            s_usd, s_tok = await self._store.get_session_usage(
+                agent_id, session_id
             )
-            d_usd, d_tok, _ = self._agent_daily.get(agent_id, (0.0, 0, None))
+            d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
+        except Exception as exc:
+            logger.error(
+                "cost.snapshot_failed",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+            )
+            s_usd, s_tok, d_usd, d_tok = 0.0, 0, 0.0, 0
 
         def _remaining_f(cap: float | None, used: float) -> float | None:
             return None if cap is None else max(0.0, cap - used)

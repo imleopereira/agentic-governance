@@ -35,6 +35,9 @@ class FailingStore(AuditStore):
     def __init__(self) -> None:
         self.attempts = 0
 
+    async def insert_with_chain_lock(self, session_id, builder):  # type: ignore[no-untyped-def]
+        raise RuntimeError("primary unavailable")
+
     async def write_batch(self, events):  # type: ignore[no-untyped-def]
         self.attempts += 1
         raise RuntimeError("primary unavailable")

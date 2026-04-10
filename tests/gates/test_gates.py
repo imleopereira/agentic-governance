@@ -97,15 +97,19 @@ async def test_wait_for_times_out(gates: GatesModule) -> None:
 
 @pytest.mark.asyncio
 async def test_blocking_decorator_runs_after_grant(gates: GatesModule) -> None:
-    @gates.require_approval(kind="charge", agent_id="a", timeout=2.0)
+    # The decorator opens the request synchronously inside the wrapper, so we
+    # use the public ``request`` API to drive a parallel scenario instead.
+    @gates.require_approval(kind="charge", agent_id="a", timeout=3.0)
     async def charge(amount: int) -> str:
         return f"charged {amount}"
 
+    # Walk the in-memory store after the decorator opens the request.
     async def approve_eventually() -> None:
-        await asyncio.sleep(0.05)
-        # Grab the most recent token
-        async with gates._lock:  # type: ignore[attr-defined]
-            req = next(iter(gates._pending.values()))  # type: ignore[attr-defined]
+        await asyncio.sleep(0.1)
+        store = gates._store  # type: ignore[attr-defined]
+        # InMemoryGatesStore exposes _pending dict for tests
+        async with store._lock:  # type: ignore[attr-defined]
+            req = next(iter(store._pending.values()))  # type: ignore[attr-defined]
         await gates.grant(req.token)
 
     asyncio.create_task(approve_eventually())

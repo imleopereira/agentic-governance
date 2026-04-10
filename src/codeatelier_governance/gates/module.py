@@ -29,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 from uuid import UUID, uuid4
 
+import structlog
+
 from ..audit.models import AuditEvent
 from ..audit.module import AuditModule
 from .errors import (
@@ -38,7 +40,10 @@ from .errors import (
     ApprovalTokenError,
 )
 from .models import ApprovalRequest
+from .store import GatesStore, InMemoryGatesStore
 from .tokens import make_token, parse_token
+
+logger = structlog.get_logger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -69,6 +74,8 @@ class GatesModule:
         *,
         secret: bytes,
         default_expires_in: timedelta = DEFAULT_EXPIRES_IN,
+        store: GatesStore | None = None,
+        poll_interval_s: float = 0.5,
     ) -> None:
         if len(secret) < MIN_GATES_SECRET_BYTES:
             raise ValueError(
@@ -78,11 +85,11 @@ class GatesModule:
         self._audit = audit
         self._secret = secret
         self._default_expires_in = default_expires_in
-        self._pending: dict[UUID, ApprovalRequest] = {}
-        self._resolved: set[UUID] = set()
-        self._outcomes: dict[UUID, bool] = {}
-        self._events: dict[UUID, asyncio.Event] = {}
-        self._lock = asyncio.Lock()
+        self._store: GatesStore = store or InMemoryGatesStore()
+        self._poll_interval_s = poll_interval_s
+
+    async def close(self) -> None:
+        await self._store.close()
 
     async def request(
         self,
@@ -93,6 +100,11 @@ class GatesModule:
         expires_in: timedelta | None = None,
     ) -> ApprovalRequest:
         """Open an approval request and return the pending object.
+
+        Observation surface: never raises on internal failure. If the store
+        is unreachable, a logged warning is emitted and the request is
+        returned anyway with no persistence — the host call continues.
+        Resolution will fail (unknown request_id) until the store recovers.
 
         The caller is responsible for surfacing the request to a human (UI,
         Slack, email, etc.). The human's tool calls ``grant(token)`` or
@@ -118,9 +130,15 @@ class GatesModule:
             payload=payload if isinstance(payload, dict) else {},
             token=token,
         )
-        async with self._lock:
-            self._pending[request_id] = req
-            self._events[request_id] = asyncio.Event()
+        try:
+            await self._store.insert_pending(req)
+        except Exception as exc:  # noqa: BLE001 - non-breaking guarantee
+            logger.error(
+                "gates.request_persist_failed",
+                error_type=type(exc).__name__,
+                request_id=str(request_id),
+            )
+        # audit.log is itself non-breaking; safe to call.
         await self._audit.log(
             AuditEvent(
                 agent_id=agent_id,
@@ -135,7 +153,12 @@ class GatesModule:
         return req
 
     async def grant(self, token: str) -> None:
-        """Approve the request bound to ``token``. Single-use, time-bound."""
+        """Approve the request bound to ``token``. Single-use, time-bound.
+
+        Operator-facing call: raises ApprovalTokenError on bad token, replay,
+        action_hash mismatch, expiration, etc. Operators are expected to
+        handle the error (e.g. show "this approval was already used").
+        """
         await self._resolve(token, granted=True)
 
     async def deny(self, token: str) -> None:
@@ -146,26 +169,16 @@ class GatesModule:
         request_id, action_hash, _expires = parse_token(
             secret=self._secret, token=token
         )
-        async with self._lock:
-            if request_id in self._resolved:
-                raise ApprovalTokenError(
-                    "approval token: already used (single-use only)"
-                )
-            req = self._pending.get(request_id)
-            if req is None:
-                raise ApprovalTokenError(
-                    "approval token: unknown request_id"
-                )
-            if req.action_hash != action_hash:
-                raise ApprovalTokenError(
-                    "approval token: action_hash mismatch"
-                )
-            self._resolved.add(request_id)
-            self._outcomes[request_id] = granted
-            event = self._events.get(request_id)
-            self._pending.pop(request_id, None)
-        if event is not None:
-            event.set()
+        # Verify action_hash by re-fetching the pending row.
+        pending = await self._store.get_pending(request_id)
+        if pending is not None and pending.action_hash != action_hash:
+            raise ApprovalTokenError(
+                "approval token: action_hash mismatch"
+            )
+        # Atomic resolution at the store layer (single-use guard).
+        req = await self._store.resolve(
+            request_id, "granted" if granted else "denied"
+        )
         await self._audit.log(
             AuditEvent(
                 agent_id=req.agent_id,
@@ -180,27 +193,37 @@ class GatesModule:
     async def wait_for(self, request_id: UUID, timeout: float) -> bool:
         """Block until the request is resolved. Returns True if granted.
 
+        Polls the store every ``poll_interval_s`` seconds. Polling is the
+        source of truth — multi-process correct without LISTEN/NOTIFY.
+
         Raises :class:`ApprovalTimeout` if the timeout elapses without
         resolution. Raises :class:`ApprovalDenied` if the request was denied.
         """
-        async with self._lock:
-            event = self._events.get(request_id)
-        if event is None:
-            raise ApprovalTokenError(
-                f"wait_for: unknown request_id={request_id}"
-            )
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout)
-        except asyncio.TimeoutError as exc:
-            raise ApprovalTimeout(
-                f"approval timeout after {timeout}s for request {request_id}"
-            ) from exc
-        granted = self._outcomes.get(request_id, False)
-        if not granted:
-            raise ApprovalDenied(
-                f"approval denied for request {request_id}"
-            )
-        return True
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            try:
+                resolution = await self._store.get_resolution(request_id)
+            except Exception as exc:
+                logger.warning(
+                    "gates.wait_for_poll_failed",
+                    error_type=type(exc).__name__,
+                    request_id=str(request_id),
+                )
+                resolution = None
+            if resolution == "granted":
+                return True
+            if resolution == "denied":
+                raise ApprovalDenied(
+                    f"approval denied for request {request_id}"
+                )
+            now = loop.time()
+            if now >= deadline:
+                raise ApprovalTimeout(
+                    f"approval timeout after {timeout}s for request {request_id}"
+                )
+            sleep_for = min(self._poll_interval_s, deadline - now)
+            await asyncio.sleep(sleep_for)
 
     def require_approval(
         self,

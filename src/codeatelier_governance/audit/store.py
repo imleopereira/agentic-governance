@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections import deque
+from typing import Awaitable, Callable
 from uuid import UUID
 
 import structlog
 
 from .errors import StoreUnavailableError
 from .models import AuditEventRecord
+
+ChainBuilder = Callable[[str | None], Awaitable[AuditEventRecord]]
 
 logger = structlog.get_logger(__name__)
 
@@ -32,8 +35,37 @@ class AuditStore(ABC):
     """Abstract audit storage backend."""
 
     @abstractmethod
+    async def insert_with_chain_lock(
+        self,
+        session_id: UUID,
+        builder: ChainBuilder,
+    ) -> AuditEventRecord:
+        """Atomically: lock the session, read the latest hmac, build a new
+        record using the prev_hash, insert it, release the lock.
+
+        The ``builder`` callback receives the latest hmac (or None if no
+        events exist for the session yet) and returns the new
+        :class:`AuditEventRecord` to insert. The store guarantees no other
+        process can interleave a chain operation for the same session_id
+        between the read and the insert.
+
+        Implementations:
+            - InMemoryAuditStore uses a per-session asyncio.Lock
+            - PostgresAuditStore uses pg_advisory_xact_lock(hashtext(session_id))
+
+        Different sessions never block each other.
+
+        Raises:
+            StoreUnavailableError: the underlying store is unreachable.
+        """
+
+    @abstractmethod
     async def write_batch(self, events: list[AuditEventRecord]) -> None:
-        """Persist a batch of events. MUST be all-or-nothing."""
+        """Persist a batch of events. MUST be all-or-nothing.
+
+        Used by ``BatchingWriter`` for non-chain writes (degraded-mode
+        spillover etc.). The chain path uses ``insert_with_chain_lock``.
+        """
 
     @abstractmethod
     async def get_event(self, event_id: UUID) -> AuditEventRecord | None:
@@ -48,7 +80,11 @@ class AuditStore(ABC):
 
     @abstractmethod
     async def get_last_hmac(self, session_id: UUID) -> str | None:
-        """Return the most-recent event's HMAC for the session, or None."""
+        """Return the most-recent event's HMAC for the session, or None.
+
+        Kept for backwards compatibility with the BatchingWriter path. New
+        code should use ``insert_with_chain_lock`` for chain construction.
+        """
 
     async def close(self) -> None:
         """Release resources. Override if needed."""
@@ -67,6 +103,25 @@ class InMemoryAuditStore(AuditStore):
         self._order: deque[UUID] = deque()
         self._max = max_events
         self._lock = asyncio.Lock()
+        self._session_locks: dict[UUID, asyncio.Lock] = {}
+
+    async def insert_with_chain_lock(
+        self,
+        session_id: UUID,
+        builder: ChainBuilder,
+    ) -> AuditEventRecord:
+        # Per-session lock — different sessions never block each other.
+        sess_lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+        async with sess_lock:
+            ids = self._by_session.get(session_id, [])
+            prev_hash = self._events[ids[-1]].hmac if ids else None
+            record = await builder(prev_hash)
+            async with self._lock:
+                self._events[record.event_id] = record
+                self._by_session.setdefault(session_id, []).append(record.event_id)
+                self._order.append(record.event_id)
+                self._evict_if_full()
+        return record
 
     async def write_batch(self, events: list[AuditEventRecord]) -> None:
         if not events:

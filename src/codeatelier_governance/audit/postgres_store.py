@@ -13,14 +13,14 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, select
+from sqlalchemy import Column, DateTime, MetaData, String, Table, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .errors import StoreUnavailableError
 from .models import AuditEventRecord
-from .store import AuditStore
+from .store import AuditStore, ChainBuilder
 
 metadata = MetaData()
 
@@ -63,6 +63,65 @@ class PostgresAuditStore(AuditStore):
             pool_size=5,
             max_overflow=10,
         )
+
+    async def insert_with_chain_lock(
+        self,
+        session_id: UUID,
+        builder: ChainBuilder,
+    ) -> AuditEventRecord:
+        """Atomic chain construction across all workers via Postgres advisory locks.
+
+        Inside one transaction:
+            1. Acquire ``pg_advisory_xact_lock(hashtext(session_id::text))`` —
+               serializes chain operations for this session globally across all
+               workers connected to the same Postgres. Different sessions never
+               contend.
+            2. SELECT the most recent hmac for the session.
+            3. Call the builder callback with that prev_hash to construct the
+               new record (the caller computes the HMAC).
+            4. INSERT the new row.
+            5. COMMIT — releases the advisory lock.
+        """
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:sid))"),
+                    {"sid": str(session_id)},
+                )
+                res = await conn.execute(
+                    text(
+                        "SELECT hmac_value FROM governance_audit_events "
+                        "WHERE session_id = :sid "
+                        "ORDER BY chain_seq DESC LIMIT 1"
+                    ),
+                    {"sid": str(session_id)},
+                )
+                row = res.first()
+                prev_hash: str | None = row[0] if row is not None else None
+                record = await builder(prev_hash)
+                await conn.execute(
+                    audit_events.insert(),
+                    [
+                        {
+                            "event_id": record.event_id,
+                            "session_id": record.session_id,
+                            "agent_id": record.agent_id,
+                            "parent_event_id": record.parent_event_id,
+                            "kind": record.kind,
+                            "input_hash": record.input_hash,
+                            "output_hash": record.output_hash,
+                            "metadata_json": record.metadata,
+                            "prev_hash": record.prev_hash,
+                            "hmac_value": record.hmac,
+                            "created_at": record.created_at,
+                        }
+                    ],
+                )
+            return record
+        except Exception as exc:
+            raise StoreUnavailableError(
+                f"postgres insert_with_chain_lock failed: {type(exc).__name__}"
+            ) from exc
 
     async def write_batch(self, events: list[AuditEventRecord]) -> None:
         if not events:
