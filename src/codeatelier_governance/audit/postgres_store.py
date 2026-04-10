@@ -13,6 +13,8 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
+import struct
+
 from sqlalchemy import Column, DateTime, MetaData, String, Table, select, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -21,6 +23,19 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from .errors import StoreUnavailableError
 from .models import AuditEventRecord
 from .store import AuditStore, ChainBuilder
+
+
+def _session_lock_key(session_id: UUID) -> int:
+    """Convert a session UUID to a signed 64-bit int for advisory locking.
+
+    pg_advisory_xact_lock(bigint) takes a 64-bit signed integer. Using
+    hashtext() of the UUID string would only give us 32 bits and trigger
+    birthday-paradox collisions at ~65k unique sessions. Instead we read
+    the first 8 bytes of the UUID directly — UUID v4 is random across
+    those bytes, so collisions only occur at ~4.3 billion sessions.
+    """
+    value: int = struct.unpack(">q", session_id.bytes[:8])[0]
+    return value
 
 metadata = MetaData()
 
@@ -71,22 +86,32 @@ class PostgresAuditStore(AuditStore):
     ) -> AuditEventRecord:
         """Atomic chain construction across all workers via Postgres advisory locks.
 
-        Inside one transaction:
-            1. Acquire ``pg_advisory_xact_lock(hashtext(session_id::text))`` —
-               serializes chain operations for this session globally across all
-               workers connected to the same Postgres. Different sessions never
-               contend.
-            2. SELECT the most recent hmac for the session.
-            3. Call the builder callback with that prev_hash to construct the
-               new record (the caller computes the HMAC).
-            4. INSERT the new row.
-            5. COMMIT — releases the advisory lock.
+        Optimistic two-phase pattern:
+            1. Read prev_hash WITHOUT holding the lock (snapshot read).
+            2. Call ``builder(prev_hash)`` outside the lock to compute the
+               record (HMAC computation runs concurrently across workers).
+            3. Open a transaction, acquire the per-session advisory lock,
+               re-read prev_hash to verify it hasn't changed under us.
+            4. If unchanged: INSERT and commit (releases the lock).
+            5. If changed (rare race): rebuild the record with the actual
+               prev_hash, then INSERT.
+
+        The lock-held window is reduced to roughly two SELECTs + an INSERT
+        — no application-level computation runs while the lock is held —
+        so contention drops sharply under high session-internal concurrency.
         """
+        lock_key = _session_lock_key(session_id)
         try:
+            # Phase 1: optimistic read (no lock held)
+            optimistic_prev = await self._read_last_hmac_no_lock(session_id)
+            # Phase 1.5: build the record with the optimistic prev_hash
+            record = await builder(optimistic_prev)
+
+            # Phase 2: lock + verify + insert
             async with self._engine.begin() as conn:
                 await conn.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:sid))"),
-                    {"sid": str(session_id)},
+                    text("SELECT pg_advisory_xact_lock(:key)"),
+                    {"key": lock_key},
                 )
                 res = await conn.execute(
                     text(
@@ -97,8 +122,11 @@ class PostgresAuditStore(AuditStore):
                     {"sid": str(session_id)},
                 )
                 row = res.first()
-                prev_hash: str | None = row[0] if row is not None else None
-                record = await builder(prev_hash)
+                actual_prev: str | None = row[0] if row is not None else None
+                if actual_prev != optimistic_prev:
+                    # Race: another worker inserted while we were computing.
+                    # Rebuild the record with the real prev_hash.
+                    record = await builder(actual_prev)
                 await conn.execute(
                     audit_events.insert(),
                     [
@@ -122,6 +150,20 @@ class PostgresAuditStore(AuditStore):
             raise StoreUnavailableError(
                 f"postgres insert_with_chain_lock failed: {type(exc).__name__}"
             ) from exc
+
+    async def _read_last_hmac_no_lock(self, session_id: UUID) -> str | None:
+        """Optimistic read of the latest hmac for a session, no advisory lock."""
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT hmac_value FROM governance_audit_events "
+                    "WHERE session_id = :sid "
+                    "ORDER BY chain_seq DESC LIMIT 1"
+                ),
+                {"sid": str(session_id)},
+            )
+            row = res.first()
+        return row[0] if row is not None else None
 
     async def write_batch(self, events: list[AuditEventRecord]) -> None:
         if not events:
@@ -174,16 +216,35 @@ class PostgresAuditStore(AuditStore):
         return list(reversed(chain))
 
     async def get_last_hmac(self, session_id: UUID) -> str | None:
-        stmt = (
-            select(audit_events.c.hmac_value)
-            .where(audit_events.c.session_id == session_id)
-            .order_by(audit_events.c.created_at.desc())
-            .limit(1)
-        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(stmt)
-            row = result.first()
+            res = await conn.execute(
+                text(
+                    "SELECT hmac_value FROM governance_audit_events "
+                    "WHERE session_id = :sid "
+                    "ORDER BY chain_seq DESC LIMIT 1"
+                ),
+                {"sid": str(session_id)},
+            )
+            row = res.first()
         return row[0] if row is not None else None
+
+    async def get_session_events(
+        self, session_id: UUID
+    ) -> list[AuditEventRecord]:
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT event_id, session_id, agent_id, parent_event_id, "
+                    "kind, input_hash, output_hash, metadata_json, "
+                    "prev_hash, hmac_value, created_at "
+                    "FROM governance_audit_events "
+                    "WHERE session_id = :sid "
+                    "ORDER BY chain_seq"
+                ),
+                {"sid": str(session_id)},
+            )
+            rows = list(res.mappings())
+        return [_row_to_record(row) for row in rows]
 
     async def close(self) -> None:
         await self._engine.dispose()

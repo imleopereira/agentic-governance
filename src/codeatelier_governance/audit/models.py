@@ -96,11 +96,19 @@ class AuditEvent(BaseModel):
         _validate_metadata(self.metadata)
 
 
+PLACEHOLDER_HMAC = "0" * 64
+PLACEHOLDER_METADATA_KEY = "audit.unavailable"
+
+
 class AuditEventRecord(BaseModel):
     """Stored representation of an audit event including chain fields.
 
     Frozen — once constructed, cannot be mutated. The DB enforces append-only
     via triggers; this is the application-layer mirror of that invariant.
+
+    A record may be a *placeholder* (returned by ``audit.log`` when both
+    primary and fallback storage failed) — in that case ``is_placeholder``
+    returns True. Callers who care about audit completeness should check it.
     """
 
     model_config = ConfigDict(
@@ -120,3 +128,17 @@ class AuditEventRecord(BaseModel):
     prev_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     hmac: str = Field(min_length=64, max_length=MAX_HASH_LEN)
     created_at: datetime
+
+    @property
+    def is_placeholder(self) -> bool:
+        """True iff this record was synthesized because storage was down.
+
+        A placeholder has ``hmac == "0" * 64`` and a metadata flag
+        ``audit.unavailable=True``. The host application got a record back
+        so its flow continued, but the underlying audit substrate was
+        unable to persist the event. Operators should alert on these.
+        """
+        return (
+            self.hmac == PLACEHOLDER_HMAC
+            and self.metadata.get(PLACEHOLDER_METADATA_KEY) is True
+        )

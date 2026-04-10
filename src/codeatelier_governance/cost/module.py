@@ -47,9 +47,12 @@ class CostModule:
         audit: AuditModule,
         policies: list[BudgetPolicy] | None = None,
         store: CostStore | None = None,
+        *,
+        fail_open: bool = False,
     ) -> None:
         self._audit = audit
         self._store: CostStore = store or InMemoryCostStore()
+        self._fail_open = fail_open
         self._policies: dict[str, BudgetPolicy] = {}
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
@@ -109,6 +112,15 @@ class CostModule:
         This is an ENFORCEMENT gate: it raises by contract. The host call
         is expected to catch it and surface a 429 / quota error to the user.
 
+        **Fail-closed semantics on storage failure.** If we cannot read the
+        counter (DB unreachable, query timeout, etc.) we cannot verify the
+        budget, and a fail-OPEN policy would let an attacker drain budgets
+        by taking down the cost store. We FAIL CLOSED — deny the call,
+        log critical, write a ``budget.check_failed`` audit row.
+
+        Operators who explicitly want fail-open availability can construct
+        ``CostModule(..., fail_open=True)`` and accept the risk.
+
         No-op for agents without a registered policy.
         """
         policy = self._policies.get(agent_id)
@@ -120,17 +132,38 @@ class CostModule:
             )
             d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
         except Exception as exc:
-            # Storage failure on a check is a special case: we cannot
-            # determine whether the cap is exceeded. Default policy is to
-            # FAIL OPEN (allow the call) rather than block on uncertainty,
-            # because blocking on every storage hiccup would be worse than
-            # over-allowing during an outage. Logged so operators can react.
-            logger.error(
-                "cost.check_failed_fail_open",
+            logger.critical(
+                "cost.check_failed_fail_closed",
                 error_type=type(exc).__name__,
                 agent_id=agent_id,
+                fail_open=self._fail_open,
             )
-            return
+            # Best-effort audit row — audit.log is itself non-breaking, so
+            # this never raises even if the audit substrate is also down.
+            await self._audit.log(
+                AuditEvent(
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    kind="budget.check_failed",
+                    metadata={
+                        "reason": "cost store unreachable",
+                        "error_type": type(exc).__name__,
+                        "fail_mode": "open" if self._fail_open else "closed",
+                    },
+                )
+            )
+            if self._fail_open:
+                logger.warning(
+                    "cost.check_failed_allowing_call_per_fail_open",
+                    agent_id=agent_id,
+                )
+                return
+            raise BudgetExceeded(
+                f"cost store unreachable; failing closed for safety. "
+                f"agent_id={agent_id!r}, error={type(exc).__name__}. "
+                f"Set fail_open=True at SDK init to allow the call instead "
+                f"(NOT recommended for production)."
+            )
 
         breach: tuple[str, float, float] | None = None
         if policy.per_session_usd is not None and s_usd > policy.per_session_usd:

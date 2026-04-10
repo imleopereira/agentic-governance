@@ -181,6 +181,34 @@ class PostgresGatesStore(GatesStore):
             return "denied"
         return None
 
+    async def cleanup_resolved(
+        self,
+        older_than_days: int = 90,
+    ) -> int:
+        """Delete resolved gate rows older than ``older_than_days`` days.
+
+        Operators should run this periodically (cron, scheduled job, manual)
+        to keep the table from growing unbounded. v0.1.5 does not auto-run
+        this; the operator chooses the cadence and retention window.
+
+        Returns the number of rows deleted.
+
+        IMPORTANT: only deletes rows where ``resolved_at IS NOT NULL``.
+        Pending requests are NEVER deleted by this method.
+        """
+        if older_than_days < 0:
+            raise ValueError("older_than_days must be non-negative")
+        async with self._engine.begin() as conn:
+            res = await conn.execute(
+                text(
+                    "DELETE FROM governance_gates_pending "
+                    "WHERE resolved_at IS NOT NULL "
+                    "  AND resolved_at < NOW() - make_interval(days => :days)"
+                ),
+                {"days": older_than_days},
+            )
+        return res.rowcount or 0
+
     async def close(self) -> None:
         await self._engine.dispose()
 

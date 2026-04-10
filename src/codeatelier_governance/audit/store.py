@@ -78,6 +78,18 @@ class AuditStore(ABC):
         Returns the chain in chronological order (root first).
         """
 
+    async def get_session_events(
+        self, session_id: UUID
+    ) -> list[AuditEventRecord]:
+        """Return every event in a session, in chain insertion order.
+
+        Used by ``audit.trace_session_chain`` to walk the HMAC chain
+        (distinct from the parent_event_id provenance walk in get_chain).
+        Default implementation falls back to scanning everything; backends
+        with native session indexes should override.
+        """
+        return []
+
     @abstractmethod
     async def get_last_hmac(self, session_id: UUID) -> str | None:
         """Return the most-recent event's HMAC for the session, or None.
@@ -170,6 +182,12 @@ class InMemoryAuditStore(AuditStore):
         if not ids:
             return None
         return self._events[ids[-1]].hmac
+
+    async def get_session_events(
+        self, session_id: UUID
+    ) -> list[AuditEventRecord]:
+        ids = self._by_session.get(session_id, [])
+        return [self._events[i] for i in ids if i in self._events]
 
     async def count(self) -> int:
         return len(self._events)

@@ -16,14 +16,13 @@ deltas with no lost updates.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from .errors import CostError
-from .store import CostStore, _utc_day_start
+from .store import CostStore
 
 
 def _normalize_url(url: str) -> str:
@@ -55,8 +54,10 @@ class PostgresCostStore(CostStore):
         tokens: int,
         usd: float,
     ) -> None:
-        now = datetime.now(timezone.utc)
-        day = _utc_day_start(now).date()
+        # Day boundary is computed by Postgres atomically with the INSERT
+        # so a track() call straddling UTC midnight cannot drop the row
+        # into yesterday's bucket while the next check_or_raise reads from
+        # tomorrow's. Single source of truth: the database clock.
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(
@@ -83,7 +84,7 @@ class PostgresCostStore(CostStore):
                         """
                         INSERT INTO governance_cost_agent_daily
                             (agent_id, day_utc, usd_used, tokens_used, last_updated)
-                        VALUES (:agent_id, :day, :usd, :tokens, NOW())
+                        VALUES (:agent_id, (NOW() AT TIME ZONE 'UTC')::DATE, :usd, :tokens, NOW())
                         ON CONFLICT (agent_id, day_utc) DO UPDATE SET
                             usd_used    = governance_cost_agent_daily.usd_used    + EXCLUDED.usd_used,
                             tokens_used = governance_cost_agent_daily.tokens_used + EXCLUDED.tokens_used,
@@ -92,7 +93,6 @@ class PostgresCostStore(CostStore):
                     ),
                     {
                         "agent_id": agent_id,
-                        "day": day,
                         "usd": usd,
                         "tokens": tokens,
                     },
@@ -124,14 +124,15 @@ class PostgresCostStore(CostStore):
         self,
         agent_id: str,
     ) -> tuple[float, int]:
-        day = _utc_day_start(datetime.now(timezone.utc)).date()
+        # Same source of truth as track(): Postgres CURRENT_DATE in UTC.
         async with self._engine.connect() as conn:
             res = await conn.execute(
                 text(
                     "SELECT usd_used, tokens_used FROM governance_cost_agent_daily "
-                    "WHERE agent_id = :agent_id AND day_utc = :day"
+                    "WHERE agent_id = :agent_id "
+                    "  AND day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"
                 ),
-                {"agent_id": agent_id, "day": day},
+                {"agent_id": agent_id},
             )
             row = res.first()
         if row is None:

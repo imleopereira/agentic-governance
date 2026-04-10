@@ -25,6 +25,7 @@ import functools
 import hashlib
 import inspect
 import json
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
 from uuid import UUID, uuid4
@@ -77,11 +78,9 @@ class GatesModule:
         store: GatesStore | None = None,
         poll_interval_s: float = 0.5,
     ) -> None:
-        if len(secret) < MIN_GATES_SECRET_BYTES:
-            raise ValueError(
-                f"gates secret must be at least {MIN_GATES_SECRET_BYTES} bytes; "
-                f"use secrets.token_bytes(32)."
-            )
+        from ..audit.module import _check_secret_strength
+
+        _check_secret_strength(secret, "gates secret")
         self._audit = audit
         self._secret = secret
         self._default_expires_in = default_expires_in
@@ -222,7 +221,9 @@ class GatesModule:
                 raise ApprovalTimeout(
                     f"approval timeout after {timeout}s for request {request_id}"
                 )
-            sleep_for = min(self._poll_interval_s, deadline - now)
+            # ±20% jitter to avoid thundering-herd polling under load
+            jittered = self._poll_interval_s * random.uniform(0.8, 1.2)
+            sleep_for = min(jittered, deadline - now)
             await asyncio.sleep(sleep_for)
 
     def require_approval(

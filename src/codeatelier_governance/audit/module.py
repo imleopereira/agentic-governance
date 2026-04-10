@@ -41,6 +41,34 @@ R = TypeVar("R")
 
 MAX_PAYLOAD_HASH_BYTES = 65_536  # 64 KiB cap for serialized args/result hashing
 MIN_SECRET_BYTES = 32
+MIN_SECRET_UNIQUE_BYTES = 8
+
+
+def _check_secret_strength(secret: bytes, name: str = "audit secret") -> None:
+    """Reject obviously weak secrets to prevent placeholder values from
+    accidentally reaching production.
+
+    Two checks:
+        * Length >= 32 bytes (HMAC-SHA256 key length)
+        * At least 8 unique bytes (rules out 'x' * 64 and similar deterministic
+          test placeholders)
+
+    Cryptographically these are necessary-but-not-sufficient — a 32-byte
+    random secret will trivially pass both — but together they catch the
+    common 'I forgot to set the env var' footgun.
+    """
+    if len(secret) < MIN_SECRET_BYTES:
+        raise ValueError(
+            f"{name}: must be at least {MIN_SECRET_BYTES} bytes "
+            f"(got {len(secret)}). Use secrets.token_bytes(32)."
+        )
+    if len(set(secret)) < MIN_SECRET_UNIQUE_BYTES:
+        raise ValueError(
+            f"{name}: rejected weak secret with only {len(set(secret))} "
+            f"unique bytes. This usually means a placeholder like "
+            f"'x' * 64 leaked into production. Use secrets.token_bytes(32) "
+            f"to generate a real key, then store it in your secrets manager."
+        )
 
 
 def _hash_payload(value: Any) -> str:
@@ -77,11 +105,7 @@ class AuditModule:
         secret: bytes,
         writer: BatchingWriter | None = None,
     ) -> None:
-        if len(secret) < MIN_SECRET_BYTES:
-            raise ValueError(
-                f"audit secret must be at least {MIN_SECRET_BYTES} bytes; "
-                f"use secrets.token_bytes(32) or set GOVERNANCE_AUDIT_SECRET."
-            )
+        _check_secret_strength(secret, "audit secret")
         self._store = store
         self._secret = secret
         # Writer is kept for the BatchingWriter test path and degraded-mode
@@ -162,6 +186,29 @@ class AuditModule:
                 kind=event.kind,
             )
             return self._placeholder_record(event)
+
+    async def _maybe_drain_fallback(self) -> None:
+        """Best-effort attempt to drain the JSONL fallback into primary.
+
+        Called after a successful recovery (emit_marker path). Failures are
+        swallowed — the next successful log will retry.
+        """
+        fallback = self._writer.fallback
+        drain_method = getattr(fallback, "drain_to", None)
+        if drain_method is None:
+            return
+        try:
+            count = await drain_method(self._store)
+            if count > 0:
+                logger.info(
+                    "audit.fallback_drained_after_recovery",
+                    events=count,
+                )
+        except Exception as exc:  # noqa: BLE001 - non-breaking
+            logger.warning(
+                "audit.fallback_drain_attempt_failed",
+                error_type=type(exc).__name__,
+            )
 
     def _placeholder_record(self, event: AuditEvent) -> AuditEventRecord:
         """Build a placeholder record returned when storage is unrecoverable.
@@ -271,6 +318,8 @@ class AuditModule:
                 # Only clear the degraded flag if the marker emit succeeds.
                 await self._store.insert_with_chain_lock(session_id, build_marker)
                 self._degraded_starts.discard(session_id)
+                # Drain any JSONL fallback that's waiting to recover.
+                await self._maybe_drain_fallback()
             record = await self._store.insert_with_chain_lock(
                 session_id, build_record
             )
@@ -317,9 +366,17 @@ class AuditModule:
         return record
 
     async def trace(self, event_id: UUID) -> list[AuditEventRecord]:
-        """Return the provenance chain from root to ``event_id``.
+        """Return the **provenance** chain from root to ``event_id``.
 
-        Verifies the HMAC of every record in the chain. Raises
+        Walks ``parent_event_id`` from leaf to root. This is the *causal*
+        chain — the events that led up to ``event_id`` via explicit nesting
+        (e.g. an LLM call that triggered a tool call that triggered another
+        LLM call). It is NOT the same as the HMAC chain (events sharing a
+        ``session_id`` linked by ``prev_hash``).
+
+        Use :meth:`trace_session_chain` for the cryptographic chain walk.
+
+        Verifies the HMAC of every record returned. Raises
         :class:`ChainIntegrityError` if any row has been tampered with.
         """
         chain = await self._store.get_chain(event_id)
@@ -329,6 +386,27 @@ class AuditModule:
                     f"audit chain integrity violation at event {record.event_id}"
                 )
         return chain
+
+    async def trace_session_chain(
+        self, session_id: UUID
+    ) -> list[AuditEventRecord]:
+        """Return every event in a session, in chain (insertion) order.
+
+        Walks the **HMAC chain** for the session — the cryptographically
+        tamper-evident sequence of events linked by ``prev_hash``. Each
+        record is HMAC-verified; the first failure raises
+        :class:`ChainIntegrityError` with the offending event_id.
+
+        This is the API to use when answering "show me everything that
+        happened in this session and prove it wasn't tampered with."
+        """
+        events = await self._store.get_session_events(session_id)
+        for record in events:
+            if not verify_event(record, self._secret):
+                raise ChainIntegrityError(
+                    f"audit chain integrity violation at event {record.event_id}"
+                )
+        return events
 
     # --- decorator ----------------------------------------------------------
     def track(

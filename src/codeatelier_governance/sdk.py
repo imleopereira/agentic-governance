@@ -16,13 +16,20 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+from pathlib import Path
+
+from .audit.jsonl_store import JsonlFallbackStore
 from .audit.module import AuditModule
-from .audit.store import AuditStore, InMemoryAuditStore
+from .audit.store import AuditStore, BatchingWriter, InMemoryAuditStore
 from .cost.module import CostModule
 from .gates.module import GatesModule
 from .scope.module import ScopeModule
 
 MIN_AUDIT_SECRET_BYTES = 32
+
+DEFAULT_FALLBACK_PATH = (
+    Path.home() / ".codeatelier_governance" / "audit_fallback.jsonl"
+)
 
 
 @dataclass
@@ -58,6 +65,9 @@ class GovernanceSDK:
         database_url: str | None = None,
         api_key: str | None = None,
         audit_secret: bytes | None = None,
+        *,
+        fallback_path: str | Path | None = None,
+        cost_fail_open: bool = False,
         **kwargs: Any,
     ) -> None:
         if not database_url and not api_key:
@@ -76,7 +86,13 @@ class GovernanceSDK:
         resolved_secret = audit_secret or self._resolve_audit_secret()
 
         store = self._build_audit_store(database_url)
-        self.audit = AuditModule(store, secret=resolved_secret)
+        # Durable fallback: when the primary is down, audit events spill to
+        # this on-disk JSONL so they survive process restarts and crashes.
+        fallback = JsonlFallbackStore(
+            fallback_path or DEFAULT_FALLBACK_PATH
+        )
+        writer = BatchingWriter(primary=store, fallback=fallback)
+        self.audit = AuditModule(store, secret=resolved_secret, writer=writer)
         # Three enforcement modules share the audit substrate; the gates
         # module reuses the same secret for HMAC-signed approval tokens.
         # When a database_url is provided, all enforcement modules use
@@ -85,7 +101,9 @@ class GovernanceSDK:
         cost_store = self._build_cost_store(database_url)
         gates_store = self._build_gates_store(database_url)
         self.scope = ScopeModule(self.audit)
-        self.cost = CostModule(self.audit, store=cost_store)
+        self.cost = CostModule(
+            self.audit, store=cost_store, fail_open=cost_fail_open
+        )
         self.gates = GatesModule(
             self.audit, secret=resolved_secret, store=gates_store
         )
