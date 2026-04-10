@@ -25,17 +25,17 @@ htmlcov/
 # OS
 .DS_Store
 
-.claude/
-.claude.json
-CLAUDE.md
-.agents/
-.agent-outputs/
+# Local config and internal tooling
+.local/
+*.local.json
+*.local.md
+.internal/
+.outputs/
 
-# QA harness — local-only multi-worker test scaffolding, never ships
+# QA harness
 qa/
 
 # Console frontend build artifacts (the source in console/ DOES ship)
 console/node_modules/
 console/.next/
 console/out/
-.gitignore

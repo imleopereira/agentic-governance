@@ -46,6 +46,9 @@ class JsonlFallbackStore(AuditStore):
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Harden file permissions: owner-only read/write (0600)
+        if self._path.exists():
+            self._path.chmod(0o600)
         self._global_lock = asyncio.Lock()
         self._session_locks: dict[UUID, asyncio.Lock] = {}
         # Cache the most-recent hmac per session in memory so we don't
@@ -79,9 +82,12 @@ class JsonlFallbackStore(AuditStore):
         original session and we just want to flush them to disk in order.
         """
         async with self._global_lock:
+            created = not self._path.exists()
             with self._path.open("a") as fp:
                 for event in events:
                     fp.write(_serialize(event) + "\n")
+            if created:
+                self._path.chmod(0o600)
 
     async def get_event(self, event_id: UUID) -> AuditEventRecord | None:
         async with self._global_lock:
@@ -158,8 +164,11 @@ class JsonlFallbackStore(AuditStore):
     # --- internals ---------------------------------------------------------
     async def _append(self, record: AuditEventRecord) -> None:
         async with self._global_lock:
+            created = not self._path.exists()
             with self._path.open("a") as fp:
                 fp.write(_serialize(record) + "\n")
+            if created:
+                self._path.chmod(0o600)
 
     async def _scan_last_hmac(self, session_id: UUID) -> str | None:
         """Scan the file for the most recent event in the session.
