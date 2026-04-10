@@ -100,9 +100,12 @@ class GovernanceSDK:
         # in-memory single-process stores.
         cost_store = self._build_cost_store(database_url)
         gates_store = self._build_gates_store(database_url)
-        self.scope = ScopeModule(self.audit)
+        self.scope = ScopeModule(self.audit, database_url=database_url)
         self.cost = CostModule(
-            self.audit, store=cost_store, fail_open=cost_fail_open
+            self.audit,
+            store=cost_store,
+            fail_open=cost_fail_open,
+            database_url=database_url,
         )
         self.gates = GatesModule(
             self.audit, secret=resolved_secret, store=gates_store

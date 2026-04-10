@@ -47,6 +47,7 @@ audit_events = Table(
     Column("agent_id", String(256), nullable=False, index=True),
     Column("parent_event_id", PG_UUID(as_uuid=True), nullable=True, index=True),
     Column("kind", String(128), nullable=False),
+    Column("model", String(128), nullable=True),
     Column("input_hash", String(128), nullable=True),
     Column("output_hash", String(128), nullable=True),
     Column("metadata_json", JSONB, nullable=False),
@@ -136,6 +137,7 @@ class PostgresAuditStore(AuditStore):
                             "agent_id": record.agent_id,
                             "parent_event_id": record.parent_event_id,
                             "kind": record.kind,
+                            "model": record.model,
                             "input_hash": record.input_hash,
                             "output_hash": record.output_hash,
                             "metadata_json": record.metadata,
@@ -175,6 +177,7 @@ class PostgresAuditStore(AuditStore):
                 "agent_id": e.agent_id,
                 "parent_event_id": e.parent_event_id,
                 "kind": e.kind,
+                "model": e.model,
                 "input_hash": e.input_hash,
                 "output_hash": e.output_hash,
                 "metadata_json": e.metadata,
@@ -235,7 +238,7 @@ class PostgresAuditStore(AuditStore):
             res = await conn.execute(
                 text(
                     "SELECT event_id, session_id, agent_id, parent_event_id, "
-                    "kind, input_hash, output_hash, metadata_json, "
+                    "kind, model, input_hash, output_hash, metadata_json, "
                     "prev_hash, hmac_value, created_at "
                     "FROM governance_audit_events "
                     "WHERE session_id = :sid "
@@ -257,6 +260,7 @@ def _row_to_record(row: Any) -> AuditEventRecord:
         agent_id=row["agent_id"],
         parent_event_id=row["parent_event_id"],
         kind=row["kind"],
+        model=row["model"],
         input_hash=row["input_hash"],
         output_hash=row["output_hash"],
         metadata=row["metadata_json"],

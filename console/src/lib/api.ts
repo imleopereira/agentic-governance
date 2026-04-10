@@ -24,6 +24,25 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
   return res.json() as Promise<T>;
 }
 
+async function post<T>(path: string): Promise<T> {
+  const url = new URL(`${BASE}${path}`, window.location.origin);
+  const token = typeof window !== "undefined"
+    ? localStorage.getItem("governance_token") ?? ""
+    : "";
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(body || `API ${path}: ${res.status} ${res.statusText}`);
+  }
+  return res.json() as Promise<T>;
+}
+
 // ---------- Types ----------
 
 export interface Agent {
@@ -42,6 +61,7 @@ export interface AuditEvent {
   output_hash: string | null;
   metadata: Record<string, unknown>;
   prev_hash: string | null;
+  hmac_value: string | null;
   chain_seq: number;
   created_at: string | null;
 }
@@ -90,7 +110,11 @@ export interface PostureAgent {
   agent_id: string;
   event_count: number;
   last_active: string | null;
-  scope: { status: string; violations_today: number };
+  scope: {
+    status: string;
+    violations_today: number;
+    latest_violation: { tool: string; created_at: string | null } | null;
+  };
   cost: { status: string; usd_today: number; tokens_today: number; exceeded_today: number };
   gates: { status: string; pending: number };
   audit: { status: string; events_total: number };
@@ -123,4 +147,12 @@ export const api = {
   gatesRecent: (limit = 50) =>
     get<GateResolved[]>("/api/gates/recent", { limit: String(limit) }),
   posture: () => get<Posture>("/api/posture"),
+  grantGate: (requestId: string) =>
+    post<{ ok: boolean; request_id: string; resolution: string }>(
+      `/api/gates/${requestId}/grant`
+    ),
+  denyGate: (requestId: string) =>
+    post<{ ok: boolean; request_id: string; resolution: string }>(
+      `/api/gates/${requestId}/deny`
+    ),
 };

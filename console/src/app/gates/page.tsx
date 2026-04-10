@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useState, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { TimeAgo } from "@/components/TimeAgo";
@@ -35,6 +35,76 @@ function CopyButton({ text, label }: { text: string; label: string }) {
     >
       {copied ? "Copied!" : label}
     </button>
+  );
+}
+
+function GateActionButtons({ requestId }: { requestId: string }) {
+  const queryClient = useQueryClient();
+  const [status, setStatus] = useState<{
+    loading: "grant" | "deny" | null;
+    error: string | null;
+    success: string | null;
+  }>({ loading: null, error: null, success: null });
+
+  const handleAction = useCallback(
+    async (action: "grant" | "deny") => {
+      setStatus({ loading: action, error: null, success: null });
+      try {
+        const result =
+          action === "grant"
+            ? await api.grantGate(requestId)
+            : await api.denyGate(requestId);
+        setStatus({
+          loading: null,
+          error: null,
+          success: `${result.resolution.charAt(0).toUpperCase() + result.resolution.slice(1)} successfully`,
+        });
+        // Refetch pending and recent lists
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["gates-pending"] }),
+          queryClient.invalidateQueries({ queryKey: ["gates-recent"] }),
+        ]);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Unknown error occurred";
+        setStatus({ loading: null, error: message, success: null });
+      }
+    },
+    [requestId, queryClient]
+  );
+
+  if (status.success) {
+    return (
+      <span className="text-xs text-green-400 font-medium">
+        {status.success}
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5 items-end">
+      <div className="flex gap-1.5">
+        <button
+          onClick={() => handleAction("grant")}
+          disabled={status.loading !== null}
+          className="text-xs px-3 py-1 rounded border border-green-700 bg-green-900/40 text-green-400 hover:bg-green-800/60 hover:border-green-600 disabled:opacity-50 transition font-medium"
+        >
+          {status.loading === "grant" ? "Granting..." : "Grant"}
+        </button>
+        <button
+          onClick={() => handleAction("deny")}
+          disabled={status.loading !== null}
+          className="text-xs px-3 py-1 rounded border border-red-700 bg-red-900/40 text-red-400 hover:bg-red-800/60 hover:border-red-600 disabled:opacity-50 transition font-medium"
+        >
+          {status.loading === "deny" ? "Denying..." : "Deny"}
+        </button>
+      </div>
+      {status.error && (
+        <span className="text-xs text-red-400 max-w-[200px] truncate" title={status.error}>
+          {status.error}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -105,11 +175,8 @@ export default function GatesPage() {
                       Expires: <TimeAgo iso={p.expires_at} />
                     </p>
                   </div>
-                  <div className="flex flex-col gap-1.5">
-                    <CopyButton
-                      text={`await sdk.gates.grant("${p.request_id}")`}
-                      label="Copy grant cmd"
-                    />
+                  <div className="flex flex-col gap-1.5 items-end">
+                    <GateActionButtons requestId={p.request_id} />
                     <CopyButton
                       text={p.request_id}
                       label="Copy request ID"

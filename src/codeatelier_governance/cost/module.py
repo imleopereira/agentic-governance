@@ -26,6 +26,9 @@ no lost updates.
 """
 from __future__ import annotations
 
+import asyncio
+import json
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -49,17 +52,119 @@ class CostModule:
         store: CostStore | None = None,
         *,
         fail_open: bool = False,
+        database_url: str | None = None,
     ) -> None:
         self._audit = audit
         self._store: CostStore = store or InMemoryCostStore()
         self._fail_open = fail_open
         self._policies: dict[str, BudgetPolicy] = {}
+        self._database_url = database_url
+        self._engine: Any = None
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
+
+    def _get_engine(self) -> Any:
+        """Lazily create and return the SQLAlchemy async engine."""
+        if self._engine is not None:
+            return self._engine
+        if self._database_url is None:
+            return None
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        url = self._database_url
+        if url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+        elif not url.startswith("postgresql+asyncpg://"):
+            return None
+        self._engine = create_async_engine(
+            url, pool_pre_ping=True, pool_size=2, max_overflow=5,
+        )
+        return self._engine
 
     def register(self, policy: BudgetPolicy) -> None:
         """Register a budget policy for an agent. Call at app startup."""
         self._policies[policy.agent_id] = policy
+        self._persist_policy_best_effort(policy.agent_id, "budget", policy)
+
+    def _persist_policy_best_effort(
+        self, agent_id: str, policy_type: str, policy: BudgetPolicy,
+    ) -> None:
+        """Best-effort upsert of a policy to Postgres. Never raises."""
+        engine = self._get_engine()
+        if engine is None:
+            return
+        try:
+            loop: asyncio.AbstractEventLoop | None = None
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+
+            if loop is not None and loop.is_running():
+                loop.create_task(
+                    self._upsert_policy(engine, agent_id, policy_type, policy)
+                )
+            else:
+                asyncio.run(
+                    self._upsert_policy(engine, agent_id, policy_type, policy)
+                )
+        except Exception:
+            logger.warning(
+                "cost.persist_policy_failed",
+                agent_id=agent_id,
+                policy_type=policy_type,
+            )
+
+    @staticmethod
+    async def _upsert_policy(
+        engine: Any,
+        agent_id: str,
+        policy_type: str,
+        policy: BudgetPolicy,
+    ) -> None:
+        """Upsert a policy row into governance_policies."""
+        from sqlalchemy import text
+
+        policy_json = json.dumps(policy.model_dump(mode="json"))
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO governance_policies (agent_id, policy_type, policy_json, updated_at) "
+                    "VALUES (:agent_id, :policy_type, :policy_json::jsonb, NOW()) "
+                    "ON CONFLICT (agent_id, policy_type) "
+                    "DO UPDATE SET policy_json = :policy_json::jsonb, updated_at = NOW()"
+                ),
+                {
+                    "agent_id": agent_id,
+                    "policy_type": policy_type,
+                    "policy_json": policy_json,
+                },
+            )
+
+    async def get_stored_policies(self) -> list[BudgetPolicy]:
+        """Read budget policies from Postgres. Returns an empty list if no DB."""
+        engine = self._get_engine()
+        if engine is None:
+            return []
+        from sqlalchemy import text
+
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT policy_json FROM governance_policies "
+                    "WHERE policy_type = :policy_type "
+                    "ORDER BY agent_id"
+                ),
+                {"policy_type": "budget"},
+            )
+            rows = list(res.mappings())
+        policies: list[BudgetPolicy] = []
+        for row in rows:
+            data = row["policy_json"]
+            if isinstance(data, str):
+                data = json.loads(data)
+            policies.append(BudgetPolicy.model_validate(data))
+        return policies
 
     def get_policy(self, agent_id: str) -> BudgetPolicy | None:
         return self._policies.get(agent_id)

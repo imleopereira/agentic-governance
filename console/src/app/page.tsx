@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type PostureAgent } from "@/lib/api";
 import { StatusBadge } from "@/components/StatusBadge";
@@ -7,6 +8,46 @@ import { CardSkeleton } from "@/components/Skeleton";
 import { LiveBadge } from "@/components/LiveBadge";
 import { TimeAgo } from "@/components/TimeAgo";
 import { GettingStarted } from "@/components/GettingStarted";
+
+function ViolationDetails({ agent }: { agent: PostureAgent }) {
+  const [expanded, setExpanded] = useState(false);
+  const violation = agent.scope.latest_violation;
+
+  if (agent.scope.violations_today <= 0 || !violation) {
+    return null;
+  }
+
+  return (
+    <div className="text-xs">
+      <button
+        onClick={(e) => {
+          e.preventDefault();
+          setExpanded((v) => !v);
+        }}
+        className="text-[var(--danger)] hover:underline flex items-center gap-1"
+      >
+        <span>{agent.scope.violations_today} scope violation(s) today</span>
+        <span className="text-[var(--muted)]">{expanded ? "\u25B2" : "\u25BC"}</span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 p-2 rounded bg-red-950/30 border border-red-900/40 text-[var(--muted)]">
+          <p>
+            Latest: attempted{" "}
+            <span className="text-[var(--fg)] font-mono">
+              &apos;{violation.tool}&apos;
+            </span>
+            {violation.created_at && (
+              <>
+                {" "}&mdash;{" "}
+                <TimeAgo iso={violation.created_at} />
+              </>
+            )}
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function PostureCard({ agent }: { agent: PostureAgent }) {
   return (
@@ -46,11 +87,7 @@ function PostureCard({ agent }: { agent: PostureAgent }) {
           {agent.cost.tokens_today.toLocaleString()} tokens
         </p>
       )}
-      {agent.scope.violations_today > 0 && (
-        <p className="text-xs text-[var(--danger)]">
-          {agent.scope.violations_today} scope violation(s) today
-        </p>
-      )}
+      <ViolationDetails agent={agent} />
       {agent.gates.pending > 0 && (
         <p className="text-xs text-[var(--warn)]">
           {agent.gates.pending} approval(s) pending

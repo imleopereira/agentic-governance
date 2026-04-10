@@ -17,11 +17,13 @@ Security constraints:
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 try:
     from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -107,8 +109,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_methods=["GET"],
-    allow_headers=["Authorization"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -175,7 +177,7 @@ async def list_events(
     # of user values. Each filter is a fixed string with a named parameter.
     base = (
         "SELECT event_id, session_id, agent_id, parent_event_id, "
-        "kind, input_hash, output_hash, metadata_json, "
+        "kind, model, input_hash, output_hash, metadata_json, "
         "prev_hash, hmac_value, created_at, chain_seq "
         "FROM governance_audit_events "
     )
@@ -208,10 +210,12 @@ async def list_events(
                 if row["parent_event_id"]
                 else None,
                 "kind": row["kind"],
+                "model": row["model"],
                 "input_hash": row["input_hash"],
                 "output_hash": row["output_hash"],
                 "metadata": _redact_metadata(row["metadata_json"] or {}),
                 "prev_hash": row["prev_hash"],
+                "hmac_value": row["hmac_value"],
                 "chain_seq": row["chain_seq"],
                 "created_at": row["created_at"].isoformat()
                 if row["created_at"]
@@ -240,7 +244,7 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
         res = await conn.execute(
             text(
                 "SELECT event_id, session_id, agent_id, parent_event_id, "
-                "kind, input_hash, output_hash, metadata_json, "
+                "kind, model, input_hash, output_hash, metadata_json, "
                 "prev_hash, hmac_value, created_at "
                 "FROM governance_audit_events "
                 "WHERE session_id = :sid ORDER BY chain_seq"
@@ -261,6 +265,7 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
             agent_id=row["agent_id"],
             parent_event_id=row["parent_event_id"],
             kind=row["kind"],
+            model=row["model"],
             input_hash=row["input_hash"],
             output_hash=row["output_hash"],
             metadata=row["metadata_json"] or {},
@@ -413,6 +418,188 @@ async def gates_recent(
         ]
 
 
+@app.post("/api/gates/{request_id}/grant", dependencies=[Depends(verify_token)])
+async def grant_gate(request_id: UUID) -> dict[str, Any]:
+    """Grant a pending approval gate request."""
+    if not AUDIT_SECRET:
+        raise HTTPException(
+            500,
+            "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
+        )
+    secret = AUDIT_SECRET.encode("utf-8")
+    assert engine is not None
+    async with engine.begin() as conn:
+        # Read the pending gate row
+        res = await conn.execute(
+            text(
+                "SELECT request_id, agent_id, kind, token, action_hash "
+                "FROM governance_gates_pending "
+                "WHERE request_id = :rid AND resolved_at IS NULL"
+            ),
+            {"rid": str(request_id)},
+        )
+        row = res.mappings().first()
+        if not row:
+            raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Verify the HMAC signature on the token
+        token_value = row["token"]
+        if token_value:
+            expected = hmac.new(
+                secret, str(request_id).encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(token_value, expected):
+                raise HTTPException(400, "Token HMAC verification failed.")
+
+        now = datetime.now(timezone.utc)
+        # Resolve the gate as granted
+        await conn.execute(
+            text(
+                "UPDATE governance_gates_pending "
+                "SET resolved_at = :now, resolution = :resolution "
+                "WHERE request_id = :rid AND resolved_at IS NULL"
+            ),
+            {"now": now, "resolution": "granted", "rid": str(request_id)},
+        )
+
+        # Insert audit event for the grant action
+        event_id = str(uuid4())
+        await conn.execute(
+            text(
+                "INSERT INTO governance_audit_events "
+                "(event_id, session_id, agent_id, kind, metadata_json, created_at) "
+                "VALUES (:eid, :sid, :aid, :kind, :meta, :now)"
+            ),
+            {
+                "eid": event_id,
+                "sid": str(uuid4()),
+                "aid": row["agent_id"],
+                "kind": "approval.granted",
+                "meta": f'{{"request_id": "{request_id}", "gate_kind": "{row["kind"]}"}}',
+                "now": now,
+            },
+        )
+
+    return {"ok": True, "request_id": str(request_id), "resolution": "granted"}
+
+
+@app.post("/api/gates/{request_id}/deny", dependencies=[Depends(verify_token)])
+async def deny_gate(request_id: UUID) -> dict[str, Any]:
+    """Deny a pending approval gate request."""
+    if not AUDIT_SECRET:
+        raise HTTPException(
+            500,
+            "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
+        )
+    secret = AUDIT_SECRET.encode("utf-8")
+    assert engine is not None
+    async with engine.begin() as conn:
+        # Read the pending gate row
+        res = await conn.execute(
+            text(
+                "SELECT request_id, agent_id, kind, token, action_hash "
+                "FROM governance_gates_pending "
+                "WHERE request_id = :rid AND resolved_at IS NULL"
+            ),
+            {"rid": str(request_id)},
+        )
+        row = res.mappings().first()
+        if not row:
+            raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Verify the HMAC signature on the token
+        token_value = row["token"]
+        if token_value:
+            expected = hmac.new(
+                secret, str(request_id).encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(token_value, expected):
+                raise HTTPException(400, "Token HMAC verification failed.")
+
+        now = datetime.now(timezone.utc)
+        # Resolve the gate as denied
+        await conn.execute(
+            text(
+                "UPDATE governance_gates_pending "
+                "SET resolved_at = :now, resolution = :resolution "
+                "WHERE request_id = :rid AND resolved_at IS NULL"
+            ),
+            {"now": now, "resolution": "denied", "rid": str(request_id)},
+        )
+
+        # Insert audit event for the deny action
+        event_id = str(uuid4())
+        await conn.execute(
+            text(
+                "INSERT INTO governance_audit_events "
+                "(event_id, session_id, agent_id, kind, metadata_json, created_at) "
+                "VALUES (:eid, :sid, :aid, :kind, :meta, :now)"
+            ),
+            {
+                "eid": event_id,
+                "sid": str(uuid4()),
+                "aid": row["agent_id"],
+                "kind": "approval.denied",
+                "meta": f'{{"request_id": "{request_id}", "gate_kind": "{row["kind"]}"}}',
+                "now": now,
+            },
+        )
+
+    return {"ok": True, "request_id": str(request_id), "resolution": "denied"}
+
+
+@app.get("/api/policies", dependencies=[Depends(verify_token)])
+async def list_policies() -> list[dict[str, Any]]:
+    """Return all policies from the governance_policies table."""
+    assert engine is not None
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT agent_id, policy_type, policy_json, updated_at "
+                "FROM governance_policies "
+                "ORDER BY agent_id, policy_type"
+            )
+        )
+        return [
+            {
+                "agent_id": row["agent_id"],
+                "policy_type": row["policy_type"],
+                "policy": row["policy_json"],
+                "updated_at": row["updated_at"].isoformat()
+                if row["updated_at"]
+                else None,
+            }
+            for row in res.mappings()
+        ]
+
+
+@app.get("/api/policies/{agent_id}", dependencies=[Depends(verify_token)])
+async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
+    """Return scope + budget policies for a single agent."""
+    assert engine is not None
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT agent_id, policy_type, policy_json, updated_at "
+                "FROM governance_policies "
+                "WHERE agent_id = :agent_id "
+                "ORDER BY policy_type"
+            ),
+            {"agent_id": agent_id},
+        )
+        return [
+            {
+                "agent_id": row["agent_id"],
+                "policy_type": row["policy_type"],
+                "policy": row["policy_json"],
+                "updated_at": row["updated_at"].isoformat()
+                if row["updated_at"]
+                else None,
+            }
+            for row in res.mappings()
+        ]
+
+
 @app.get("/api/posture", dependencies=[Depends(verify_token)])
 async def governance_posture() -> dict[str, Any]:
     """Governance posture overview — the Persona D CEO demo page.
@@ -478,6 +665,24 @@ async def governance_posture() -> dict[str, Any]:
         )
         exceeded = {r["agent_id"]: r["exceeded_count"] for r in exceeded_res.mappings()}
 
+        # Latest scope violation per agent (for inline details on posture cards)
+        latest_violation_res = await conn.execute(
+            text(
+                "SELECT DISTINCT ON (agent_id) agent_id, metadata_json, created_at "
+                "FROM governance_audit_events "
+                "WHERE kind = 'scope.violation' "
+                "AND created_at >= (NOW() AT TIME ZONE 'UTC')::DATE "
+                "ORDER BY agent_id, created_at DESC"
+            )
+        )
+        latest_violations: dict[str, dict[str, Any]] = {}
+        for r in latest_violation_res.mappings():
+            meta = r["metadata_json"] or {}
+            latest_violations[r["agent_id"]] = {
+                "tool": meta.get("tool", meta.get("action", "unknown")),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+
     posture: list[dict[str, Any]] = []
     for agent_id, info in agents.items():
         v_count = violations.get(agent_id, 0)
@@ -495,6 +700,7 @@ async def governance_posture() -> dict[str, Any]:
                 "scope": {
                     "status": "FAIL" if v_count > 0 else "PASS",
                     "violations_today": v_count,
+                    "latest_violation": latest_violations.get(agent_id),
                 },
                 "cost": {
                     "status": "FAIL"

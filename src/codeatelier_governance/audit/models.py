@@ -88,6 +88,7 @@ class AuditEvent(BaseModel):
     agent_id: str = Field(min_length=1, max_length=MAX_AGENT_ID_LEN)
     parent_event_id: UUID | None = None
     kind: str = Field(min_length=1, max_length=MAX_KIND_LEN)
+    model: str | None = Field(default=None, max_length=128)
     input_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     output_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -122,6 +123,7 @@ class AuditEventRecord(BaseModel):
     agent_id: str = Field(min_length=1, max_length=MAX_AGENT_ID_LEN)
     parent_event_id: UUID | None
     kind: str = Field(min_length=1, max_length=MAX_KIND_LEN)
+    model: str | None = Field(default=None, max_length=128)
     input_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     output_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     metadata: dict[str, Any]

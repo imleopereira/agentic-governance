@@ -52,6 +52,9 @@ CREATE TRIGGER trg_audit_no_delete
     FOR EACH ROW
     EXECUTE FUNCTION governance_audit_append_only();
 
+-- Model field: LLM model name associated with the event (v0.2+).
+ALTER TABLE governance_audit_events ADD COLUMN IF NOT EXISTS model VARCHAR(128) NULL;
+
 -- Defense-in-depth: revoke mutation privileges from the SDK role.
 -- Replace `governance_sdk_role` with the actual role you connect as.
 --
