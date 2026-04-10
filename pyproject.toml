@@ -4,9 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codeatelier-governance"
-version = "0.1.0"
-description = "Enterprise-grade governance SDK for AI agent deployments"
+version = "0.1.5"
+description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Code Atelier" },
+]
+keywords = [
+    "ai", "agents", "governance", "audit", "hmac", "compliance",
+    "llm", "openai", "anthropic", "langchain",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Security",
+    "Framework :: AsyncIO",
+]
 dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg>=0.29",
@@ -15,6 +36,11 @@ dependencies = [
     "alembic>=1.13",
     "greenlet>=3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/imleopereira/code-atelier-governance"
+Documentation = "https://github.com/imleopereira/code-atelier-governance/blob/production/README.md"
+Issues = "https://github.com/imleopereira/code-atelier-governance/issues"
 
 [project.optional-dependencies]
 otel = [
@@ -34,6 +60,15 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"codeatelier_governance" = ["py.typed"]
+"codeatelier_governance.audit" = ["*.sql"]
+"codeatelier_governance.cost" = ["*.sql"]
+"codeatelier_governance.gates" = ["*.sql"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -46,3 +81,8 @@ mypy_path = "src"
 pythonpath = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: tests that require a running QA Postgres at :5435",
+]
+# Skip integration tests by default — opt in with `pytest -m integration`
+addopts = "-m 'not integration'"

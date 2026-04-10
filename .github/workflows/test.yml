@@ -1,0 +1,99 @@
+name: tests
+
+on:
+  push:
+    branches: [production]
+  pull_request:
+    branches: [production]
+
+jobs:
+  unit:
+    name: unit tests + lint + types (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,otel]"
+      - name: ruff
+        run: python -m ruff check src/ tests/
+      - name: mypy
+        run: python -m mypy --strict src/codeatelier_governance/
+      - name: pytest (unit only)
+        run: python -m pytest tests/ -q
+
+  integration:
+    name: integration tests (Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: governance_qa
+          POSTGRES_USER: governance
+          POSTGRES_PASSWORD: governance
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U governance -d governance_qa"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      GOVERNANCE_QA_DB_URL: postgresql://governance:governance@localhost:5435/governance_qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,otel]"
+      - name: apply DDL
+        run: |
+          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
+            -f src/codeatelier_governance/audit/ddl.sql
+          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
+            -f src/codeatelier_governance/cost/ddl.sql
+          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
+            -f src/codeatelier_governance/gates/ddl.sql
+      - name: integration tests
+        run: python -m pytest tests/ -q -m integration
+
+  package:
+    name: clean-venv install smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: build wheel
+        run: |
+          python -m pip install --upgrade pip wheel
+          python -m pip wheel . --no-deps -w dist/
+      - name: install in fresh venv
+        run: |
+          python -m venv test-venv
+          test-venv/bin/python -m pip install --upgrade pip
+          test-venv/bin/python -m pip install dist/*.whl
+      - name: smoke test (no source tree)
+        run: |
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          ${{ github.workspace }}/test-venv/bin/python -c "
+          import codeatelier_governance, importlib.resources as res
+          assert codeatelier_governance.__version__ == '0.1.5'
+          assert (res.files('codeatelier_governance.audit') / 'ddl.sql').is_file()
+          assert (res.files('codeatelier_governance.cost') / 'ddl.sql').is_file()
+          assert (res.files('codeatelier_governance.gates') / 'ddl.sql').is_file()
+          print('clean install OK:', codeatelier_governance.__version__)
+          "
