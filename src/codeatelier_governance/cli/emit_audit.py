@@ -50,6 +50,11 @@ def main() -> None:
     parser.add_argument("--metadata", default="{}", help="JSON string of event metadata")
     args = parser.parse_args()
 
+    if len(args.metadata) > 65536:
+        print("Metadata exceeds 64KB limit", file=sys.stderr)
+        print(NULL_UUID)
+        sys.exit(1)
+
     try:
         metadata = json.loads(args.metadata)
     except json.JSONDecodeError as e:

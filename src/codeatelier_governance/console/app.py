@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -43,7 +44,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ..audit.chain import verify_event
-from ..audit.models import AuditEventRecord
+from ..audit.models import AuditEvent, AuditEventRecord
+from ..audit.module import AuditModule
 from .auth import create_session_id, hash_password, session_expires_at, verify_password
 
 _logger = structlog.get_logger(__name__)
@@ -65,6 +67,49 @@ CORS_ORIGINS = os.environ.get(
 REDACT_KEYS: set[str] = set(
     os.environ.get("GOVERNANCE_CONSOLE_REDACT_KEYS", "").split(",")
 ) | {"password", "secret", "token", "api_key", "authorization"}
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter: in-memory, per-IP, for /api/auth/login only
+# ---------------------------------------------------------------------------
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_SECONDS = 60
+_login_attempts: dict[str, list[float]] = {}
+
+
+def _check_rate_limit(ip: str) -> float | None:
+    """Return seconds until retry if rate-limited, else None."""
+    now = time.monotonic()
+    attempts = _login_attempts.get(ip, [])
+    # Prune stale entries
+    attempts = [t for t in attempts if now - t < _LOGIN_WINDOW_SECONDS]
+    _login_attempts[ip] = attempts
+    if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
+        oldest = attempts[0]
+        retry_after = _LOGIN_WINDOW_SECONDS - (now - oldest)
+        return max(1.0, retry_after)
+    return None
+
+
+def _record_login_attempt(ip: str) -> None:
+    """Record a login attempt timestamp."""
+    now = time.monotonic()
+    if ip not in _login_attempts:
+        _login_attempts[ip] = []
+    _login_attempts[ip].append(now)
+    # Opportunistic cleanup: remove IPs with only stale entries
+    stale_ips = [
+        k for k, v in _login_attempts.items()
+        if all(now - t >= _LOGIN_WINDOW_SECONDS for t in v)
+    ]
+    for k in stale_ips:
+        del _login_attempts[k]
+
+
+# ---------------------------------------------------------------------------
+# Audit module for console-originated events (gate grant/deny)
+# ---------------------------------------------------------------------------
+audit_module: AuditModule | None = None
 
 
 def _normalize_url(url: str) -> str:
@@ -118,14 +163,29 @@ def _validate_cors_origins(origins: list[str]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     _validate_cors_origins(CORS_ORIGINS)
-    global engine
+    global engine, audit_module
     engine = create_async_engine(
         _normalize_url(DATABASE_URL),
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
     )
+    # Initialize audit module for console-originated events (gate grant/deny)
+    if AUDIT_SECRET:
+        try:
+            from ..audit.postgres_store import PostgresAuditStore
+
+            audit_store = PostgresAuditStore(DATABASE_URL)
+            audit_module = AuditModule(
+                audit_store,
+                secret=AUDIT_SECRET.encode("utf-8"),
+            )
+        except ValueError:
+            _logger.warning("console.audit_module_init_skipped_weak_secret")
+            audit_module = None
     yield
+    if audit_module is not None:
+        await audit_module.close()
     if engine is not None:
         await engine.dispose()
 
@@ -247,8 +307,18 @@ async def health() -> dict[str, Any]:
 # Auth endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/auth/login")
-async def login(body: LoginRequest) -> JSONResponse:
+async def login(body: LoginRequest, request: Request) -> JSONResponse:
     """Authenticate and create a session. Sets an httpOnly cookie."""
+    # Rate limiting: 5 attempts per IP per 60s window
+    client_ip = request.client.host if request.client else "unknown"
+    retry_after = _check_rate_limit(client_ip)
+    if retry_after is not None:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many login attempts. Try again later."},
+            headers={"Retry-After": str(int(retry_after))},
+        )
+    _record_login_attempt(client_ip)
     assert engine is not None
     # Opportunistic session cleanup
     async with engine.begin() as conn:
@@ -801,22 +871,22 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
             {"now": now, "resolution": "granted", "rid": str(request_id)},
         )
 
-        # Insert audit event for the grant action
-        event_id = str(uuid4())
-        await conn.execute(
-            text(
-                "INSERT INTO governance_audit_events "
-                "(event_id, session_id, agent_id, kind, metadata_json, created_at) "
-                "VALUES (:eid, :sid, :aid, :kind, :meta, :now)"
-            ),
-            {
-                "eid": event_id,
-                "sid": str(uuid4()),
-                "aid": row["agent_id"],
-                "kind": "approval.granted",
-                "meta": f'{{"request_id": "{request_id}", "gate_kind": "{row["kind"]}"}}',
-                "now": now,
-            },
+    # Audit event via SDK — part of the HMAC chain
+    if audit_module is not None:
+        # Deterministic session_id derived from request_id for traceability
+        session_id = UUID(
+            hashlib.md5(str(request_id).encode("utf-8")).hexdigest()
+        )
+        await audit_module.log(
+            AuditEvent(
+                agent_id=row["agent_id"],
+                session_id=session_id,
+                kind="approval.granted",
+                metadata={
+                    "request_id": str(request_id),
+                    "gate_kind": row["kind"],
+                },
+            )
         )
 
     return {"ok": True, "request_id": str(request_id), "resolution": "granted"}
@@ -866,22 +936,21 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
             {"now": now, "resolution": "denied", "rid": str(request_id)},
         )
 
-        # Insert audit event for the deny action
-        event_id = str(uuid4())
-        await conn.execute(
-            text(
-                "INSERT INTO governance_audit_events "
-                "(event_id, session_id, agent_id, kind, metadata_json, created_at) "
-                "VALUES (:eid, :sid, :aid, :kind, :meta, :now)"
-            ),
-            {
-                "eid": event_id,
-                "sid": str(uuid4()),
-                "aid": row["agent_id"],
-                "kind": "approval.denied",
-                "meta": f'{{"request_id": "{request_id}", "gate_kind": "{row["kind"]}"}}',
-                "now": now,
-            },
+    # Audit event via SDK — part of the HMAC chain
+    if audit_module is not None:
+        session_id = UUID(
+            hashlib.md5(str(request_id).encode("utf-8")).hexdigest()
+        )
+        await audit_module.log(
+            AuditEvent(
+                agent_id=row["agent_id"],
+                session_id=session_id,
+                kind="approval.denied",
+                metadata={
+                    "request_id": str(request_id),
+                    "gate_kind": row["kind"],
+                },
+            )
         )
 
     return {"ok": True, "request_id": str(request_id), "resolution": "denied"}
