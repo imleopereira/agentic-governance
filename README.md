@@ -1,10 +1,15 @@
 # Code Atelier Governance SDK
 
-> **v0.1.0 — Developer Preview.** The audit module is multi-worker correct.
-> The cost, gates, and full chain-integrity guarantees are correct for
-> single-process deployments only — multi-worker correctness ships in
-> v0.1.5 (target: two weeks). For multi-worker deployments today, run a
-> single worker per agent type or wait for v0.1.5.
+> **v0.1.5 — Multi-worker correct, single-region, single-database.**
+> Audit chain, cost counters, and HITL gates are all correct under
+> multi-process deployments behind a single Postgres. The cost gate
+> defaults to **fail-closed**: if the cost store is unreachable, the
+> call is denied (set ``cost_fail_open=True`` for availability over
+> safety). Audit events that can't reach Postgres spill to a local
+> JSONL file that survives process restarts and auto-drains on recovery.
+> 22 adversarial security scenarios are tested in
+> ``qa/security_red_team.py`` against real Postgres + real uvicorn
+> workers and all currently pass.
 
 **Enforcement gates for AI agents — five lines, in-process, just Postgres.**
 
@@ -39,6 +44,29 @@ async def read_invoice(invoice_id: str) -> dict:
 That's an in-process scope check, an in-process budget check, and a
 tamper-evident audit row written to your Postgres. No proxy. No sidecar.
 No second database to back up.
+
+## Resilience contract (v0.1.5)
+
+**Observation surfaces never break the host call.** ``sdk.audit.log()``,
+``sdk.cost.track()``, and ``sdk.gates.request()`` will log a structured
+warning and continue if our internal storage is on fire — your
+application's request keeps moving. ``audit.log()`` returns a placeholder
+record (with ``record.is_placeholder == True``) so you can detect the
+degraded state if you care to alert on it.
+
+**Enforcement surfaces fail closed by default.** ``sdk.cost.check_or_raise()``,
+``sdk.scope.check()``, and ``sdk.gates.wait_for()`` raise by contract.
+On internal storage failure, the cost gate denies the call rather than
+allowing it — an attacker who takes down the cost store cannot drain
+budgets. Pass ``cost_fail_open=True`` if you'd rather have availability
+than safety; the failure is audit-logged either way.
+
+**Tamper-evident at the database level.** Every audit row stores an
+HMAC-SHA256 over its immutable fields plus the previous row's HMAC.
+Tampering with any past row breaks every subsequent row's verification.
+``sdk.audit.trace_session_chain(session_id)`` re-verifies the entire
+session chain on demand and raises ``ChainIntegrityError`` at the first
+broken row.
 
 ## Why "enforcement gates" and not "tracing"
 
