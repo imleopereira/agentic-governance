@@ -203,3 +203,51 @@ async def test_scope_violation_logged_not_raised(
         if ev and ev.kind == "scope.violation":
             events.append(ev)
     assert len(events) >= 1
+
+
+# -- SDK-4: enforce=True raises ScopeViolation --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_enforce_true_raises_scope_violation(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """With enforce=True, a disallowed tool call should raise ScopeViolation."""
+    from codeatelier_governance.scope.errors import ScopeViolation
+
+    handler = GovernanceCallbackHandler(sdk=sdk, agent_id="test-agent", enforce=True)  # type: ignore[arg-type]
+
+    with pytest.raises(ScopeViolation):
+        await handler.aon_tool_start(
+            serialized={"name": "dangerous_tool"},
+            input_str="test",
+        )
+
+    # The violation should still be audit-logged
+    events = []
+    for eid in store._order:
+        ev = store._events.get(eid)
+        if ev and ev.kind == "scope.violation":
+            events.append(ev)
+    assert len(events) >= 1
+
+
+@pytest.mark.asyncio
+async def test_enforce_false_does_not_raise(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """With enforce=False (default), a disallowed tool call logs but does not raise."""
+    handler = GovernanceCallbackHandler(sdk=sdk, agent_id="test-agent", enforce=False)  # type: ignore[arg-type]
+
+    # Should NOT raise
+    await handler.aon_tool_start(
+        serialized={"name": "dangerous_tool"},
+        input_str="test",
+    )
+
+    events = []
+    for eid in store._order:
+        ev = store._events.get(eid)
+        if ev and ev.kind == "scope.violation":
+            events.append(ev)
+    assert len(events) >= 1

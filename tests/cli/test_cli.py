@@ -172,3 +172,43 @@ def test_main_no_args(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exc_info:
         main([])
     assert exc_info.value.code == 0
+
+
+# -- SEC-2: Invalid UUID error handling ----------------------------------------
+
+
+def test_verify_invalid_uuid_exits_with_message(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """governance verify --session-id not-a-uuid should exit 1 with a helpful message."""
+    monkeypatch.setenv("GOVERNANCE_DATABASE_URL", "postgresql://localhost/test")
+    with pytest.raises(SystemExit) as exc_info:
+        main(["verify", "--session-id", "not-a-uuid"])
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Invalid session_id" in captured.err
+    assert "550e8400" in captured.err
+
+
+# -- SEC-3: --dry-run for migrate ----------------------------------------------
+
+
+def test_migrate_dry_run_prints_ddl(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """governance migrate --dry-run should print DDL without applying it."""
+    monkeypatch.setenv("GOVERNANCE_DATABASE_URL", "postgresql://localhost/test")
+    main(["migrate", "--dry-run", "--database-url", "postgresql://localhost/test"])
+    captured = capsys.readouterr()
+    assert "CREATE TABLE" in captured.out or "governance_audit_events" in captured.out
+    assert "Dry run complete" in captured.out
+
+
+def test_parser_migrate_dry_run() -> None:
+    """Parser should accept --dry-run flag on migrate."""
+    parser = _build_parser()
+    args = parser.parse_args(["migrate", "--dry-run", "--database-url", "postgresql://x"])
+    assert args.dry_run is True
+    assert args.command == "migrate"

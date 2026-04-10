@@ -217,3 +217,28 @@ async def test_wrap_async_budget_exceeded_raises(
 
     with pytest.raises(BudgetExceeded):
         await wrapped2.chat.completions.create(model="gpt-4o")
+
+
+# -- SDK-3: Double-wrap sentinel -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_double_wrap_returns_same_client(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Calling wrap_openai twice on the same client should be a no-op the second time."""
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+
+    wrap_openai(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
+    assert getattr(client, "_governance_wrapped", False) is True
+
+    # Wrap again — should return immediately
+    wrap_openai(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
+
+    # Call once — should produce only 1 set of audit events (not doubled)
+    await client.chat.completions.create(model="gpt-4o")
+
+    count = await store.count()
+    # Should have exactly llm.call + llm.result = 2 events, not 4
+    assert count == 2

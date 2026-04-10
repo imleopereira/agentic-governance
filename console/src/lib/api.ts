@@ -131,12 +131,13 @@ export interface Posture {
 export const api = {
   health: () => get<{ ok: boolean; version: string }>("/api/health"),
   agents: (limit = 50) => get<Agent[]>("/api/agents", { limit: String(limit) }),
-  events: (params?: { agent_id?: string; kind?: string; session_id?: string; limit?: number }) =>
+  events: (params?: { agent_id?: string; kind?: string; session_id?: string; limit?: number; offset?: number }) =>
     get<AuditEvent[]>("/api/events", {
       ...(params?.agent_id && { agent_id: params.agent_id }),
       ...(params?.kind && { kind: params.kind }),
       ...(params?.session_id && { session_id: params.session_id }),
       limit: String(params?.limit ?? 100),
+      offset: String(params?.offset ?? 0),
     }),
   verifySession: (sessionId: string) =>
     get<VerifyResult>(`/api/session/${sessionId}/verify`),

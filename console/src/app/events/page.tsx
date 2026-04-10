@@ -303,15 +303,18 @@ export default function EventsPage() {
   const [kindFilter, setKindFilter] = useState("");
   const [sessionFilter, setSessionFilter] = useState("");
   const [selectedEvent, setSelectedEvent] = useState<AuditEvent | null>(null);
+  const [pageSize, setPageSize] = useState(50);
+  const [page, setPage] = useState(0);
 
   const { data: events, isLoading } = useQuery({
-    queryKey: ["events", agentFilter, kindFilter, sessionFilter],
+    queryKey: ["events", agentFilter, kindFilter, sessionFilter, pageSize, page],
     queryFn: () =>
       api.events({
         agent_id: agentFilter || undefined,
         kind: kindFilter || undefined,
         session_id: sessionFilter || undefined,
-        limit: 200,
+        limit: pageSize,
+        offset: page * pageSize,
       }),
   });
 
@@ -343,19 +346,19 @@ export default function EventsPage() {
         <input
           placeholder="Filter by agent_id"
           value={agentFilter}
-          onChange={(e) => setAgentFilter(e.target.value)}
+          onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
           className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-48 focus:border-[var(--accent)] outline-none transition"
         />
         <input
           placeholder="Filter by kind"
           value={kindFilter}
-          onChange={(e) => setKindFilter(e.target.value)}
+          onChange={(e) => { setKindFilter(e.target.value); setPage(0); }}
           className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-48 focus:border-[var(--accent)] outline-none transition"
         />
         <input
           placeholder="Filter by session_id"
           value={sessionFilter}
-          onChange={(e) => setSessionFilter(e.target.value)}
+          onChange={(e) => { setSessionFilter(e.target.value); setPage(0); }}
           className="bg-[var(--card)] border border-[var(--border)] rounded-lg px-3 py-2 text-sm w-64 focus:border-[var(--accent)] outline-none transition"
         />
         {(agentFilter || kindFilter || sessionFilter) && (
@@ -364,6 +367,7 @@ export default function EventsPage() {
               setAgentFilter("");
               setKindFilter("");
               setSessionFilter("");
+              setPage(0);
             }}
             className="text-xs text-[var(--muted)] hover:text-white transition"
           >
@@ -441,9 +445,40 @@ export default function EventsPage() {
               ))}
             </tbody>
           </table>
-          <p className="text-xs text-[var(--muted)] mt-2">
-            Showing {events.length} events (most recent first)
-          </p>
+          <div className="flex items-center justify-between mt-3">
+            <div className="flex items-center gap-2">
+              <label className="text-xs text-[var(--muted)]">Page size:</label>
+              <select
+                value={pageSize}
+                onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
+                className="bg-[var(--card)] border border-[var(--border)] rounded px-2 py-1 text-xs focus:border-[var(--accent)] outline-none"
+              >
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </div>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="text-xs px-3 py-1.5 rounded-lg border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition"
+              >
+                Prev
+              </button>
+              <span className="text-xs text-[var(--muted)]">Page {page + 1}</span>
+              <button
+                onClick={() => setPage((p) => p + 1)}
+                disabled={!events || events.length < pageSize}
+                className="text-xs px-3 py-1.5 rounded-lg border border-[var(--border)] text-[var(--muted)] hover:text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-30 transition"
+              >
+                Next
+              </button>
+            </div>
+            <p className="text-xs text-[var(--muted)]">
+              Showing {events.length} events (most recent first)
+            </p>
+          </div>
         </div>
       )}
 

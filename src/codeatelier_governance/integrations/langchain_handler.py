@@ -67,10 +67,11 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         agent_id: The agent identifier for audit and scope checks.
     """
 
-    def __init__(self, sdk: GovernanceSDK, agent_id: str) -> None:
+    def __init__(self, sdk: GovernanceSDK, agent_id: str, enforce: bool = False) -> None:
         super().__init__()
         self._sdk = sdk
         self._agent_id = agent_id
+        self._enforce = enforce
 
     # -- helpers ---------------------------------------------------------------
 
@@ -92,7 +93,7 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             )
 
     async def _scope_check(self, tool_name: str) -> None:
-        """Run a scope check, logging violations but never raising."""
+        """Run a scope check. Logs violations; re-raises when enforce=True."""
         try:
             await self._sdk.scope.check(self._agent_id, tool=tool_name)
         except ScopeViolation:
@@ -102,6 +103,8 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                 agent_id=self._agent_id,
                 tool=tool_name,
             )
+            if self._enforce:
+                raise
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.scope_check_failed",
@@ -209,6 +212,9 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             _run_async(
                 self._audit_log("tool.call", {"tool": str(tool_name)})
             )
+        except ScopeViolation:
+            if self._enforce:
+                raise
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.on_tool_start_failed",
@@ -384,6 +390,9 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             tool_name = serialized.get("name", "unknown")
             await self._scope_check(str(tool_name))
             await self._audit_log("tool.call", {"tool": str(tool_name)})
+        except ScopeViolation:
+            if self._enforce:
+                raise
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.aon_tool_start_failed",

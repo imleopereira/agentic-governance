@@ -54,6 +54,18 @@ def _normalize_url_sync(url: str) -> str:
     return url
 
 
+def _run_migrate_dry_run() -> None:
+    """Print all DDL that would be executed, without touching the database."""
+    for ddl_path in _DDL_FILES:
+        if not ddl_path.exists():
+            sys.stderr.write(f"Warning: DDL file not found: {ddl_path}\n")
+            continue
+        sys.stdout.write(f"-- {ddl_path.name}\n")
+        sys.stdout.write(ddl_path.read_text())
+        sys.stdout.write("\n\n")
+    sys.stdout.write("-- Dry run complete. No changes applied.\n")
+
+
 async def _run_migrate(database_url: str) -> None:
     """Apply all DDL files to the database. Idempotent (IF NOT EXISTS)."""
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -273,6 +285,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--database-url", type=str, default=None,
         help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
     )
+    migrate_parser.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Print the DDL that would be executed without applying it",
+    )
 
     # verify
     verify_parser = subparsers.add_parser(
@@ -331,11 +347,21 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.command == "migrate":
         database_url = _resolve_database_url(args)
-        asyncio.run(_run_migrate(database_url))
+        if getattr(args, "dry_run", False):
+            _run_migrate_dry_run()
+        else:
+            asyncio.run(_run_migrate(database_url))
 
     elif args.command == "verify":
         database_url = _resolve_database_url(args)
-        session_id = UUID(args.session_id)
+        try:
+            session_id = UUID(args.session_id)
+        except ValueError:
+            sys.stderr.write(
+                "Invalid session_id: must be a UUID "
+                "(e.g., 550e8400-e29b-41d4-a716-446655440000)\n"
+            )
+            sys.exit(1)
         exit_code = asyncio.run(_run_verify(database_url, session_id))
         sys.exit(exit_code)
 

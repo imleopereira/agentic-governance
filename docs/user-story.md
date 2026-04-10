@@ -401,13 +401,14 @@ After the month-2 enforcement modules ship, this is what's left:
 | `auth` | stub | Agent identity (full identity is v0.2; v0.1 ships `agent_id: str`) |
 
 Things Maya also doesn't get yet:
-- A `governance migrate` CLI (she runs `psql -f ddl.sql` manually)
-- Pre-built FastAPI / LangChain integration examples
+- A `governance migrate` CLI (she runs `psql -f ddl.sql` manually). v0.1.6.
+- Pre-built LangChain CallbackHandler / OpenAI SDK adapter (she uses the
+  decorator pattern instead — works fine, just one extra line per call). v0.1.6.
 - A web dashboard (she queries Postgres directly with SQL — and if she wants
   charts, she points Grafana at the same database)
 - Managed-mode hosting (everything self-hosted in v0.1)
-- Persistent budget counters across process restarts (in-memory only in
-  v0.1; v0.2 adds Postgres durability)
+- Auto-cleanup for resolved gate rows (she runs the `cleanup_resolved` helper
+  on a cron, or `DELETE WHERE resolved_at < NOW() - INTERVAL '90 days'`)
 
 ---
 

@@ -257,6 +257,13 @@ def wrap_openai(
     Returns:
         The same client object, patched in-place.
     """
+    if getattr(client, "_governance_wrapped", False):
+        logger.warning(
+            "governance.openai_wrap.already_wrapped",
+            agent_id=agent_id,
+        )
+        return client
+
     completions = client.chat.completions
 
     is_async = asyncio.iscoroutinefunction(getattr(completions, "create", None))
@@ -266,4 +273,5 @@ def wrap_openai(
     else:
         completions.create = _wrap_sync_create(completions.create, sdk, agent_id)
 
+    client._governance_wrapped = True
     return client

@@ -69,12 +69,24 @@ def _normalize_url(url: str) -> str:
     raise ValueError("GOVERNANCE_DATABASE_URL must be a postgresql:// URL.")
 
 
-def _redact_metadata(meta: dict[str, Any]) -> dict[str, Any]:
-    """Strip sensitive keys from metadata before serving to the frontend."""
-    return {
-        k: ("***REDACTED***" if k.lower() in REDACT_KEYS else v)
-        for k, v in meta.items()
-    }
+def _redact_metadata(meta: dict[str, Any] | list[Any] | Any) -> Any:
+    """Strip sensitive keys from metadata before serving to the frontend.
+
+    Walks nested dicts and lists recursively, redacting any key at any
+    depth that matches the REDACT_KEYS set.
+    """
+    if isinstance(meta, dict):
+        return {
+            k: (
+                "***REDACTED***"
+                if k.lower() in REDACT_KEYS
+                else _redact_metadata(v)
+            )
+            for k, v in meta.items()
+        }
+    if isinstance(meta, list):
+        return [_redact_metadata(item) for item in meta]
+    return meta
 
 
 # ---------------------------------------------------------------------------
@@ -83,8 +95,19 @@ def _redact_metadata(meta: dict[str, Any]) -> dict[str, Any]:
 engine: AsyncEngine | None = None
 
 
+def _validate_cors_origins(origins: list[str]) -> None:
+    """Reject CORS wildcard '*' — require explicit origins."""
+    for origin in origins:
+        if origin.strip() == "*":
+            raise ValueError(
+                "CORS wildcard '*' is not allowed. "
+                "List specific origins in GOVERNANCE_CONSOLE_CORS_ORIGINS."
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+    _validate_cors_origins(CORS_ORIGINS)
     global engine
     engine = create_async_engine(
         _normalize_url(DATABASE_URL),
@@ -627,7 +650,8 @@ async def governance_posture() -> dict[str, Any]:
                 "FROM governance_audit_events "
                 "WHERE kind = 'scope.violation' "
                 "AND created_at >= (NOW() AT TIME ZONE 'UTC')::DATE "
-                "GROUP BY agent_id"
+                "GROUP BY agent_id "
+                "LIMIT 50"
             )
         )
         violations = {r["agent_id"]: r["violation_count"] for r in violations_res.mappings()}
@@ -637,7 +661,8 @@ async def governance_posture() -> dict[str, Any]:
             text(
                 "SELECT agent_id, usd_used, tokens_used "
                 "FROM governance_cost_agent_daily "
-                "WHERE day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"
+                "WHERE day_utc = (NOW() AT TIME ZONE 'UTC')::DATE "
+                "LIMIT 50"
             )
         )
         budgets = {r["agent_id"]: dict(r) for r in budget_res.mappings()}
@@ -648,7 +673,8 @@ async def governance_posture() -> dict[str, Any]:
                 "SELECT agent_id, COUNT(*) as pending_count "
                 "FROM governance_gates_pending "
                 "WHERE resolved_at IS NULL "
-                "GROUP BY agent_id"
+                "GROUP BY agent_id "
+                "LIMIT 50"
             )
         )
         pending = {r["agent_id"]: r["pending_count"] for r in pending_res.mappings()}
@@ -660,7 +686,8 @@ async def governance_posture() -> dict[str, Any]:
                 "FROM governance_audit_events "
                 "WHERE kind = 'budget.exceeded' "
                 "AND created_at >= (NOW() AT TIME ZONE 'UTC')::DATE "
-                "GROUP BY agent_id"
+                "GROUP BY agent_id "
+                "LIMIT 50"
             )
         )
         exceeded = {r["agent_id"]: r["exceeded_count"] for r in exceeded_res.mappings()}
