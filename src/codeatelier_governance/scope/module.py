@@ -161,6 +161,18 @@ class ScopeModule:
     def get_policy(self, agent_id: str) -> ScopePolicy | None:
         return self._policies.get(agent_id)
 
+    def filter_tools(self, agent_id: str, tools: list[str]) -> list[str]:
+        """Remove hidden tools from a tool list.
+
+        Used before passing tools to the LLM so the agent never even
+        knows the hidden tools exist. If no policy is registered for
+        the agent, the full list is returned unchanged.
+        """
+        policy = self._policies.get(agent_id)
+        if policy is None or not policy.hidden_tools:
+            return tools
+        return [t for t in tools if t not in policy.hidden_tools]
+
     async def check(
         self,
         agent_id: str,

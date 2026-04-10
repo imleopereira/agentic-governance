@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 MAX_AGENT_ID_LEN = 256
 MAX_USD_CAP = 1_000_000.0  # one million USD per scope — sanity ceiling
 MAX_TOKEN_CAP = 1_000_000_000  # one billion tokens — sanity ceiling
+MAX_SESSION_SECONDS = 86400  # 24 hours — sanity ceiling
 
 
 class BudgetPolicy(BaseModel):
@@ -33,6 +34,7 @@ class BudgetPolicy(BaseModel):
     per_session_tokens: int | None = Field(default=None, ge=0, le=MAX_TOKEN_CAP)
     per_agent_usd_daily: float | None = Field(default=None, ge=0.0, le=MAX_USD_CAP)
     per_agent_tokens_daily: int | None = Field(default=None, ge=0, le=MAX_TOKEN_CAP)
+    per_session_seconds: int | None = Field(default=None, ge=0, le=MAX_SESSION_SECONDS)
 
     def model_post_init(self, __context: object) -> None:
         # At least one cap must be set, else the policy does nothing.
@@ -43,6 +45,7 @@ class BudgetPolicy(BaseModel):
                 self.per_session_tokens,
                 self.per_agent_usd_daily,
                 self.per_agent_tokens_daily,
+                self.per_session_seconds,
             )
         )
         if not any_set:

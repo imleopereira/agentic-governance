@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS governance_cost_session_usage (
     usd_used      DOUBLE PRECISION NOT NULL DEFAULT 0,
     tokens_used   BIGINT           NOT NULL DEFAULT 0,
     last_updated  TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    started_at    TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
     PRIMARY KEY (agent_id, session_id)
 );
 

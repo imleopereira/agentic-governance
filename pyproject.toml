@@ -81,6 +81,7 @@ include-package-data = true
 "codeatelier_governance.audit" = ["*.sql"]
 "codeatelier_governance.cost" = ["*.sql"]
 "codeatelier_governance.gates" = ["*.sql"]
+"codeatelier_governance.console" = ["*.sql"]
 
 [tool.ruff]
 line-length = 100

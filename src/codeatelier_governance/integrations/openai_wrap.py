@@ -50,28 +50,15 @@ def _extract_token_usage(response: Any) -> dict[str, int]:
 
 
 def _estimate_usd(model: str, usage: dict[str, int]) -> float:
-    """Rough cost estimate based on model name and token counts.
+    """Estimate USD cost using the built-in pricing table.
 
-    Returns 0.0 if the model is unknown or usage is empty. Callers should
-    register accurate pricing via BudgetPolicy for production use.
+    Returns 0.0 if the model is unknown or usage is empty.
     """
+    from codeatelier_governance.cost.pricing import estimate_cost
+
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
-
-    # Rough per-1k-token pricing (input/output) for common models.
-    pricing: dict[str, tuple[float, float]] = {
-        "gpt-4o": (0.0025, 0.01),
-        "gpt-4o-mini": (0.00015, 0.0006),
-        "gpt-4-turbo": (0.01, 0.03),
-        "gpt-4": (0.03, 0.06),
-        "gpt-3.5-turbo": (0.0005, 0.0015),
-    }
-
-    for prefix, (inp_rate, out_rate) in pricing.items():
-        if model.startswith(prefix):
-            return (prompt * inp_rate + completion * out_rate) / 1000.0
-
-    return 0.0
+    return estimate_cost(model, prompt, completion)
 
 
 def _has_running_loop() -> bool:

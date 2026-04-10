@@ -16,6 +16,7 @@ deltas with no lost updates.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import text
@@ -64,8 +65,8 @@ class PostgresCostStore(CostStore):
                     text(
                         """
                         INSERT INTO governance_cost_session_usage
-                            (agent_id, session_id, usd_used, tokens_used, last_updated)
-                        VALUES (:agent_id, :session_id, :usd, :tokens, NOW())
+                            (agent_id, session_id, usd_used, tokens_used, last_updated, started_at)
+                        VALUES (:agent_id, :session_id, :usd, :tokens, NOW(), NOW())
                         ON CONFLICT (agent_id, session_id) DO UPDATE SET
                             usd_used    = governance_cost_session_usage.usd_used    + EXCLUDED.usd_used,
                             tokens_used = governance_cost_session_usage.tokens_used + EXCLUDED.tokens_used,
@@ -138,6 +139,27 @@ class PostgresCostStore(CostStore):
         if row is None:
             return (0.0, 0)
         return (float(row[0]), int(row[1]))
+
+    async def get_session_start_time(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> datetime | None:
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT started_at FROM governance_cost_session_usage "
+                    "WHERE agent_id = :agent_id AND session_id = :sid"
+                ),
+                {"agent_id": agent_id, "sid": str(session_id)},
+            )
+            row = res.first()
+        if row is None or row[0] is None:
+            return None
+        val = row[0]
+        if isinstance(val, datetime):
+            return val
+        return None
 
     async def close(self) -> None:
         await self._engine.dispose()

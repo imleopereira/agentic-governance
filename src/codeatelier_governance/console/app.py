@@ -13,7 +13,7 @@ Security constraints:
       It is NEVER serialized to the frontend.
     * Field-level redaction of metadata is applied before serving.
     * CORS is restricted to the console's own origin.
-    * A bearer token gates every request.
+    * Session-based auth with httpOnly cookies (v0.2.2+).
 """
 from __future__ import annotations
 
@@ -25,20 +25,28 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+import structlog
+
 try:
     from fastapi import Depends, FastAPI, HTTPException, Query, Request
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
 except ImportError as exc:
     raise ImportError(
         "The governance console requires FastAPI. "
         "Install with: pip install codeatelier-governance[console]"
     ) from exc
 
+from pydantic import BaseModel
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ..audit.chain import verify_event
 from ..audit.models import AuditEventRecord
+from .auth import create_session_id, hash_password, session_expires_at, verify_password
+
+_logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config from env
@@ -46,6 +54,8 @@ from ..audit.models import AuditEventRecord
 DATABASE_URL = os.environ.get("GOVERNANCE_DATABASE_URL", "")
 AUDIT_SECRET = os.environ.get("GOVERNANCE_AUDIT_SECRET", "")
 CONSOLE_TOKEN = os.environ.get("GOVERNANCE_CONSOLE_TOKEN", "")
+DEV_MODE = os.environ.get("GOVERNANCE_CONSOLE_DEV_MODE", "").lower() == "true"
+SESSION_TTL_HOURS = int(os.environ.get("GOVERNANCE_CONSOLE_SESSION_TTL_HOURS", "8"))
 CORS_ORIGINS = os.environ.get(
     "GOVERNANCE_CONSOLE_CORS_ORIGINS", "http://localhost:3000"
 ).split(",")
@@ -132,20 +142,97 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
 
 # ---------------------------------------------------------------------------
+# Auth: request models
+# ---------------------------------------------------------------------------
+class LoginRequest(BaseModel):
+    """Login request body."""
+    username: str
+    password: str
+
+
+class CreateUserRequest(BaseModel):
+    """Create user request body."""
+    username: str
+    password: str
+    role: str = "viewer"
+
+
+class UpdateUserRequest(BaseModel):
+    """Update user request body."""
+    role: str | None = None
+    disabled: bool | None = None
+
+
+# ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
-async def verify_token(request: Request) -> None:
-    if not CONSOLE_TOKEN:
-        return  # dev mode: no token required
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {CONSOLE_TOKEN}":
-        raise HTTPException(401, "Invalid or missing bearer token.")
+async def authenticate(request: Request) -> None:
+    """Three-mode auth: user auth, legacy token, dev mode.
+
+    Injects ``user_id`` and ``role`` into ``request.state``.
+    """
+    # Health endpoint is unauthenticated
+    if request.url.path == "/api/health":
+        return
+
+    # Dev mode: no auth, synthetic user
+    if DEV_MODE:
+        request.state.user_id = "dev"
+        request.state.role = "admin"
+        return
+
+    # Session cookie auth
+    session_cookie = request.cookies.get("governance_session")
+    if session_cookie and engine is not None:
+        try:
+            sid = UUID(session_cookie)
+        except ValueError:
+            raise HTTPException(401, "Invalid session cookie.")
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT s.user_id, u.role, s.expires_at, s.revoked "
+                    "FROM governance_console_sessions s "
+                    "JOIN governance_console_users u ON s.user_id = u.user_id "
+                    "WHERE s.session_id = :sid AND u.disabled = FALSE"
+                ),
+                {"sid": str(sid)},
+            )
+            row = res.mappings().first()
+        if row is None:
+            raise HTTPException(401, "Session not found.")
+        if row["revoked"]:
+            raise HTTPException(401, "Session revoked.")
+        if row["expires_at"].replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            raise HTTPException(401, "Session expired.")
+        request.state.user_id = str(row["user_id"])
+        request.state.role = row["role"]
+        return
+
+    # Legacy bearer token fallback
+    auth_header = request.headers.get("Authorization", "")
+    if CONSOLE_TOKEN and auth_header == f"Bearer {CONSOLE_TOKEN}":
+        request.state.user_id = "legacy-token"
+        request.state.role = "viewer"
+        return
+
+    raise HTTPException(401, "Authentication required.")
+
+
+def require_role(role: str) -> Any:
+    """Dependency that checks request.state.role against required role."""
+    async def check(request: Request) -> None:
+        user_role = getattr(request.state, "role", None)
+        if user_role != role and user_role != "admin":
+            raise HTTPException(403, f"Requires {role} role.")
+    return Depends(check)
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +240,239 @@ async def verify_token(request: Request) -> None:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "version": "0.2.0"}
+    return {"ok": True, "version": "0.2.2"}
 
 
-@app.get("/api/agents", dependencies=[Depends(verify_token)])
+# ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/auth/login")
+async def login(body: LoginRequest) -> JSONResponse:
+    """Authenticate and create a session. Sets an httpOnly cookie."""
+    assert engine is not None
+    # Opportunistic session cleanup
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "DELETE FROM governance_console_sessions "
+                "WHERE expires_at < NOW() OR revoked = TRUE"
+            )
+        )
+    # Look up user
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT user_id, password_hash, role, disabled "
+                "FROM governance_console_users "
+                "WHERE username = :username"
+            ),
+            {"username": body.username.lower()},
+        )
+        row = res.mappings().first()
+    if row is None or not verify_password(body.password, row["password_hash"]):
+        raise HTTPException(401, "Invalid username or password.")
+    if row["disabled"]:
+        raise HTTPException(403, "Account is disabled.")
+    # Create session
+    sid = create_session_id()
+    expires = session_expires_at(SESSION_TTL_HOURS)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO governance_console_sessions "
+                "(session_id, user_id, expires_at) "
+                "VALUES (:sid, :uid, :expires)"
+            ),
+            {"sid": str(sid), "uid": str(row["user_id"]), "expires": expires},
+        )
+    response = JSONResponse(
+        content={"ok": True, "username": body.username, "role": row["role"]}
+    )
+    max_age = SESSION_TTL_HOURS * 3600
+    secure = not DEV_MODE
+    response.set_cookie(
+        key="governance_session",
+        value=str(sid),
+        httponly=True,
+        secure=secure,
+        samesite="lax",
+        path="/api",
+        max_age=max_age,
+    )
+    return response
+
+
+@app.post("/api/auth/logout", dependencies=[Depends(authenticate)])
+async def logout(request: Request) -> JSONResponse:
+    """Revoke the current session and clear the cookie."""
+    session_cookie = request.cookies.get("governance_session")
+    if session_cookie and engine is not None:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE governance_console_sessions "
+                    "SET revoked = TRUE "
+                    "WHERE session_id = :sid"
+                ),
+                {"sid": session_cookie},
+            )
+    response = JSONResponse(content={"ok": True})
+    response.delete_cookie(key="governance_session", path="/api")
+    return response
+
+
+@app.get("/api/auth/me", dependencies=[Depends(authenticate)])
+async def auth_me(request: Request) -> dict[str, Any]:
+    """Return the current authenticated user."""
+    user_id = getattr(request.state, "user_id", "unknown")
+    role = getattr(request.state, "role", "unknown")
+    username = "unknown"
+    if engine is not None and user_id not in ("dev", "legacy-token", "unknown"):
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT username FROM governance_console_users "
+                    "WHERE user_id = :uid"
+                ),
+                {"uid": user_id},
+            )
+            row = res.first()
+            if row:
+                username = row[0]
+    elif user_id == "dev":
+        username = "dev"
+    elif user_id == "legacy-token":
+        username = "legacy-token"
+    return {"user_id": user_id, "username": username, "role": role}
+
+
+# ---------------------------------------------------------------------------
+# Admin: user management
+# ---------------------------------------------------------------------------
+@app.get(
+    "/api/auth/users",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def list_users() -> list[dict[str, Any]]:
+    """List all console users (admin only)."""
+    assert engine is not None
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT user_id, username, role, disabled, created_at, updated_at "
+                "FROM governance_console_users "
+                "ORDER BY created_at"
+            )
+        )
+        return [
+            {
+                "user_id": str(row["user_id"]),
+                "username": row["username"],
+                "role": row["role"],
+                "disabled": row["disabled"],
+                "created_at": row["created_at"].isoformat()
+                if row["created_at"]
+                else None,
+                "updated_at": row["updated_at"].isoformat()
+                if row["updated_at"]
+                else None,
+            }
+            for row in res.mappings()
+        ]
+
+
+@app.post(
+    "/api/auth/users",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def create_user(body: CreateUserRequest) -> dict[str, Any]:
+    """Create a new console user (admin only)."""
+    if body.role not in ("viewer", "admin"):
+        raise HTTPException(400, "Role must be 'viewer' or 'admin'.")
+    if len(body.password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters.")
+    assert engine is not None
+    uid = uuid4()
+    pw_hash = hash_password(body.password)
+    now = datetime.now(timezone.utc)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO governance_console_users "
+                    "(user_id, username, password_hash, role, created_at, updated_at) "
+                    "VALUES (:uid, :username, :pw_hash, :role, :now, :now)"
+                ),
+                {
+                    "uid": str(uid),
+                    "username": body.username.lower(),
+                    "pw_hash": pw_hash,
+                    "role": body.role,
+                    "now": now,
+                },
+            )
+    except Exception as exc:
+        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+            raise HTTPException(409, f"Username '{body.username}' already exists.")
+        raise
+    return {"ok": True, "user_id": str(uid), "username": body.username.lower()}
+
+
+@app.patch(
+    "/api/auth/users/{user_id}",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
+    """Update a user's role or disabled status (admin only)."""
+    assert engine is not None
+    updates: list[str] = []
+    params: dict[str, Any] = {"uid": str(user_id), "now": datetime.now(timezone.utc)}
+    if body.role is not None:
+        if body.role not in ("viewer", "admin"):
+            raise HTTPException(400, "Role must be 'viewer' or 'admin'.")
+        updates.append("role = :role")
+        params["role"] = body.role
+    if body.disabled is not None:
+        updates.append("disabled = :disabled")
+        params["disabled"] = body.disabled
+    if not updates:
+        raise HTTPException(400, "No fields to update.")
+    updates.append("updated_at = :now")
+    set_clause = ", ".join(updates)
+    async with engine.begin() as conn:
+        res = await conn.execute(
+            text(
+                f"UPDATE governance_console_users SET {set_clause} "
+                "WHERE user_id = :uid"
+            ),
+            params,
+        )
+        if res.rowcount == 0:
+            raise HTTPException(404, "User not found.")
+    return {"ok": True, "user_id": str(user_id)}
+
+
+@app.delete(
+    "/api/auth/sessions/{session_id}",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def revoke_session(session_id: UUID) -> dict[str, Any]:
+    """Revoke a specific session (admin only)."""
+    assert engine is not None
+    async with engine.begin() as conn:
+        res = await conn.execute(
+            text(
+                "UPDATE governance_console_sessions SET revoked = TRUE "
+                "WHERE session_id = :sid AND revoked = FALSE"
+            ),
+            {"sid": str(session_id)},
+        )
+        if res.rowcount == 0:
+            raise HTTPException(404, "Session not found or already revoked.")
+    return {"ok": True, "session_id": str(session_id)}
+
+
+@app.get("/api/agents", dependencies=[Depends(authenticate)])
 async def list_agents(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
@@ -186,7 +502,7 @@ async def list_agents(
         ]
 
 
-@app.get("/api/events", dependencies=[Depends(verify_token)])
+@app.get("/api/events", dependencies=[Depends(authenticate)])
 async def list_events(
     agent_id: str | None = None,
     kind: str | None = None,
@@ -248,7 +564,7 @@ async def list_events(
         ]
 
 
-@app.get("/api/session/{session_id}/verify", dependencies=[Depends(verify_token)])
+@app.get("/api/session/{session_id}/verify", dependencies=[Depends(authenticate)])
 async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
     """Verify the HMAC chain integrity for an entire session.
 
@@ -318,7 +634,7 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
     }
 
 
-@app.get("/api/cost/agents", dependencies=[Depends(verify_token)])
+@app.get("/api/cost/agents", dependencies=[Depends(authenticate)])
 async def cost_agents() -> list[dict[str, Any]]:
     """Cost summary per agent for today."""
     assert engine is not None
@@ -341,7 +657,7 @@ async def cost_agents() -> list[dict[str, Any]]:
         ]
 
 
-@app.get("/api/cost/sessions", dependencies=[Depends(verify_token)])
+@app.get("/api/cost/sessions", dependencies=[Depends(authenticate)])
 async def cost_sessions(
     agent_id: str | None = None,
     limit: int = Query(50, ge=1, le=500),
@@ -376,7 +692,7 @@ async def cost_sessions(
         ]
 
 
-@app.get("/api/gates/pending", dependencies=[Depends(verify_token)])
+@app.get("/api/gates/pending", dependencies=[Depends(authenticate)])
 async def gates_pending() -> list[dict[str, Any]]:
     """List all unresolved approval requests."""
     assert engine is not None
@@ -407,7 +723,7 @@ async def gates_pending() -> list[dict[str, Any]]:
         ]
 
 
-@app.get("/api/gates/recent", dependencies=[Depends(verify_token)])
+@app.get("/api/gates/recent", dependencies=[Depends(authenticate)])
 async def gates_recent(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
@@ -441,7 +757,7 @@ async def gates_recent(
         ]
 
 
-@app.post("/api/gates/{request_id}/grant", dependencies=[Depends(verify_token)])
+@app.post("/api/gates/{request_id}/grant", dependencies=[Depends(authenticate)])
 async def grant_gate(request_id: UUID) -> dict[str, Any]:
     """Grant a pending approval gate request."""
     if not AUDIT_SECRET:
@@ -506,7 +822,7 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
     return {"ok": True, "request_id": str(request_id), "resolution": "granted"}
 
 
-@app.post("/api/gates/{request_id}/deny", dependencies=[Depends(verify_token)])
+@app.post("/api/gates/{request_id}/deny", dependencies=[Depends(authenticate)])
 async def deny_gate(request_id: UUID) -> dict[str, Any]:
     """Deny a pending approval gate request."""
     if not AUDIT_SECRET:
@@ -571,7 +887,7 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
     return {"ok": True, "request_id": str(request_id), "resolution": "denied"}
 
 
-@app.get("/api/policies", dependencies=[Depends(verify_token)])
+@app.get("/api/policies", dependencies=[Depends(authenticate)])
 async def list_policies() -> list[dict[str, Any]]:
     """Return all policies from the governance_policies table."""
     assert engine is not None
@@ -596,7 +912,7 @@ async def list_policies() -> list[dict[str, Any]]:
         ]
 
 
-@app.get("/api/policies/{agent_id}", dependencies=[Depends(verify_token)])
+@app.get("/api/policies/{agent_id}", dependencies=[Depends(authenticate)])
 async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
     """Return scope + budget policies for a single agent."""
     assert engine is not None
@@ -623,7 +939,7 @@ async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
         ]
 
 
-@app.get("/api/posture", dependencies=[Depends(verify_token)])
+@app.get("/api/posture", dependencies=[Depends(authenticate)])
 async def governance_posture() -> dict[str, Any]:
     """Governance posture overview — the Persona D CEO demo page.
 

@@ -202,3 +202,67 @@ async def _attempt_violation(scope: ScopeModule) -> Exception:
     except ScopeViolation as exc:
         return exc
     return RuntimeError("expected violation")
+
+
+# ---------------------------------------------------------------------------
+# G10: Hidden tool policies
+# ---------------------------------------------------------------------------
+def test_filter_tools_removes_hidden(scope: ScopeModule) -> None:
+    """filter_tools should remove tools in the hidden_tools set."""
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_tools=frozenset({"read", "write"}),
+            hidden_tools=frozenset({"secret_tool", "internal_api"}),
+        )
+    )
+    tools = ["read", "write", "secret_tool", "internal_api", "other"]
+    result = scope.filter_tools("a", tools)
+    assert result == ["read", "write", "other"]
+
+
+def test_filter_tools_no_hidden_returns_full_list(scope: ScopeModule) -> None:
+    """Policy with no hidden_tools returns the full list."""
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_tools=frozenset({"read"}),
+        )
+    )
+    tools = ["read", "write", "anything"]
+    assert scope.filter_tools("a", tools) == tools
+
+
+def test_filter_tools_no_policy_returns_full_list(scope: ScopeModule) -> None:
+    """Unknown agent gets the full list (no filtering)."""
+    assert scope.filter_tools("unknown", ["a", "b"]) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_hidden_tools_also_blocked_by_check(scope: ScopeModule) -> None:
+    """Hidden tools not in allowed_tools are blocked by scope.check()."""
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_tools=frozenset({"read"}),
+            hidden_tools=frozenset({"secret_tool"}),
+        )
+    )
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="a", tool="secret_tool")
+
+
+def test_policy_with_both_allowed_and_hidden(scope: ScopeModule) -> None:
+    """Allowed and hidden tools should work together correctly."""
+    scope.register(
+        ScopePolicy(
+            agent_id="a",
+            allowed_tools=frozenset({"read", "write", "list"}),
+            hidden_tools=frozenset({"write"}),
+        )
+    )
+    tools = ["read", "write", "list", "delete"]
+    result = scope.filter_tools("a", tools)
+    assert "write" not in result
+    assert "read" in result
+    assert "list" in result

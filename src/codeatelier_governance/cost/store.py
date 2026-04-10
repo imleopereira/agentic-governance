@@ -53,6 +53,14 @@ class CostStore(ABC):
     ) -> tuple[float, int]:
         """Return ``(usd_used, tokens_used)`` for the agent's current UTC day."""
 
+    async def get_session_start_time(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> datetime | None:
+        """Return the timestamp of the first track() call for this session, or None."""
+        return None
+
     async def close(self) -> None:
         """Release resources. Override if needed."""
         return None
@@ -63,6 +71,7 @@ class InMemoryCostStore(CostStore):
 
     def __init__(self) -> None:
         self._session_usage: dict[tuple[str, UUID], tuple[float, int]] = {}
+        self._session_started: dict[tuple[str, UUID], datetime] = {}
         self._agent_daily: dict[str, tuple[float, int, datetime]] = {}
         self._lock = asyncio.Lock()
 
@@ -77,10 +86,11 @@ class InMemoryCostStore(CostStore):
         now = datetime.now(timezone.utc)
         day = _utc_day_start(now)
         async with self._lock:
-            cur_usd, cur_tok = self._session_usage.get(
-                (agent_id, session_id), (0.0, 0)
-            )
-            self._session_usage[(agent_id, session_id)] = (
+            key = (agent_id, session_id)
+            if key not in self._session_started:
+                self._session_started[key] = now
+            cur_usd, cur_tok = self._session_usage.get(key, (0.0, 0))
+            self._session_usage[key] = (
                 cur_usd + usd,
                 cur_tok + tokens,
             )
@@ -108,3 +118,11 @@ class InMemoryCostStore(CostStore):
             if d_day < day:
                 return (0.0, 0)
             return (d_usd, d_tok)
+
+    async def get_session_start_time(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> datetime | None:
+        async with self._lock:
+            return self._session_started.get((agent_id, session_id))

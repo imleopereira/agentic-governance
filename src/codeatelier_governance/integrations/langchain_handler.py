@@ -137,9 +137,34 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        """Called when an LLM call starts."""
+        """Called when an LLM call starts.
+
+        If the serialized LLM payload contains a ``tools`` list, hidden
+        tools are filtered out before the call reaches the model.
+        """
         try:
             model = serialized.get("name", serialized.get("id", ["unknown"])[-1])
+            invocation_params = kwargs.get("invocation_params", {})
+            if isinstance(invocation_params, dict):
+                tools = invocation_params.get("tools")
+                if isinstance(tools, list):
+                    tool_names = [
+                        t.get("function", {}).get("name", "")
+                        if isinstance(t, dict)
+                        else ""
+                        for t in tools
+                    ]
+                    filtered = self._sdk.scope.filter_tools(self._agent_id, tool_names)
+                    if len(filtered) < len(tool_names):
+                        hidden = set(tool_names) - set(filtered)
+                        invocation_params["tools"] = [
+                            t
+                            for t in tools
+                            if not (
+                                isinstance(t, dict)
+                                and t.get("function", {}).get("name", "") in hidden
+                            )
+                        ]
             _run_async(
                 self._audit_log(
                     "llm.call",

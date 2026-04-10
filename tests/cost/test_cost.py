@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -158,3 +159,70 @@ async def test_breach_event_includes_session_id(
         if e.kind == "budget.exceeded"
     )
     assert breach.session_id == sid
+
+
+# ---------------------------------------------------------------------------
+# G15: Session time limits
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_session_under_time_limit_passes(cost: CostModule) -> None:
+    """Session within time limit should pass check_or_raise."""
+    cost.register(BudgetPolicy(agent_id="a", per_session_seconds=300))
+    sid = uuid4()
+    await cost.track("a", sid, tokens=1)
+    await cost.check_or_raise("a", sid)
+
+
+@pytest.mark.asyncio
+async def test_session_over_time_limit_raises(cost: CostModule) -> None:
+    """Session exceeding time limit should raise BudgetExceeded."""
+    cost.register(BudgetPolicy(agent_id="a", per_session_seconds=10))
+    sid = uuid4()
+    await cost.track("a", sid, tokens=1)
+    # Backdate the session start time to simulate elapsed time
+    store = cost._store  # type: ignore[attr-defined]
+    key = ("a", sid)
+    store._session_started[key] = datetime.now(timezone.utc) - timedelta(seconds=15)
+    with pytest.raises(BudgetExceeded, match="session time limit exceeded"):
+        await cost.check_or_raise("a", sid)
+
+
+@pytest.mark.asyncio
+async def test_session_time_limit_logs_audit_event(
+    cost: CostModule, audit_store: InMemoryAuditStore
+) -> None:
+    """Time limit breach should log a budget.exceeded audit event."""
+    cost.register(BudgetPolicy(agent_id="a", per_session_seconds=5))
+    sid = uuid4()
+    await cost.track("a", sid, tokens=1)
+    store = cost._store  # type: ignore[attr-defined]
+    store._session_started[("a", sid)] = datetime.now(timezone.utc) - timedelta(seconds=10)
+    with pytest.raises(BudgetExceeded):
+        await cost.check_or_raise("a", sid)
+    await asyncio.sleep(0.1)
+    breaches = [
+        e
+        for e in audit_store._events.values()  # type: ignore[attr-defined]
+        if e.kind == "budget.exceeded" and e.metadata.get("cap") == "per_session_seconds"
+    ]
+    assert len(breaches) == 1
+    assert breaches[0].metadata["limit"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_session_no_time_limit_ignores_check(cost: CostModule) -> None:
+    """Policy without per_session_seconds should not check time."""
+    cost.register(BudgetPolicy(agent_id="a", per_session_usd=100.0))
+    sid = uuid4()
+    await cost.track("a", sid, tokens=1)
+    await cost.check_or_raise("a", sid)
+
+
+def test_per_session_seconds_field_validation() -> None:
+    """per_session_seconds must be 0..86400."""
+    BudgetPolicy(agent_id="a", per_session_seconds=300)
+    BudgetPolicy(agent_id="a", per_session_seconds=86400)
+    with pytest.raises(ValidationError):
+        BudgetPolicy(agent_id="a", per_session_seconds=86401)
+    with pytest.raises(ValidationError):
+        BudgetPolicy(agent_id="a", per_session_seconds=-1)

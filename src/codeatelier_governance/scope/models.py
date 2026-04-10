@@ -40,6 +40,7 @@ class ScopePolicy(BaseModel):
     agent_id: str = Field(min_length=1, max_length=MAX_AGENT_ID_LEN)
     allowed_tools: frozenset[str] = Field(default_factory=frozenset)
     allowed_apis: frozenset[str] = Field(default_factory=frozenset)
+    hidden_tools: frozenset[str] = Field(default_factory=frozenset)
 
     def model_post_init(self, __context: object) -> None:
         if len(self.allowed_tools) > MAX_SET_SIZE:
@@ -52,6 +53,11 @@ class ScopePolicy(BaseModel):
                 f"scope policy: allowed_apis has {len(self.allowed_apis)} entries "
                 f"(max {MAX_SET_SIZE}). Fix: use prefix matches or split agents."
             )
+        if len(self.hidden_tools) > MAX_SET_SIZE:
+            raise ValueError(
+                f"scope policy: hidden_tools has {len(self.hidden_tools)} entries "
+                f"(max {MAX_SET_SIZE}). Fix: split into multiple agents."
+            )
         for tool in self.allowed_tools:
             if len(tool) > MAX_TOOL_NAME_LEN or not tool:
                 raise ValueError(
@@ -61,4 +67,9 @@ class ScopePolicy(BaseModel):
             if len(api) > MAX_API_PATTERN_LEN or not api:
                 raise ValueError(
                     f"scope policy: api pattern {api!r} must be 1-{MAX_API_PATTERN_LEN} chars"
+                )
+        for tool in self.hidden_tools:
+            if len(tool) > MAX_TOOL_NAME_LEN or not tool:
+                raise ValueError(
+                    f"scope policy: hidden tool name {tool!r} must be 1-{MAX_TOOL_NAME_LEN} chars"
                 )

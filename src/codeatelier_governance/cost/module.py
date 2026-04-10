@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -171,6 +172,31 @@ class CostModule:
 
     async def close(self) -> None:
         await self._store.close()
+
+    async def track_usage(
+        self,
+        agent_id: str,
+        session_id: UUID,
+        *,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        """Track cost using built-in model pricing.
+
+        Convenience wrapper around ``track()`` that looks up the model in
+        the built-in pricing table. Users no longer need to pass ``usd=``
+        manually for known models.
+        """
+        from .pricing import estimate_cost
+
+        usd = estimate_cost(model, input_tokens, output_tokens)
+        await self.track(
+            agent_id,
+            session_id,
+            tokens=input_tokens + output_tokens,
+            usd=usd,
+        )
 
     async def track(
         self,
@@ -319,6 +345,40 @@ class CostModule:
                 f"budget exceeded: {cap_name}={used} > limit={limit} "
                 f"for agent_id={agent_id!r}"
             )
+
+        if policy.per_session_seconds is not None:
+            try:
+                started = await self._store.get_session_start_time(
+                    agent_id, session_id
+                )
+            except Exception as exc:
+                logger.error(
+                    "cost.session_time_check_failed",
+                    error_type=type(exc).__name__,
+                    agent_id=agent_id,
+                )
+                started = None
+            if started is not None:
+                elapsed = int(
+                    (datetime.now(timezone.utc) - started).total_seconds()
+                )
+                if elapsed > policy.per_session_seconds:
+                    await self._audit.log(
+                        AuditEvent(
+                            agent_id=agent_id,
+                            session_id=session_id,
+                            kind="budget.exceeded",
+                            metadata={
+                                "cap": "per_session_seconds",
+                                "used": float(elapsed),
+                                "limit": float(policy.per_session_seconds),
+                            },
+                        )
+                    )
+                    raise BudgetExceeded(
+                        f"session time limit exceeded: "
+                        f"{elapsed}s > {policy.per_session_seconds}s limit"
+                    )
 
     async def snapshot(
         self,
