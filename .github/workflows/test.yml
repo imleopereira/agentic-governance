@@ -22,7 +22,7 @@ jobs:
       - name: install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,otel]"
+          python -m pip install -e ".[dev,otel,console]"
       - name: ruff
         run: python -m ruff check src/ tests/
       - name: mypy
@@ -57,7 +57,7 @@ jobs:
       - name: install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,otel]"
+          python -m pip install -e ".[dev,otel,console]"
       - name: apply DDL
         run: |
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
@@ -66,6 +66,8 @@ jobs:
             -f src/codeatelier_governance/cost/ddl.sql
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
             -f src/codeatelier_governance/gates/ddl.sql
+          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
+            -f src/codeatelier_governance/console/ddl.sql
       - name: integration tests
         run: python -m pytest tests/ -q -m integration
 

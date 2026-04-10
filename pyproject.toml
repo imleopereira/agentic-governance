@@ -63,6 +63,7 @@ dev = [
     "ruff",
     "mypy",
     "coverage",
+    "httpx>=0.27",
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
 ]

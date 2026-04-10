@@ -135,7 +135,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Code Atelier Governance Console",
-    version="0.2.0",
+    version="0.2.2",
     lifespan=lifespan,
 )
 
