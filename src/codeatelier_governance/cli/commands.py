@@ -69,6 +69,51 @@ def _run_migrate_dry_run() -> None:
     sys.stdout.write("-- Dry run complete. No changes applied.\n")
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a SQL file into individual statements for asyncpg.
+
+    Handles PL/pgSQL function bodies delimited by $$ ... $$ by not
+    splitting on semicolons inside dollar-quoted strings.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    in_dollar_quote = False
+
+    for line in sql.split("\n"):
+        stripped = line.strip()
+        # Skip pure comment lines (but keep comments within statements)
+        if not current and (not stripped or stripped.startswith("--")):
+            continue
+
+        # Track $$ delimiters for PL/pgSQL blocks
+        dollar_count = line.count("$$")
+        if dollar_count % 2 == 1:
+            in_dollar_quote = not in_dollar_quote
+
+        current.append(line)
+
+        # Statement ends at semicolon OUTSIDE dollar-quoted blocks
+        if stripped.endswith(";") and not in_dollar_quote:
+            stmt = "\n".join(current).strip()
+            if stmt and not all(
+                ln.strip().startswith("--") or not ln.strip()
+                for ln in stmt.split("\n")
+            ):
+                statements.append(stmt)
+            current = []
+
+    # Handle any trailing statement without semicolon
+    if current:
+        stmt = "\n".join(current).strip()
+        if stmt and not all(
+            ln.strip().startswith("--") or not ln.strip()
+            for ln in stmt.split("\n")
+        ):
+            statements.append(stmt)
+
+    return statements
+
+
 async def _run_migrate(database_url: str) -> None:
     """Apply all DDL files to the database. Idempotent (IF NOT EXISTS)."""
     from sqlalchemy.ext.asyncio import create_async_engine
@@ -80,12 +125,15 @@ async def _run_migrate(database_url: str) -> None:
                 sys.stderr.write(f"Warning: DDL file not found: {ddl_path}\n")
                 continue
             ddl_sql = ddl_path.read_text()
-            async with engine.begin() as conn:
-                # Execute each statement separately for Postgres compatibility.
-                # The DDL files use IF NOT EXISTS so this is idempotent.
-                from sqlalchemy import text
+            from sqlalchemy import text
 
-                await conn.execute(text(ddl_sql))
+            # asyncpg cannot execute multiple statements in a single
+            # prepared statement. Split on semicolons, but preserve
+            # PL/pgSQL function bodies (delimited by $$..$$).
+            statements = _split_sql_statements(ddl_sql)
+            async with engine.begin() as conn:
+                for stmt in statements:
+                    await conn.execute(text(stmt))
             sys.stdout.write(f"Applied: {ddl_path.name}\n")
     finally:
         await engine.dispose()

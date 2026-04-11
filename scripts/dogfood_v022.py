@@ -2,7 +2,7 @@
 
 Usage:
     GOVERNANCE_AUDIT_SECRET="qa-harness-deadbeef-cafe-1234-5678-9abc-def0-1234-5678-9abcdef01234" \
-    GOVERNANCE_DATABASE_URL="postgresql://governance:governance@localhost:5435/governance_qa" \
+    GOVERNANCE_DATABASE_URL="postgresql://user:pass@host/db" \
     .venv/bin/python scripts/dogfood_v022.py
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ AGENT_ID = "v022-engineer"
 async def main() -> None:
     db_url = os.environ.get(
         "GOVERNANCE_DATABASE_URL",
-        "postgresql://governance:governance@localhost:5435/governance_qa",
+        "",
     )
     if "GOVERNANCE_AUDIT_SECRET" not in os.environ:
         os.environ["GOVERNANCE_AUDIT_SECRET"] = (
