@@ -57,6 +57,9 @@ langchain = [
 openai = [
     "openai>=1.0",
 ]
+anthropic = [
+    "anthropic>=0.30",
+]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
@@ -66,6 +69,10 @@ dev = [
     "httpx>=0.27",
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
+]
+publish = [
+    "build",
+    "twine",
 ]
 
 [project.scripts]
@@ -82,6 +89,7 @@ include-package-data = true
 "codeatelier_governance.audit" = ["*.sql"]
 "codeatelier_governance.cost" = ["*.sql"]
 "codeatelier_governance.gates" = ["*.sql"]
+"codeatelier_governance.scope" = ["*.sql"]
 "codeatelier_governance.console" = ["*.sql"]
 "codeatelier_governance.loop" = ["*.sql"]
 "codeatelier_governance.presence" = ["*.sql"]

@@ -1,6 +1,8 @@
 """Code Atelier Governance SDK — Enforcement gates for AI agents."""
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
+from .contracts.errors import ContractViolation
+from .contracts.models import Contract, PostCondition, PreCondition
 from .loop.errors import LoopDetected
 from .loop.models import LoopPolicy
 from .presence.models import AgentStatus
@@ -14,9 +16,13 @@ except PackageNotFoundError:  # pragma: no cover
 
 __all__ = [
     "AgentStatus",
+    "Contract",
+    "ContractViolation",
     "GovernanceConfig",
     "GovernanceSDK",
     "LoopDetected",
     "LoopPolicy",
+    "PostCondition",
+    "PreCondition",
     "__version__",
 ]

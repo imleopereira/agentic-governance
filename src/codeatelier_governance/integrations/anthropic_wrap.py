@@ -1,0 +1,272 @@
+"""Anthropic SDK wrapper that patches a client to emit governance events.
+
+Usage::
+
+    import anthropic
+    from codeatelier_governance import GovernanceSDK
+    from codeatelier_governance.integrations.anthropic_wrap import wrap_anthropic
+
+    sdk = GovernanceSDK(database_url="postgresql://...")
+    client = wrap_anthropic(anthropic.Anthropic(), sdk=sdk, agent_id="my-agent")
+    # client.messages.create() now emits audit events + tracks cost
+
+The wrapper monkey-patches the client in-place and returns it so existing
+references keep working.
+
+Observation surfaces (audit.log, cost.track) never raise. The enforcement
+surface (cost.check_or_raise) DOES raise BudgetExceeded by contract.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+from typing import Any
+from uuid import uuid4
+
+import structlog
+
+from codeatelier_governance.audit.models import AuditEvent
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from codeatelier_governance.sdk import GovernanceSDK
+
+logger = structlog.get_logger(__name__)
+
+
+def _extract_token_usage(response: Any) -> dict[str, int]:
+    """Extract token usage from an Anthropic response object.
+
+    Anthropic responses expose ``response.usage.input_tokens`` and
+    ``response.usage.output_tokens``. There is no ``total_tokens``
+    field -- we compute it as the sum.
+    """
+    usage: dict[str, int] = {}
+    if hasattr(response, "usage") and response.usage is not None:
+        u = response.usage
+        if hasattr(u, "input_tokens"):
+            usage["input_tokens"] = int(u.input_tokens)
+        if hasattr(u, "output_tokens"):
+            usage["output_tokens"] = int(u.output_tokens)
+        if "input_tokens" in usage and "output_tokens" in usage:
+            usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    return usage
+
+
+def _estimate_usd(model: str, usage: dict[str, int]) -> float:
+    """Estimate USD cost using the built-in pricing table.
+
+    Returns 0.0 if the model is unknown or usage is empty.
+    """
+    from codeatelier_governance.cost.pricing import estimate_cost
+
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    return estimate_cost(model, input_tokens, output_tokens)
+
+
+def _has_running_loop() -> bool:
+    """Check if there is a running event loop."""
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+async def _safe_audit_log(sdk: GovernanceSDK, agent_id: str, kind: str, metadata: dict[str, Any]) -> None:
+    """Audit log that swallows all errors (observation surface)."""
+    try:
+        await sdk.audit.log(
+            AuditEvent(agent_id=agent_id, kind=kind, metadata=metadata)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "governance.anthropic_wrap.audit_log_failed",
+            kind=kind,
+            error_type=type(exc).__name__,
+        )
+
+
+async def _safe_cost_track(sdk: GovernanceSDK, agent_id: str, tokens: int, usd: float) -> None:
+    """Track cost, swallowing all errors (observation surface)."""
+    try:
+        session_id = uuid4()
+        await sdk.cost.track(agent_id, session_id, tokens=tokens, usd=usd)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "governance.anthropic_wrap.cost_track_failed",
+            error_type=type(exc).__name__,
+        )
+
+
+def _wrap_sync_create(
+    original: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Wrap a sync messages.create method.
+
+    If called from within an existing async event loop (e.g. from a test
+    or a framework that nests sync in async), the wrapper returns a
+    coroutine instead so callers can await it. When there is no running
+    loop, it uses ``asyncio.run`` for each governance call.
+    """
+
+    async def _async_impl(*args: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model", "unknown")
+
+        session_id = uuid4()
+        await sdk.cost.check_or_raise(agent_id, session_id)
+
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+
+        try:
+            response = original(*args, **kwargs)
+        except Exception as exc:
+            await _safe_audit_log(
+                sdk, agent_id, "llm.error",
+                {"model": model, "error_type": type(exc).__name__},
+            )
+            raise
+
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        resp_model = getattr(response, "model", model)
+        usd = _estimate_usd(str(resp_model), usage)
+
+        await _safe_audit_log(
+            sdk, agent_id, "llm.result",
+            {"model": resp_model, "token_usage": usage},
+        )
+        if total_tokens > 0:
+            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+
+        return response
+
+    @functools.wraps(original)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _has_running_loop():
+            # Inside an event loop: return a coroutine for the caller to await.
+            return _async_impl(*args, **kwargs)
+
+        model = kwargs.get("model", "unknown")
+
+        session_id = uuid4()
+        asyncio.run(sdk.cost.check_or_raise(agent_id, session_id))
+
+        asyncio.run(_safe_audit_log(sdk, agent_id, "llm.call", {"model": model}))
+
+        try:
+            response = original(*args, **kwargs)
+        except Exception as exc:
+            asyncio.run(
+                _safe_audit_log(
+                    sdk, agent_id, "llm.error",
+                    {"model": model, "error_type": type(exc).__name__},
+                )
+            )
+            raise
+
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        resp_model = getattr(response, "model", model)
+        usd = _estimate_usd(str(resp_model), usage)
+
+        asyncio.run(
+            _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": resp_model, "token_usage": usage},
+            )
+        )
+        if total_tokens > 0:
+            asyncio.run(_safe_cost_track(sdk, agent_id, total_tokens, usd))
+
+        return response
+
+    return wrapper
+
+
+def _wrap_async_create(
+    original: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Wrap an async messages.create method."""
+
+    @functools.wraps(original)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        model = kwargs.get("model", "unknown")
+
+        # Enforcement: check budget BEFORE the call.
+        session_id = uuid4()
+        await sdk.cost.check_or_raise(agent_id, session_id)
+
+        # Observation: audit log pre-call.
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+
+        try:
+            response = await original(*args, **kwargs)
+        except Exception as exc:
+            await _safe_audit_log(
+                sdk, agent_id, "llm.error",
+                {"model": model, "error_type": type(exc).__name__},
+            )
+            raise
+
+        # Observation: audit log + cost track post-call.
+        usage = _extract_token_usage(response)
+        total_tokens = usage.get("total_tokens", 0)
+        resp_model = getattr(response, "model", model)
+        usd = _estimate_usd(str(resp_model), usage)
+
+        await _safe_audit_log(
+            sdk, agent_id, "llm.result",
+            {"model": resp_model, "token_usage": usage},
+        )
+        if total_tokens > 0:
+            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+
+        return response
+
+    return wrapper
+
+
+def wrap_anthropic(
+    client: Any,
+    sdk: GovernanceSDK,
+    agent_id: str,
+) -> Any:
+    """Patch an Anthropic client to emit governance audit events.
+
+    Supports both ``anthropic.Anthropic`` (sync) and ``anthropic.AsyncAnthropic``
+    (async). The client is monkey-patched in-place and returned so existing
+    references continue to work.
+
+    Args:
+        client: An ``anthropic.Anthropic`` or ``anthropic.AsyncAnthropic`` instance.
+        sdk: The initialized GovernanceSDK instance.
+        agent_id: The agent identifier for audit and cost tracking.
+
+    Returns:
+        The same client object, patched in-place.
+    """
+    if getattr(client, "_governance_wrapped", False):
+        logger.warning(
+            "governance.anthropic_wrap.already_wrapped",
+            agent_id=agent_id,
+        )
+        return client
+
+    messages = client.messages
+
+    is_async = asyncio.iscoroutinefunction(getattr(messages, "create", None))
+
+    if is_async:
+        messages.create = _wrap_async_create(messages.create, sdk, agent_id)
+    else:
+        messages.create = _wrap_sync_create(messages.create, sdk, agent_id)
+
+    client._governance_wrapped = True
+    return client

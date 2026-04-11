@@ -336,6 +336,40 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Agent ID to inspect",
     )
 
+    # report
+    report_parser = subparsers.add_parser(
+        "report", help="Generate compliance reports from audit trail data"
+    )
+    report_parser.add_argument(
+        "--database-url", type=str, default=None,
+        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
+    )
+    report_parser.add_argument(
+        "--session-id", type=str, default=None,
+        help="UUID of a specific session to report on",
+    )
+    report_parser.add_argument(
+        "--agent-id", type=str, default=None,
+        help="Agent ID to filter by",
+    )
+    report_parser.add_argument(
+        "--from", type=str, default=None, dest="date_from",
+        help="Start date for report range (ISO 8601, e.g. 2026-04-01)",
+    )
+    report_parser.add_argument(
+        "--to", type=str, default=None, dest="date_to",
+        help="End date for report range (ISO 8601, e.g. 2026-04-10)",
+    )
+    report_parser.add_argument(
+        "--format", type=str, default="article12",
+        choices=["article12", "summary"], dest="report_format",
+        help="Report format (default: article12)",
+    )
+    report_parser.add_argument(
+        "--output", type=str, default=None,
+        help="Output file path (default: stdout)",
+    )
+
     # console (user management subcommands)
     console_parser = subparsers.add_parser(
         "console", help="Console user management commands"
@@ -402,6 +436,72 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+async def _run_report(
+    database_url: str,
+    report_format: str,
+    session_id: str | None,
+    agent_id: str | None,
+    date_from_str: str | None,
+    date_to_str: str | None,
+    output_path: str | None,
+) -> None:
+    """Generate a compliance report and write JSON to output."""
+    from datetime import datetime as dt
+    from datetime import timezone
+
+    from codeatelier_governance.compliance.report import ReportGenerator
+
+    # Normalize URL for async
+    url = _normalize_url_sync(database_url)
+    generator = ReportGenerator(database_url=url)
+
+    # Parse dates
+    date_from: dt | None = None
+    date_to: dt | None = None
+    if date_from_str:
+        date_from = dt.fromisoformat(date_from_str)
+        if date_from.tzinfo is None:
+            date_from = date_from.replace(tzinfo=timezone.utc)
+    if date_to_str:
+        date_to = dt.fromisoformat(date_to_str)
+        if date_to.tzinfo is None:
+            date_to = date_to.replace(tzinfo=timezone.utc)
+
+    # Parse session IDs
+    session_ids: list[UUID] | None = None
+    if session_id:
+        try:
+            session_ids = [UUID(session_id)]
+        except ValueError:
+            sys.stderr.write(f"Invalid session-id: {session_id}\n")
+            sys.exit(1)
+
+    if report_format == "summary":
+        if not agent_id:
+            sys.stderr.write("Error: --agent-id is required for summary format.\n")
+            sys.exit(2)
+        report = await generator.generate_summary(
+            agent_id=agent_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    else:
+        report = await generator.generate_article12(
+            session_ids=session_ids,
+            agent_id=agent_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+    report_json = report.model_dump_json(indent=2)
+
+    if output_path:
+        Path(output_path).write_text(report_json)
+        sys.stdout.write(f"Report written to {output_path}\n")
+    else:
+        sys.stdout.write(report_json + "\n")
 
 
 async def _run_console_add_user(
@@ -573,6 +673,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "budget":
         database_url = _resolve_database_url(args)
         asyncio.run(_run_budget(database_url, args.agent_id))
+
+    elif args.command == "report":
+        database_url = _resolve_database_url(args)
+        asyncio.run(
+            _run_report(
+                database_url=database_url,
+                report_format=getattr(args, "report_format", "article12"),
+                session_id=getattr(args, "session_id", None),
+                agent_id=getattr(args, "agent_id", None),
+                date_from_str=getattr(args, "date_from", None),
+                date_to_str=getattr(args, "date_to", None),
+                output_path=getattr(args, "output", None),
+            )
+        )
 
     elif args.command == "console":
         console_cmd = getattr(args, "console_command", None)

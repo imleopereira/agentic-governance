@@ -24,6 +24,7 @@ import structlog
 from .audit.jsonl_store import JsonlFallbackStore
 from .audit.module import AuditModule
 from .audit.store import AuditStore, BatchingWriter, InMemoryAuditStore
+from .contracts.module import ContractsModule
 from .cost.module import CostModule
 from .gates.module import GatesModule
 from .loop.module import LoopModule
@@ -137,6 +138,9 @@ class GovernanceSDK:
             database_url=database_url,
         )
         self.presence = PresenceModule(database_url=database_url)
+        self.contracts = ContractsModule(
+            self.audit, self.scope, self.cost, gates=self.gates,
+        )
 
     # ------------------------------------------------------------------
     # Audit secret resolution

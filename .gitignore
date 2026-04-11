@@ -39,3 +39,10 @@ qa/
 console/node_modules/
 console/.next/
 console/out/
+console/.env.local
+console/package-lock.json
+
+# Local automation (cron scripts, logs)
+scripts/automation/logs/
+scripts/automation/*.sh
+scripts/automation/install-cron.sh
