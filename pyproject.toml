@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codeatelier-governance"
+name = "code-atelier-governance"
 version = "0.4.0"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
