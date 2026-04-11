@@ -9,8 +9,13 @@ permissions:
   id-token: write
 
 jobs:
+  test:
+    name: Run tests before publish
+    uses: ./.github/workflows/test.yml
+
   publish:
     name: Build and publish to PyPI
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,4 +29,4 @@ jobs:
       - name: Build wheel and sdist
         run: python -m build
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@6733eb7d741f0b11ec6a39b58540dab7590f9b7d # v1.14.0

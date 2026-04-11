@@ -5,6 +5,7 @@ on:
     branches: [production]
   pull_request:
     branches: [production]
+  workflow_call:
 
 jobs:
   unit:
@@ -72,6 +73,8 @@ jobs:
             -f src/codeatelier_governance/loop/ddl.sql
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
             -f src/codeatelier_governance/presence/ddl.sql
+          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
+            -f src/codeatelier_governance/scope/ddl.sql
       - name: integration tests
         run: python -m pytest tests/ -q -m integration
 
@@ -97,7 +100,7 @@ jobs:
           mkdir -p /tmp/smoke && cd /tmp/smoke
           ${{ github.workspace }}/test-venv/bin/python -c "
           import codeatelier_governance, importlib.resources as res
-          assert codeatelier_governance.__version__ == '0.3.0'
+          assert codeatelier_governance.__version__ == '0.4.0'
           assert (res.files('codeatelier_governance.audit') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.cost') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.gates') / 'ddl.sql').is_file()
