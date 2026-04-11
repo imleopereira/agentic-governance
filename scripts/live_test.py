@@ -114,9 +114,9 @@ async def run_all_tests() -> None:
         ))
         log_result("Second event chained", not r2.is_placeholder)
 
-        # Verify chain
+        # Verify chain — trace_session_chain returns a list and raises ChainIntegrityError on tampering
         chain = await sdk.audit.trace_session_chain(session_id)
-        log_result("HMAC chain verified", chain.verified, f"{chain.event_count} events, verified={chain.verified}")
+        log_result("HMAC chain verified", len(chain) >= 2, f"{len(chain)} events verified (no ChainIntegrityError raised)")
     except Exception as e:
         log_result("Audit trail", False, str(e))
 

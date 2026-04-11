@@ -108,7 +108,12 @@ class GovernanceSDK:
         self._hot_reload_task: asyncio.Task[None] | None = None
         self._last_policy_updated_at: datetime | None = None
 
-        resolved_secret = audit_secret or self._resolve_audit_secret()
+        resolved_secret_str = audit_secret or self._resolve_audit_secret()
+        resolved_secret = (
+            resolved_secret_str.encode("utf-8")
+            if isinstance(resolved_secret_str, str)
+            else resolved_secret_str
+        )
 
         store = self._build_audit_store(database_url)
         # Durable fallback: when the primary is down, audit events spill to

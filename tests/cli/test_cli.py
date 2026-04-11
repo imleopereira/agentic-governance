@@ -155,6 +155,8 @@ async def test_budget_shows_data(capsys: pytest.CaptureFixture[str]) -> None:
     """Budget command should output JSON with agent_id."""
     url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
     await _run_migrate(url)
+    # Clear migrate output before capturing budget output
+    capsys.readouterr()
     await _run_budget(url, "nonexistent-agent")
 
     captured = capsys.readouterr()

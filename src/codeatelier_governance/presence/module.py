@@ -101,10 +101,10 @@ class PresenceModule:
                     text(
                         "INSERT INTO governance_agent_presence "
                         "(agent_id, status, last_heartbeat, started_at, metadata_json) "
-                        "VALUES (:agent_id, 'live', NOW(), NOW(), :meta::jsonb) "
+                        "VALUES (:agent_id, 'live', NOW(), NOW(), CAST(:meta AS jsonb)) "
                         "ON CONFLICT (agent_id) DO UPDATE SET "
                         "status = 'live', last_heartbeat = NOW(), "
-                        "metadata_json = :meta::jsonb"
+                        "metadata_json = CAST(:meta AS jsonb)"
                     ),
                     {"agent_id": agent_id, "meta": meta_json},
                 )
