@@ -90,7 +90,7 @@ def test_database_url_missing_exits(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_migrate_idempotent() -> None:
     """Running migrate twice should succeed (IF NOT EXISTS in DDL)."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", "postgresql://postgres:postgres@localhost:5435/postgres")
+    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
     await _run_migrate(url)
     await _run_migrate(url)  # Should not raise
 
@@ -102,7 +102,7 @@ async def test_migrate_idempotent() -> None:
 @pytest.mark.asyncio
 async def test_verify_clean_session() -> None:
     """Verify should exit 0 for a valid HMAC chain."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", "postgresql://postgres:postgres@localhost:5435/postgres")
+    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
     secret_hex = secrets.token_hex(32)
 
     # First, migrate
@@ -135,7 +135,7 @@ async def test_verify_clean_session() -> None:
 @pytest.mark.asyncio
 async def test_verify_empty_session() -> None:
     """Verify should exit 1 for a session with no events."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", "postgresql://postgres:postgres@localhost:5435/postgres")
+    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
     secret_hex = secrets.token_hex(32)
     os.environ["GOVERNANCE_AUDIT_SECRET"] = secret_hex
 
@@ -153,7 +153,7 @@ async def test_verify_empty_session() -> None:
 @pytest.mark.asyncio
 async def test_budget_shows_data(capsys: pytest.CaptureFixture[str]) -> None:
     """Budget command should output JSON with agent_id."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", "postgresql://postgres:postgres@localhost:5435/postgres")
+    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
     await _run_migrate(url)
     await _run_budget(url, "nonexistent-agent")
 
