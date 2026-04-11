@@ -423,9 +423,11 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                 prompt_tokens = int(token_usage.get("prompt_tokens", 0))
                 completion_tokens = int(token_usage.get("completion_tokens", 0))
                 usd = estimate_cost(self._last_model, prompt_tokens, completion_tokens)
-            await self._audit_log("llm.result", {"token_usage": token_usage})
+            # Run audit log + cost track concurrently (both are observation surfaces)
+            coros: list[Any] = [self._audit_log("llm.result", {"token_usage": token_usage})]
             if total_tokens > 0:
-                await self._cost_track(total_tokens, usd)
+                coros.append(self._cost_track(total_tokens, usd))
+            await asyncio.gather(*coros)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.aon_llm_end_failed",

@@ -30,6 +30,7 @@ from .gates.module import GatesModule
 from .loop.module import LoopModule
 from .presence.module import PresenceModule
 from .scope.module import ScopeModule
+from .utils import normalize_db_url
 
 logger = structlog.get_logger(__name__)
 
@@ -115,7 +116,21 @@ class GovernanceSDK:
             else resolved_secret_str
         )
 
-        store = self._build_audit_store(database_url)
+        # Create ONE shared AsyncEngine for all modules when using Postgres.
+        # This drops max connections from ~74 to ~15 per SDK instance.
+        self._shared_engine: Any = None
+        if database_url is not None:
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            self._shared_engine = create_async_engine(
+                normalize_db_url(database_url, component="sdk"),
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+                connect_args={"command_timeout": 5},
+            )
+
+        store = self._build_audit_store(database_url, self._shared_engine)
         # Durable fallback: when the primary is down, audit events spill to
         # this on-disk JSONL so they survive process restarts and crashes.
         fallback = JsonlFallbackStore(fallback_path or DEFAULT_FALLBACK_PATH)
@@ -124,14 +139,17 @@ class GovernanceSDK:
 
         # All enforcement modules share the audit substrate; the gates module
         # reuses the same secret for HMAC-signed approval tokens.
-        cost_store = self._build_cost_store(database_url)
-        gates_store = self._build_gates_store(database_url)
-        self.scope = ScopeModule(self.audit, database_url=database_url)
+        cost_store = self._build_cost_store(database_url, self._shared_engine)
+        gates_store = self._build_gates_store(database_url, self._shared_engine)
+        self.scope = ScopeModule(
+            self.audit, database_url=database_url, engine=self._shared_engine,
+        )
         self.cost = CostModule(
             self.audit,
             store=cost_store,
             fail_open=cost_fail_open,
             database_url=database_url,
+            engine=self._shared_engine,
         )
         self.gates = GatesModule(
             self.audit, secret=resolved_secret, store=gates_store
@@ -141,8 +159,11 @@ class GovernanceSDK:
             self.audit,
             policies=loop_policies,
             database_url=database_url,
+            engine=self._shared_engine,
         )
-        self.presence = PresenceModule(database_url=database_url)
+        self.presence = PresenceModule(
+            database_url=database_url, engine=self._shared_engine,
+        )
         self.contracts = ContractsModule(
             self.audit, self.scope, self.cost, gates=self.gates,
         )
@@ -177,33 +198,45 @@ class GovernanceSDK:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_audit_store(database_url: str | None) -> AuditStore:
+    def _build_audit_store(
+        database_url: str | None, engine: Any = None,
+    ) -> AuditStore:
         if database_url is None:
             return InMemoryAuditStore()
         # Local import keeps sqlalchemy/asyncpg out of the import path when
         # callers run in pure in-memory mode (e.g. unit tests).
         from .audit.postgres_store import PostgresAuditStore
 
+        if engine is not None:
+            return PostgresAuditStore(engine=engine)
         return PostgresAuditStore(database_url)
 
     @staticmethod
-    def _build_cost_store(database_url: str | None):  # type: ignore[no-untyped-def]
+    def _build_cost_store(
+        database_url: str | None, engine: Any = None,
+    ) -> Any:
         from .cost.store import InMemoryCostStore
 
         if database_url is None:
             return InMemoryCostStore()
         from .cost.postgres_store import PostgresCostStore
 
+        if engine is not None:
+            return PostgresCostStore(engine=engine)
         return PostgresCostStore(database_url)
 
     @staticmethod
-    def _build_gates_store(database_url: str | None):  # type: ignore[no-untyped-def]
+    def _build_gates_store(
+        database_url: str | None, engine: Any = None,
+    ) -> Any:
         from .gates.store import InMemoryGatesStore
 
         if database_url is None:
             return InMemoryGatesStore()
         from .gates.postgres_store import PostgresGatesStore
 
+        if engine is not None:
+            return PostgresGatesStore(engine=engine)
         return PostgresGatesStore(database_url)
 
     # ------------------------------------------------------------------
@@ -244,59 +277,54 @@ class GovernanceSDK:
                 )
 
     async def _poll_policies(self) -> None:
-        """Read governance_policies and atomically replace in-memory dicts."""
-        if self.config.database_url is None:
+        """Read governance_policies and atomically replace in-memory dicts.
+
+        Reuses the shared engine instead of creating/disposing a new engine
+        on every 30-second poll cycle.
+        """
+        if self._shared_engine is None:
             return
 
         from sqlalchemy import text
-        from sqlalchemy.ext.asyncio import create_async_engine
 
-        url = self.config.database_url
-        if url.startswith("postgresql://"):
-            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
-
-        engine = create_async_engine(url, pool_pre_ping=True, pool_size=1, max_overflow=0)
-        try:
-            async with engine.connect() as conn:
-                res = await conn.execute(
-                    text("SELECT MAX(updated_at) FROM governance_policies")
-                )
-                row = res.first()
-                max_updated: datetime | None = row[0] if row else None
-
-            if max_updated is None:
-                return
-            if max_updated.tzinfo is None:
-                max_updated = max_updated.replace(tzinfo=timezone.utc)
-
-            if (
-                self._last_policy_updated_at is not None
-                and max_updated <= self._last_policy_updated_at
-            ):
-                return  # No changes since last poll
-
-            # Policies changed — reload and atomically replace
-            from .cost.models import BudgetPolicy as _BudgetPolicy
-            from .scope.models import ScopePolicy as _ScopePolicy
-
-            scope_policies = await self.scope.get_stored_policies()
-            cost_policies = await self.cost.get_stored_policies()
-
-            new_scope: dict[str, _ScopePolicy] = {p.agent_id: p for p in scope_policies}
-            new_cost: dict[str, _BudgetPolicy] = {p.agent_id: p for p in cost_policies}
-
-            # Dict assignment is atomic under the GIL
-            self.scope._policies = new_scope
-            self.cost._policies = new_cost
-            self._last_policy_updated_at = max_updated
-
-            logger.info(
-                "hot_reload.policies_reloaded",
-                scope_count=len(new_scope),
-                cost_count=len(new_cost),
+        async with self._shared_engine.connect() as conn:
+            res = await conn.execute(
+                text("SELECT MAX(updated_at) FROM governance_policies")
             )
-        finally:
-            await engine.dispose()
+            row = res.first()
+            max_updated: datetime | None = row[0] if row else None
+
+        if max_updated is None:
+            return
+        if max_updated.tzinfo is None:
+            max_updated = max_updated.replace(tzinfo=timezone.utc)
+
+        if (
+            self._last_policy_updated_at is not None
+            and max_updated <= self._last_policy_updated_at
+        ):
+            return  # No changes since last poll
+
+        # Policies changed — reload and atomically replace
+        from .cost.models import BudgetPolicy as _BudgetPolicy
+        from .scope.models import ScopePolicy as _ScopePolicy
+
+        scope_policies = await self.scope.get_stored_policies()
+        cost_policies = await self.cost.get_stored_policies()
+
+        new_scope: dict[str, _ScopePolicy] = {p.agent_id: p for p in scope_policies}
+        new_cost: dict[str, _BudgetPolicy] = {p.agent_id: p for p in cost_policies}
+
+        # Dict assignment is atomic under the GIL
+        self.scope._policies = new_scope
+        self.cost._policies = new_cost
+        self._last_policy_updated_at = max_updated
+
+        logger.info(
+            "hot_reload.policies_reloaded",
+            scope_count=len(new_scope),
+            cost_count=len(new_cost),
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -322,6 +350,11 @@ class GovernanceSDK:
             await self.audit.close()
         await self.loop.close()
         await self.presence.close()
+        # Dispose the shared engine last, after all modules have released
+        # their references to it.
+        if self._shared_engine is not None:
+            await self._shared_engine.dispose()
+            self._shared_engine = None
 
     async def __aenter__(self) -> "GovernanceSDK":
         await self.start()

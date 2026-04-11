@@ -132,11 +132,15 @@ def _wrap_sync_create(
 
         await sdk.cost.check_or_raise(agent_id, session_id)
 
-        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
+        # Background the pre-call audit (observation-only, not enforcement)
+        pre_audit_task = asyncio.create_task(
+            _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
+        )
 
         try:
             response = original(*args, **kwargs)
         except Exception as exc:
+            await pre_audit_task
             await _safe_audit_log(
                 sdk, agent_id, "llm.error",
                 {"model": model, "error_type": type(exc).__name__},
@@ -144,18 +148,26 @@ def _wrap_sync_create(
             )
             raise
 
+        await pre_audit_task
+
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
         resp_model = getattr(response, "model", model)
         usd = _estimate_usd(str(resp_model), usage)
 
-        await _safe_audit_log(
-            sdk, agent_id, "llm.result",
-            {"model": resp_model, "token_usage": usage},
-            model=str(resp_model), session_id=session_id,
-        )
+        # Run post-call audit + cost track concurrently
+        post_coros: list[Any] = [
+            _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": resp_model, "token_usage": usage},
+                model=str(resp_model), session_id=session_id,
+            ),
+        ]
         if total_tokens > 0:
-            await _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
+            post_coros.append(
+                _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
+            )
+        await asyncio.gather(*post_coros)
 
         return response
 
@@ -215,15 +227,22 @@ def _wrap_async_create(
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
 
-        # Enforcement: check budget BEFORE the call.
+        # Enforcement: check budget BEFORE the call (must stay on critical path).
         await sdk.cost.check_or_raise(agent_id, session_id)
 
-        # Observation: audit log pre-call.
-        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
+        # Observation: audit log pre-call — backgrounded because it is
+        # observation-only, not an enforcement gate.  We hold a reference
+        # to the task to avoid silent failures (no fire-and-forget).
+        pre_audit_task = asyncio.create_task(
+            _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
+        )
 
         try:
             response = await original(*args, **kwargs)
         except Exception as exc:
+            # Await the pre-call audit before propagating the error so it
+            # completes before we log the error event.
+            await pre_audit_task
             await _safe_audit_log(
                 sdk, agent_id, "llm.error",
                 {"model": model, "error_type": type(exc).__name__},
@@ -231,19 +250,30 @@ def _wrap_async_create(
             )
             raise
 
-        # Observation: audit log + cost track post-call.
+        # Ensure pre-call audit completed before post-call work
+        await pre_audit_task
+
+        # Observation: audit log + cost track post-call — run concurrently.
+        # cost.track must complete before the next check_or_raise to avoid
+        # budget race conditions, but it CAN run concurrently with the
+        # post-call audit log.
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
         resp_model = getattr(response, "model", model)
         usd = _estimate_usd(str(resp_model), usage)
 
-        await _safe_audit_log(
-            sdk, agent_id, "llm.result",
-            {"model": resp_model, "token_usage": usage},
-            model=str(resp_model), session_id=session_id,
-        )
+        post_coros: list[Any] = [
+            _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": resp_model, "token_usage": usage},
+                model=str(resp_model), session_id=session_id,
+            ),
+        ]
         if total_tokens > 0:
-            await _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
+            post_coros.append(
+                _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
+            )
+        await asyncio.gather(*post_coros)
 
         return response
 

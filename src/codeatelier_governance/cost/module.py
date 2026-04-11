@@ -54,18 +54,20 @@ class CostModule:
         *,
         fail_open: bool = False,
         database_url: str | None = None,
+        engine: Any = None,
     ) -> None:
         self._audit = audit
         self._store: CostStore = store or InMemoryCostStore()
         self._fail_open = fail_open
         self._policies: dict[str, BudgetPolicy] = {}
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -80,6 +82,7 @@ class CostModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     def register(self, policy: BudgetPolicy) -> None:
@@ -132,9 +135,9 @@ class CostModule:
             await conn.execute(
                 text(
                     "INSERT INTO governance_policies (agent_id, policy_type, policy_json, updated_at) "
-                    "VALUES (:agent_id, :policy_type, :policy_json::jsonb, NOW()) "
+                    "VALUES (:agent_id, :policy_type, CAST(:policy_json AS jsonb), NOW()) "
                     "ON CONFLICT (agent_id, policy_type) "
-                    "DO UPDATE SET policy_json = :policy_json::jsonb, updated_at = NOW()"
+                    "DO UPDATE SET policy_json = CAST(:policy_json AS jsonb), updated_at = NOW()"
                 ),
                 {
                     "agent_id": agent_id,
@@ -172,7 +175,11 @@ class CostModule:
         return self._policies.get(agent_id)
 
     async def close(self) -> None:
+        """Release resources. Disposes the engine only if this module owns it."""
         await self._store.close()
+        if self._owns_engine and self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
 
     async def track_usage(
         self,
@@ -280,10 +287,18 @@ class CostModule:
         if policy is None:
             return
         try:
-            s_usd, s_tok = await self._store.get_session_usage(
-                agent_id, session_id
-            )
-            d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
+            # Use the combined query when available (PostgresCostStore)
+            # to halve the pre-call enforcement latency (1 DB round-trip
+            # instead of 2).
+            if hasattr(self._store, "get_session_and_daily_usage"):
+                s_usd, s_tok, d_usd, d_tok = await self._store.get_session_and_daily_usage(
+                    agent_id, session_id
+                )
+            else:
+                s_usd, s_tok = await self._store.get_session_usage(
+                    agent_id, session_id
+                )
+                d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
         except Exception as exc:
             logger.critical(
                 "cost.check_failed_fail_closed",

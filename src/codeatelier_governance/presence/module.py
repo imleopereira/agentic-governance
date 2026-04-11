@@ -23,15 +23,21 @@ logger = structlog.get_logger(__name__)
 class PresenceModule:
     """Agent presence tracking — live/idle/unresponsive status."""
 
-    def __init__(self, *, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        database_url: str | None = None,
+        engine: Any = None,
+    ) -> None:
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         # In-memory fallback: {agent_id: {status, last_heartbeat, started_at, metadata}}
         self._agents: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -46,6 +52,7 @@ class PresenceModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     _MAX_AGENT_ID_LEN = 256
@@ -268,7 +275,7 @@ class PresenceModule:
             )
 
     async def close(self) -> None:
-        """Release resources."""
-        if self._engine is not None:
+        """Release resources. Disposes the engine only if this module owns it."""
+        if self._owns_engine and self._engine is not None:
             await self._engine.dispose()
             self._engine = None

@@ -30,13 +30,27 @@ from .store import CostStore
 class PostgresCostStore(CostStore):
     """SQLAlchemy/asyncpg-backed cost store."""
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(
-            normalize_db_url(database_url, component="cost store"),
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
-        )
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        engine: AsyncEngine | None = None,
+    ) -> None:
+        if engine is not None:
+            self._engine: AsyncEngine = engine
+            self._owns_engine = False
+        elif database_url is not None:
+            self._engine = create_async_engine(
+                normalize_db_url(database_url, component="cost store"),
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+            )
+            self._owns_engine = True
+        else:
+            raise ValueError(
+                "PostgresCostStore requires either database_url or engine"
+            )
 
     async def track(
         self,
@@ -198,5 +212,42 @@ class PostgresCostStore(CostStore):
             for row in rows
         }
 
+    async def get_session_and_daily_usage(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> tuple[float, int, float, int]:
+        """Return session and daily usage in a single DB round-trip.
+
+        Returns ``(session_usd, session_tokens, daily_usd, daily_tokens)``.
+        This combines ``get_session_usage`` and ``get_agent_daily_usage``
+        into one query to halve the pre-call enforcement latency.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(s.usd_used, 0) AS s_usd,
+                        COALESCE(s.tokens_used, 0) AS s_tok,
+                        COALESCE(d.usd_used, 0) AS d_usd,
+                        COALESCE(d.tokens_used, 0) AS d_tok
+                    FROM (SELECT 1) AS _dummy
+                    LEFT JOIN governance_cost_session_usage s
+                        ON s.agent_id = :agent_id AND s.session_id = :sid
+                    LEFT JOIN governance_cost_agent_daily d
+                        ON d.agent_id = :agent_id
+                        AND d.day_utc = (NOW() AT TIME ZONE 'UTC')::DATE
+                    """
+                ),
+                {"agent_id": agent_id, "sid": str(session_id)},
+            )
+            row = res.first()
+        if row is None:
+            return (0.0, 0, 0.0, 0)
+        return (float(row[0]), int(row[1]), float(row[2]), int(row[3]))
+
     async def close(self) -> None:
-        await self._engine.dispose()
+        """Dispose the engine only if this store owns it."""
+        if self._owns_engine:
+            await self._engine.dispose()

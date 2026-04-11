@@ -44,17 +44,18 @@ class ScopeModule:
         policies: list[ScopePolicy] | None = None,
         *,
         database_url: str | None = None,
+        engine: Any = None,
     ) -> None:
         self._audit = audit
         self._policies: dict[str, ScopePolicy] = {}
-        self._lock = asyncio.Lock()
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -69,6 +70,7 @@ class ScopeModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     def register(self, policy: ScopePolicy) -> None:
@@ -123,9 +125,9 @@ class ScopeModule:
             await conn.execute(
                 text(
                     "INSERT INTO governance_policies (agent_id, policy_type, policy_json, updated_at) "
-                    "VALUES (:agent_id, :policy_type, :policy_json::jsonb, NOW()) "
+                    "VALUES (:agent_id, :policy_type, CAST(:policy_json AS jsonb), NOW()) "
                     "ON CONFLICT (agent_id, policy_type) "
-                    "DO UPDATE SET policy_json = :policy_json::jsonb, updated_at = NOW()"
+                    "DO UPDATE SET policy_json = CAST(:policy_json AS jsonb), updated_at = NOW()"
                 ),
                 {
                     "agent_id": agent_id,
