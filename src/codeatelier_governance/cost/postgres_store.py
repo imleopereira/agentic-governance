@@ -22,18 +22,9 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from ..utils import normalize_db_url
 from .errors import CostError
 from .store import CostStore
-
-
-def _normalize_url(url: str) -> str:
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    raise ValueError(
-        "cost store: expected a postgresql:// connection string."
-    )
 
 
 class PostgresCostStore(CostStore):
@@ -41,7 +32,7 @@ class PostgresCostStore(CostStore):
 
     def __init__(self, database_url: str) -> None:
         self._engine: AsyncEngine = create_async_engine(
-            _normalize_url(database_url),
+            normalize_db_url(database_url, component="cost store"),
             pool_pre_ping=True,
             pool_size=5,
             max_overflow=10,

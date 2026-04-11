@@ -109,11 +109,12 @@ class CostModule:
                 asyncio.run(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "cost.persist_policy_failed",
                 agent_id=agent_id,
                 policy_type=policy_type,
+                exc_type=type(exc).__name__,
             )
 
     @staticmethod
@@ -314,7 +315,8 @@ class CostModule:
                 f"cost store unreachable; failing closed for safety. "
                 f"agent_id={agent_id!r}, error={type(exc).__name__}. "
                 f"Set fail_open=True at SDK init to allow the call instead "
-                f"(NOT recommended for production)."
+                f"(NOT recommended for production).",
+                recovery_hint="Check database connectivity. Set fail_open=True only for non-production.",
             )
 
         breach: tuple[str, float, float] | None = None
@@ -363,8 +365,10 @@ class CostModule:
                 )
             )
             raise BudgetExceeded(
-                f"budget exceeded: {cap_name}={used} > limit={limit} "
-                f"for agent_id={agent_id!r}"
+                f"Budget exceeded: {cap_name} for agent {agent_id!r} "
+                f"({used:.4f} > {limit:.4f}).\n"
+                f"Fix: increase the cap via BudgetPolicy({cap_name}=...) or start a new session.",
+                recovery_hint=f"Increase {cap_name} in BudgetPolicy or create a new session.",
             )
 
         if policy.per_session_seconds is not None:
@@ -397,8 +401,10 @@ class CostModule:
                         )
                     )
                     raise BudgetExceeded(
-                        f"session time limit exceeded: "
-                        f"{elapsed}s > {policy.per_session_seconds}s limit"
+                        f"Session time limit exceeded for agent {agent_id!r}: "
+                        f"{elapsed}s > {policy.per_session_seconds}s.\n"
+                        f"Fix: increase per_session_seconds in BudgetPolicy or start a new session.",
+                        recovery_hint="Increase per_session_seconds or start a new session.",
                     )
 
     async def snapshot(

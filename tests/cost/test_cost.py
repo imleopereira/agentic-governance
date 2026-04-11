@@ -183,7 +183,7 @@ async def test_session_over_time_limit_raises(cost: CostModule) -> None:
     store = cost._store  # type: ignore[attr-defined]
     key = ("a", sid)
     store._session_started[key] = datetime.now(timezone.utc) - timedelta(seconds=15)
-    with pytest.raises(BudgetExceeded, match="session time limit exceeded"):
+    with pytest.raises(BudgetExceeded, match="(?i)session time limit exceeded"):
         await cost.check_or_raise("a", sid)
 
 

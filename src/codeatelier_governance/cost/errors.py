@@ -1,8 +1,10 @@
 """Cost / budget enforcement exceptions."""
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class CostError(Exception):
+
+class CostError(GovernanceError):
     """Base class for cost module errors."""
 
 

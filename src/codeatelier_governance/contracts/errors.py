@@ -1,8 +1,10 @@
 """Contract enforcement exceptions."""
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class ContractError(Exception):
+
+class ContractError(GovernanceError):
     """Base class for contract module errors."""
 
 

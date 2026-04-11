@@ -240,10 +240,11 @@ class ContractsModule:
                 return False
             # Fallback: no way to query without request_id — fail closed
             return False
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "contracts.hitl_check_failed",
                 agent_id=agent_id,
+                exc_type=type(exc).__name__,
             )
             return False
 
@@ -305,11 +306,12 @@ class ContractsModule:
                 if meta.get("tool") == tool:
                     return True
             return False
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "contracts.audit_logged_check_failed",
                 agent_id=agent_id,
                 session_id=str(session_id),
+                exc_type=type(exc).__name__,
             )
             return False
 
@@ -343,10 +345,11 @@ class ContractsModule:
         try:
             result = await fn(agent_id, session_id, tool)
             return bool(result)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "contracts.custom_check_failed",
                 callable_name=callable_name,
                 agent_id=agent_id,
+                exc_type=type(exc).__name__,
             )
             return False

@@ -21,12 +21,14 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (res.status === 401) {
-    // Session expired or invalid - clear stale token and let AuthProvider handle redirect
     localStorage.removeItem("governance_token");
-    throw new Error("Authentication required");
+    // Try to extract detail from JSON response
+    const detail401 = await res.json().then((j) => j.detail).catch(() => null);
+    throw new Error(detail401 || "Authentication required");
   }
   if (!res.ok) {
-    throw new Error(`API ${path}: ${res.status} ${res.statusText}`);
+    const detail = await res.json().then((j) => j.detail).catch(() => null);
+    throw new Error(detail || `API ${path}: ${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
@@ -47,8 +49,12 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `API ${path}: ${res.status} ${res.statusText}`);
+    // FastAPI returns {"detail": "..."} on errors — prefer that over raw status
+    const detail = await res.json().then((j) => j.detail).catch(() => null);
+    if (detail) {
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    throw new Error(`API ${path}: ${res.status} ${res.statusText}`);
   }
   return res.json() as Promise<T>;
 }
@@ -123,6 +129,8 @@ export interface GateResolved {
   resolution: string;
   created_at: string | null;
   resolved_at: string | null;
+  rationale?: string | null;
+  resolved_by?: string | null;
 }
 
 export interface PostureAgent {
@@ -187,8 +195,13 @@ export const api = {
     post<{ ok: boolean; request_id: string; resolution: string }>(
       `/api/gates/${requestId}/grant`
     ),
-  denyGate: (requestId: string) =>
+  /** Deny a gate with a required rationale (stored in audit trail). */
+  denyGate: (requestId: string, rationale?: string) =>
     post<{ ok: boolean; request_id: string; resolution: string }>(
-      `/api/gates/${requestId}/deny`
+      `/api/gates/${requestId}/deny`,
+      rationale ? { rationale } : undefined
     ),
+  /** Kill switch - sets agent status to killed. Admin only. */
+  killAgent: (agentId: string) =>
+    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/kill`),
 };

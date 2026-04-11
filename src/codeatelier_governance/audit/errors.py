@@ -4,8 +4,10 @@ Errors raised to callers must never include secrets, DB URLs, or internal paths.
 """
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class AuditError(Exception):
+
+class AuditError(GovernanceError):
     """Base class for all audit module errors."""
 
 

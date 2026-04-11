@@ -13,7 +13,7 @@ Security constraints:
       It is NEVER serialized to the frontend.
     * Field-level redaction of metadata is applied before serving.
     * CORS is restricted to the console's own origin.
-    * Session-based auth with httpOnly cookies (v0.2.2+).
+    * Session-based auth with httpOnly cookies (v0.4.0+).
 """
 from __future__ import annotations
 
@@ -115,13 +115,12 @@ audit_module: AuditModule | None = None
 def _normalize_url(url: str) -> str:
     if not url:
         raise ValueError(
-            "GOVERNANCE_DATABASE_URL env var is required for the console."
+            "Console startup failed: GOVERNANCE_DATABASE_URL env var is not set.\n"
+            "Expected: a postgresql:// connection string.\n"
+            "Fix: export GOVERNANCE_DATABASE_URL=postgresql://user:pass@host/db"
         )
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    raise ValueError("GOVERNANCE_DATABASE_URL must be a postgresql:// URL.")
+    from ..utils import normalize_db_url
+    return normalize_db_url(url, component="console")
 
 
 def _redact_metadata(meta: dict[str, Any] | list[Any] | Any) -> Any:
@@ -195,7 +194,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Code Atelier Governance Console",
-    version="0.2.2",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -309,7 +308,7 @@ def require_role(role: str) -> Any:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "version": "0.2.2"}
+    return {"ok": True, "version": "0.4.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +327,8 @@ async def login(body: LoginRequest, request: Request) -> JSONResponse:
             headers={"Retry-After": str(int(retry_after))},
         )
     _record_login_attempt(client_ip)
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     # Opportunistic session cleanup
     async with engine.begin() as conn:
         await conn.execute(
@@ -351,7 +351,11 @@ async def login(body: LoginRequest, request: Request) -> JSONResponse:
     if row is None or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "Invalid username or password.")
     if row["disabled"]:
-        raise HTTPException(403, "Account is disabled.")
+        _logger.info(
+            "auth.login_disabled_account",
+            username_hash=hashlib.sha256(body.username.lower().encode()).hexdigest()[:16],
+        )
+        raise HTTPException(401, "Invalid username or password.")
     # Create session
     sid = create_session_id()
     expires = session_expires_at(SESSION_TTL_HOURS)
@@ -434,7 +438,8 @@ async def auth_me(request: Request) -> dict[str, Any]:
 )
 async def list_users() -> list[dict[str, Any]]:
     """List all console users (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -470,7 +475,8 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
         raise HTTPException(400, "Role must be 'viewer' or 'admin'.")
     if len(body.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     uid = uuid4()
     pw_hash = hash_password(body.password)
     now = datetime.now(timezone.utc)
@@ -491,9 +497,14 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
                 },
             )
     except Exception as exc:
-        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
-            raise HTTPException(409, f"Username '{body.username}' already exists.")
-        raise
+        from sqlalchemy.exc import IntegrityError
+        if isinstance(exc, IntegrityError):
+            raise HTTPException(409, f"Username '{body.username}' already exists.") from None
+        _logger.error(
+            "console.create_user_failed",
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(500, "Failed to create user. Check server logs.") from None
     return {"ok": True, "user_id": str(uid), "username": body.username.lower()}
 
 
@@ -503,7 +514,8 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
 )
 async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
     """Update a user's role or disabled status (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     updates: list[str] = []
     params: dict[str, Any] = {"uid": str(user_id), "now": datetime.now(timezone.utc)}
     if body.role is not None:
@@ -537,7 +549,8 @@ async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
 )
 async def revoke_session(session_id: UUID) -> dict[str, Any]:
     """Revoke a specific session (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.begin() as conn:
         res = await conn.execute(
             text(
@@ -556,7 +569,8 @@ async def list_agents(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """List agents by recent activity."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -590,7 +604,8 @@ async def list_events(
     offset: int = Query(0, ge=0),
 ) -> list[dict[str, Any]]:
     """Paginated audit event explorer with filters."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     # Build the query using parameterized WHERE — no f-string interpolation
     # of user values. Each filter is a fixed string with a named parameter.
     base = (
@@ -657,7 +672,8 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for chain verification.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -716,7 +732,8 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
 @app.get("/api/cost/agents", dependencies=[Depends(authenticate)])
 async def cost_agents() -> list[dict[str, Any]]:
     """Cost summary per agent for today."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -742,7 +759,8 @@ async def cost_sessions(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """Cost per session, ordered by spend."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     clauses: list[str] = []
     params: dict[str, Any] = {"limit": limit}
     if agent_id:
@@ -774,7 +792,8 @@ async def cost_sessions(
 @app.get("/api/gates/pending", dependencies=[Depends(authenticate)])
 async def gates_pending() -> list[dict[str, Any]]:
     """List all unresolved approval requests."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -807,7 +826,8 @@ async def gates_recent(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """Recent gate resolutions."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -845,7 +865,8 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -910,7 +931,8 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -968,7 +990,8 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
 @app.get("/api/policies", dependencies=[Depends(authenticate)])
 async def list_policies() -> list[dict[str, Any]]:
     """Return all policies from the governance_policies table."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -993,7 +1016,8 @@ async def list_policies() -> list[dict[str, Any]]:
 @app.get("/api/policies/{agent_id}", dependencies=[Depends(authenticate)])
 async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
     """Return scope + budget policies for a single agent."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -1024,7 +1048,8 @@ async def governance_posture() -> dict[str, Any]:
     Maps the four enforcement modules to a per-agent summary with
     pass/warn/fail status. One glance, one screenshot.
     """
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         # Agent activity
         agents_res = await conn.execute(
@@ -1118,9 +1143,12 @@ async def governance_posture() -> dict[str, Any]:
                 pj = r["policy_json"]
                 if isinstance(pj, dict):
                     budget_policies[r["agent_id"]] = pj
-        except Exception:
+        except Exception as exc:
             # Table may not exist yet; treat as no policies
-            pass
+            _logger.debug(
+                "console.budget_policies_query_skipped",
+                exc_type=type(exc).__name__,
+            )
 
     posture: list[dict[str, Any]] = []
     for agent_id, info in agents.items():
@@ -1187,7 +1215,8 @@ async def cost_model_breakdown(
     Returns rows from ``governance_cost_model_daily`` for the current UTC
     day. Filter by ``agent_id`` when provided; returns all agents otherwise.
     """
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     try:
         clauses: list[str] = ["day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"]
         params: dict[str, Any] = {}
@@ -1216,15 +1245,20 @@ async def cost_model_breakdown(
                 }
                 for row in res.mappings()
             ]
-    except Exception:
+    except Exception as exc:
         # Table may not exist yet if migration hasn't been run
+        _logger.debug(
+            "console.cost_model_breakdown_skipped",
+            exc_type=type(exc).__name__,
+        )
         return []
 
 
 @app.get("/api/agents/presence", dependencies=[Depends(authenticate)])
 async def agent_presence() -> list[dict[str, Any]]:
     """List all agents with their presence status."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     try:
         async with engine.connect() as conn:
             res = await conn.execute(
@@ -1248,6 +1282,10 @@ async def agent_presence() -> list[dict[str, Any]]:
                 }
                 for row in res.mappings()
             ]
-    except Exception:
+    except Exception as exc:
         # Table may not exist yet if migration hasn't been run
+        _logger.debug(
+            "console.agent_presence_skipped",
+            exc_type=type(exc).__name__,
+        )
         return []

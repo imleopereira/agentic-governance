@@ -100,11 +100,12 @@ class ScopeModule:
                 _asyncio.run(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "scope.persist_policy_failed",
                 agent_id=agent_id,
                 policy_type=policy_type,
+                exc_type=type(exc).__name__,
             )
 
     @staticmethod
@@ -197,23 +198,33 @@ class ScopeModule:
                 agent_id, tool, api, reason="no policy registered"
             )
             raise PolicyNotRegistered(
-                f"scope check failed: no policy registered for agent_id={agent_id!r}. "
-                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., allowed_tools=...)) "
-                f"at startup."
+                f"scope check failed: no policy registered for agent_id={agent_id!r}.\n"
+                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., allowed_tools=...)) at startup.",
+                recovery_hint="Register a ScopePolicy for this agent_id before calling check().",
             )
         if tool is not None and tool not in policy.allowed_tools:
             await self._log_violation(
                 agent_id, tool, api, reason="tool not whitelisted"
             )
+            allowed_preview = sorted(policy.allowed_tools)[:10]
+            suffix = f" ... and {len(policy.allowed_tools) - 10} more" if len(policy.allowed_tools) > 10 else ""
             raise ScopeViolation(
-                f"scope violation: tool={tool!r} is not in scope for agent={agent_id!r}"
+                f"Scope violation: tool {tool!r} is not allowed for agent {agent_id!r}.\n"
+                f"Allowed tools: [{', '.join(allowed_preview)}{suffix}]\n"
+                f"Fix: add {tool!r} to ScopePolicy.allowed_tools for this agent.",
+                recovery_hint=f"Add {tool!r} to ScopePolicy(allowed_tools=frozenset({{...}})) at startup.",
             )
         if api is not None and not _api_matches(api, policy.allowed_apis):
             await self._log_violation(
                 agent_id, tool, api, reason="api not whitelisted"
             )
+            allowed_preview = sorted(policy.allowed_apis)[:10]
+            suffix = f" ... and {len(policy.allowed_apis) - 10} more" if len(policy.allowed_apis) > 10 else ""
             raise ScopeViolation(
-                f"scope violation: api={api!r} is not in scope for agent={agent_id!r}"
+                f"Scope violation: api {api!r} is not allowed for agent {agent_id!r}.\n"
+                f"Allowed APIs: [{', '.join(allowed_preview)}{suffix}]\n"
+                f"Fix: add {api!r} to ScopePolicy.allowed_apis for this agent.",
+                recovery_hint=f"Add {api!r} to ScopePolicy(allowed_apis=frozenset({{...}})) at startup.",
             )
 
     async def _log_violation(
@@ -249,7 +260,8 @@ class ScopeModule:
             if not inspect.iscoroutinefunction(func):
                 raise TypeError(
                     f"@scope.require_tool requires an async function; "
-                    f"{func.__name__} is sync."
+                    f"{func.__name__} is sync. "
+                    f"Fix: convert to `async def {func.__name__}(...)`."
                 )
 
             @functools.wraps(func)

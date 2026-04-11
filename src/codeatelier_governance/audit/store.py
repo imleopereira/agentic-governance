@@ -258,7 +258,12 @@ class BatchingWriter:
         written directly to the fallback store rather than dropped.
         """
         if self._closed:
-            raise StoreUnavailableError("audit writer is closed")
+            raise StoreUnavailableError(
+                "audit.enqueue failed: the BatchingWriter has already been closed.\n"
+                "Expected: enqueue() called before close() or within an `async with sdk:` block.\n"
+                "Fix: ensure sdk.close() is only called once, after all events are logged.",
+                recovery_hint="Ensure sdk.close() or sdk.__aexit__ is only called once, after all events are logged.",
+            )
         async with self._lock:
             if len(self._buffer) >= self._buffer_max:
                 logger.warning(
@@ -290,7 +295,10 @@ class BatchingWriter:
             try:
                 await self._flush_once()
             except Exception as exc:  # never let the loop die
-                logger.error("audit.flush_loop_error", error=str(exc))
+                logger.error(
+                    "audit.flush_loop_error",
+                    error_type=type(exc).__name__,
+                )
 
     async def _flush_once(self) -> None:
         async with self._lock:

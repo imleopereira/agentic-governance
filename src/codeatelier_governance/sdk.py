@@ -94,7 +94,7 @@ class GovernanceSDK:
             raise ValueError(
                 "GovernanceSDK init failed: neither database_url nor api_key provided.\n"
                 "Expected: a postgresql:// connection string OR a Code Atelier API key.\n"
-                "Fix: GovernanceSDK(database_url='postgresql://user:pass@host/db')"
+                "Fix: GovernanceSDK(database_url=os.environ['GOVERNANCE_DATABASE_URL'])"
             )
         self.config = GovernanceConfig(
             database_url=database_url,
@@ -237,8 +237,11 @@ class GovernanceSDK:
                 await self._poll_policies()
             except asyncio.CancelledError:
                 return
-            except Exception:  # noqa: BLE001
-                logger.warning("hot_reload.poll_failed", exc_info=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "hot_reload.poll_failed",
+                    error_type=type(exc).__name__,
+                )
 
     async def _poll_policies(self) -> None:
         """Read governance_policies and atomically replace in-memory dicts."""

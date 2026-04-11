@@ -9,7 +9,7 @@ from .presence.models import AgentStatus
 from .sdk import GovernanceConfig, GovernanceSDK
 
 try:
-    __version__ = _pkg_version("codeatelier-governance")
+    __version__ = _pkg_version("code-atelier-governance")
 except PackageNotFoundError:  # pragma: no cover
     # Fallback for source-tree usage where the package isn't installed
     __version__ = "0.0.0+source"

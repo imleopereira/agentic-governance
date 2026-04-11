@@ -1,8 +1,10 @@
 """Loop detection exceptions."""
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class LoopError(Exception):
+
+class LoopError(GovernanceError):
     """Base class for loop module errors."""
 
 
