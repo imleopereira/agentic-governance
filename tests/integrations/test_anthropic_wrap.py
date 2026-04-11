@@ -257,3 +257,65 @@ async def test_wrap_async_client_error_audit(
 
     count = await store.count()
     assert count >= 2
+
+
+# -- Fix 1: Session ID stability -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_id_shared_across_calls(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Two consecutive calls through a wrapped client must share the same session_id."""
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+
+    wrapped = wrap_anthropic(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
+
+    await wrapped.messages.create(model="claude-sonnet-4-6")
+    await wrapped.messages.create(model="claude-sonnet-4-6")
+
+    all_events = list(store._events.values())
+    session_ids = {e.session_id for e in all_events}
+    # All events should share the same session_id
+    assert len(session_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_session_id_is_used(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """An explicit session_id passed to wrap_anthropic must be used."""
+    from uuid import uuid4 as _uuid4
+
+    explicit_sid = _uuid4()
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+
+    wrapped = wrap_anthropic(client, sdk=sdk, agent_id="test-agent", session_id=explicit_sid)  # type: ignore[arg-type]
+    assert getattr(wrapped, "_governance_session_id") == explicit_sid
+
+    await wrapped.messages.create(model="claude-sonnet-4-6")
+
+    all_events = list(store._events.values())
+    for event in all_events:
+        assert event.session_id == explicit_sid
+
+
+@pytest.mark.asyncio
+async def test_model_field_set_on_audit_events(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """AuditEvent.model should be set as a first-class field, not just in metadata."""
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+
+    wrap_anthropic(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
+    await client.messages.create(model="claude-sonnet-4-6")
+
+    all_events = list(store._events.values())
+    llm_events = [e for e in all_events if e.kind in ("llm.call", "llm.result")]
+    assert len(llm_events) >= 2
+    for event in llm_events:
+        assert event.model is not None
+        assert "claude" in event.model

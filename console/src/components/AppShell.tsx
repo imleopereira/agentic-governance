@@ -25,10 +25,10 @@ function AuthGate({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <>
+    <div className="animate-auth-resolve">
       <NavBar />
       <main className="max-w-7xl mx-auto px-6 py-8">{children}</main>
-    </>
+    </div>
   );
 }
 

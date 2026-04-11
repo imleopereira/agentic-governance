@@ -20,8 +20,16 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Governance Console — Code Atelier",
-  description: "Enforcement gates dashboard for AI agent governance",
+  title: "Governance Console - Code Atelier",
+  description:
+    "Enforcement gates dashboard for AI agent governance. Monitor scope, cost, audit trails, and human-in-the-loop approval gates in real time.",
+  metadataBase: new URL("https://codeatelier.tech"),
+  openGraph: {
+    title: "Governance Console - Code Atelier",
+    description:
+      "Enforcement gates dashboard for AI agent governance.",
+    type: "website",
+  },
 };
 
 export default function RootLayout({
@@ -31,7 +39,15 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
-      <body className="min-h-screen">
+      <head>
+        <meta name="theme-color" content="#0D0F14" />
+        <meta name="color-scheme" content="dark" />
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, viewport-fit=cover"
+        />
+      </head>
+      <body className="min-h-screen antialiased">
         <Providers>
           <WalkthroughProvider>
             <AppShell>{children}</AppShell>

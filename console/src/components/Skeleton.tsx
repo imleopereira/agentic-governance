@@ -5,7 +5,7 @@ export function Skeleton({ className = "" }: { className?: string }) {
     <div
       className={`animate-pulse ${className}`}
       style={{
-        background: "rgba(255, 255, 255, 0.04)",
+        background: "rgba(255, 255, 255, 0.03)",
         borderRadius: "var(--radius-sm)",
       }}
     />

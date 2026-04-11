@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import functools
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import structlog
 
@@ -70,11 +70,24 @@ def _has_running_loop() -> bool:
         return False
 
 
-async def _safe_audit_log(sdk: GovernanceSDK, agent_id: str, kind: str, metadata: dict[str, Any]) -> None:
+async def _safe_audit_log(
+    sdk: GovernanceSDK,
+    agent_id: str,
+    kind: str,
+    metadata: dict[str, Any],
+    model: str | None = None,
+    session_id: UUID | None = None,
+) -> None:
     """Audit log that swallows all errors (observation surface)."""
     try:
         await sdk.audit.log(
-            AuditEvent(agent_id=agent_id, kind=kind, metadata=metadata)
+            AuditEvent(
+                agent_id=agent_id,
+                kind=kind,
+                metadata=metadata,
+                model=model,
+                session_id=session_id,
+            )
         )
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -84,10 +97,9 @@ async def _safe_audit_log(sdk: GovernanceSDK, agent_id: str, kind: str, metadata
         )
 
 
-async def _safe_cost_track(sdk: GovernanceSDK, agent_id: str, tokens: int, usd: float) -> None:
+async def _safe_cost_track(sdk: GovernanceSDK, agent_id: str, session_id: UUID, tokens: int, usd: float) -> None:
     """Track cost, swallowing all errors (observation surface)."""
     try:
-        session_id = uuid4()
         await sdk.cost.track(agent_id, session_id, tokens=tokens, usd=usd)
     except Exception as exc:  # noqa: BLE001
         logger.error(
@@ -100,6 +112,7 @@ def _wrap_sync_create(
     original: Any,
     sdk: GovernanceSDK,
     agent_id: str,
+    session_id: UUID,
 ) -> Any:
     """Wrap a sync chat.completions.create method.
 
@@ -112,10 +125,9 @@ def _wrap_sync_create(
     async def _async_impl(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
 
-        session_id = uuid4()
         await sdk.cost.check_or_raise(agent_id, session_id)
 
-        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
 
         try:
             response = original(*args, **kwargs)
@@ -123,6 +135,7 @@ def _wrap_sync_create(
             await _safe_audit_log(
                 sdk, agent_id, "llm.error",
                 {"model": model, "error_type": type(exc).__name__},
+                model=str(model), session_id=session_id,
             )
             raise
 
@@ -133,9 +146,10 @@ def _wrap_sync_create(
         await _safe_audit_log(
             sdk, agent_id, "llm.result",
             {"model": model, "token_usage": usage},
+            model=str(model), session_id=session_id,
         )
         if total_tokens > 0:
-            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+            await _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
 
         return response
 
@@ -147,10 +161,9 @@ def _wrap_sync_create(
 
         model = kwargs.get("model", "unknown")
 
-        session_id = uuid4()
         asyncio.run(sdk.cost.check_or_raise(agent_id, session_id))
 
-        asyncio.run(_safe_audit_log(sdk, agent_id, "llm.call", {"model": model}))
+        asyncio.run(_safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id))
 
         try:
             response = original(*args, **kwargs)
@@ -159,6 +172,7 @@ def _wrap_sync_create(
                 _safe_audit_log(
                     sdk, agent_id, "llm.error",
                     {"model": model, "error_type": type(exc).__name__},
+                    model=str(model), session_id=session_id,
                 )
             )
             raise
@@ -171,10 +185,11 @@ def _wrap_sync_create(
             _safe_audit_log(
                 sdk, agent_id, "llm.result",
                 {"model": model, "token_usage": usage},
+                model=str(model), session_id=session_id,
             )
         )
         if total_tokens > 0:
-            asyncio.run(_safe_cost_track(sdk, agent_id, total_tokens, usd))
+            asyncio.run(_safe_cost_track(sdk, agent_id, session_id, total_tokens, usd))
 
         return response
 
@@ -185,6 +200,7 @@ def _wrap_async_create(
     original: Any,
     sdk: GovernanceSDK,
     agent_id: str,
+    session_id: UUID,
 ) -> Any:
     """Wrap an async chat.completions.create method."""
 
@@ -193,11 +209,10 @@ def _wrap_async_create(
         model = kwargs.get("model", "unknown")
 
         # Enforcement: check budget BEFORE the call.
-        session_id = uuid4()
         await sdk.cost.check_or_raise(agent_id, session_id)
 
         # Observation: audit log pre-call.
-        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model})
+        await _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
 
         try:
             response = await original(*args, **kwargs)
@@ -205,6 +220,7 @@ def _wrap_async_create(
             await _safe_audit_log(
                 sdk, agent_id, "llm.error",
                 {"model": model, "error_type": type(exc).__name__},
+                model=str(model), session_id=session_id,
             )
             raise
 
@@ -216,9 +232,10 @@ def _wrap_async_create(
         await _safe_audit_log(
             sdk, agent_id, "llm.result",
             {"model": model, "token_usage": usage},
+            model=str(model), session_id=session_id,
         )
         if total_tokens > 0:
-            await _safe_cost_track(sdk, agent_id, total_tokens, usd)
+            await _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
 
         return response
 
@@ -229,6 +246,7 @@ def wrap_openai(
     client: Any,
     sdk: GovernanceSDK,
     agent_id: str,
+    session_id: UUID | None = None,
 ) -> Any:
     """Patch an OpenAI client to emit governance audit events.
 
@@ -236,10 +254,16 @@ def wrap_openai(
     The client is monkey-patched in-place and returned so existing references
     continue to work.
 
+    A single ``session_id`` is shared across ALL calls made through this
+    wrapped client, ensuring per-session budget limits work correctly.
+    Pass an explicit ``session_id`` for deterministic control, or omit it
+    to generate one automatically.
+
     Args:
         client: An ``openai.OpenAI`` or ``openai.AsyncOpenAI`` instance.
         sdk: The initialized GovernanceSDK instance.
         agent_id: The agent identifier for audit and cost tracking.
+        session_id: Optional session UUID; auto-generated if not provided.
 
     Returns:
         The same client object, patched in-place.
@@ -251,14 +275,17 @@ def wrap_openai(
         )
         return client
 
+    sid = session_id if session_id is not None else uuid4()
+
     completions = client.chat.completions
 
     is_async = asyncio.iscoroutinefunction(getattr(completions, "create", None))
 
     if is_async:
-        completions.create = _wrap_async_create(completions.create, sdk, agent_id)
+        completions.create = _wrap_async_create(completions.create, sdk, agent_id, sid)
     else:
-        completions.create = _wrap_sync_create(completions.create, sdk, agent_id)
+        completions.create = _wrap_sync_create(completions.create, sdk, agent_id, sid)
 
     client._governance_wrapped = True
+    client._governance_session_id = sid
     return client

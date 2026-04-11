@@ -633,7 +633,7 @@ def _get_password_from_args_or_prompt(args: argparse.Namespace) -> str:
         sys.stderr.write("Error: password cannot be empty.\n")
         sys.exit(1)
     if len(pw) < 8:
-        sys.stderr.write("Warning: password is shorter than 12 characters.\n")
+        sys.stderr.write("Warning: password is shorter than 8 characters.\n")
     return pw
 
 

@@ -9,7 +9,7 @@ import { TimeAgo } from "@/components/TimeAgo";
 import { LiveBadge } from "@/components/LiveBadge";
 import { TableSkeleton } from "@/components/Skeleton";
 
-function VerifyButton({ sessionId }: { sessionId: string }) {
+function VerifyButton({ sessionId, prominent }: { sessionId: string; prominent?: boolean }) {
   const [result, setResult] = useState<VerifyResult | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -43,15 +43,72 @@ function VerifyButton({ sessionId }: { sessionId: string }) {
       onClick={verify}
       disabled={loading}
       data-tour="verify"
-      className="text-xs px-3 py-1.5 border transition-colors disabled:opacity-50"
+      className={`text-xs px-3 py-1.5 border transition-all disabled:opacity-50 ${
+        prominent ? "animate-verify-glow" : ""
+      }`}
       style={{
         borderColor: "var(--accent)",
-        color: "var(--accent)",
+        color: prominent ? "var(--fg)" : "var(--accent)",
+        background: prominent ? "rgba(130, 40, 245, 0.15)" : "transparent",
         borderRadius: "var(--radius-sm)",
+        boxShadow: prominent ? "var(--shadow-accent)" : "none",
       }}
     >
       {loading ? "Verifying..." : "Verify chain integrity"}
     </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Copyable session ID cell - monospace, truncated, click to copy
+// ---------------------------------------------------------------------------
+function SessionIdCell({
+  sessionId,
+  onFilter,
+}: {
+  sessionId: string;
+  onFilter: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  async function copy(ev: React.MouseEvent) {
+    ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(sessionId);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = sessionId;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1">
+      <button
+        onClick={(ev) => {
+          ev.stopPropagation();
+          onFilter();
+        }}
+        className="hover:underline font-mono text-xs truncate max-w-[7rem]"
+        style={{ color: "var(--accent)" }}
+        title={sessionId}
+      >
+        {sessionId.slice(0, 8)}...
+      </button>
+      <button
+        onClick={copy}
+        className="shrink-0 text-[10px] transition-colors"
+        style={{ color: copied ? "var(--accent)" : "var(--text-tertiary)" }}
+        title="Copy full session ID"
+      >
+        {copied ? "\u2713" : "\u2398"}
+      </button>
+    </span>
   );
 }
 
@@ -141,22 +198,32 @@ function EventDetailPanel({
 
   return (
     <>
-      <div className="fixed inset-0 bg-black/50 z-40" onClick={onClose} />
+      <div
+        className="fixed inset-0 z-40 animate-fade-in-up"
+        style={{ background: "rgba(0, 0, 0, 0.6)", backdropFilter: "blur(4px)" }}
+        onClick={onClose}
+      />
       <div
         className="fixed top-0 right-0 h-full w-full max-w-lg border-l z-50 overflow-y-auto shadow-2xl animate-slide-in"
         style={{ background: "var(--bg)", borderColor: "var(--border)" }}
       >
         <div
-          className="sticky top-0 border-b p-4 flex items-center justify-between"
+          className="sticky top-0 z-10 border-b px-4 py-3 flex items-center justify-between"
           style={{ background: "var(--bg)", borderColor: "var(--border)" }}
         >
           <h2 className="text-sm font-semibold">Event Detail</h2>
           <button
             onClick={onClose}
-            className="transition text-lg leading-none"
-            style={{ color: "var(--text-tertiary)" }}
+            className="flex items-center justify-center w-7 h-7 transition-colors hover:bg-white/[0.06]"
+            style={{
+              color: "var(--text-tertiary)",
+              borderRadius: "var(--radius-sm)",
+            }}
+            title="Close (Esc)"
           >
-            &times;
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M1 1l12 12M13 1L1 13" />
+            </svg>
           </button>
         </div>
 
@@ -190,7 +257,7 @@ function EventDetailPanel({
           <div className="space-y-0.5">
             <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Model</p>
             <p className="text-sm font-mono">
-              {model ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
+              {model ?? <span style={{ color: "var(--text-tertiary)" }}>-</span>}
             </p>
           </div>
 
@@ -198,13 +265,13 @@ function EventDetailPanel({
             <div className="space-y-0.5">
               <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Input Hash</p>
               <p className="font-mono text-xs break-all">
-                {event.input_hash ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
+                {event.input_hash ?? <span style={{ color: "var(--text-tertiary)" }}>-</span>}
               </p>
             </div>
             <div className="space-y-0.5">
               <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Output Hash</p>
               <p className="font-mono text-xs break-all">
-                {event.output_hash ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
+                {event.output_hash ?? <span style={{ color: "var(--text-tertiary)" }}>-</span>}
               </p>
             </div>
           </div>
@@ -235,7 +302,7 @@ function EventDetailPanel({
               </button>
             ) : (
               <p className="font-mono text-xs" style={{ color: "var(--text-tertiary)" }}>
-                &mdash; (chain head)
+                - (chain head)
               </p>
             )}
           </div>
@@ -243,7 +310,7 @@ function EventDetailPanel({
           <div className="space-y-0.5">
             <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>HMAC Value</p>
             <p className="font-mono text-xs break-all">
-              {event.hmac_value ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
+              {event.hmac_value ?? <span style={{ color: "var(--text-tertiary)" }}>-</span>}
             </p>
           </div>
 
@@ -255,7 +322,7 @@ function EventDetailPanel({
           <div className="space-y-0.5">
             <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>Created At</p>
             <p className="text-sm font-mono">
-              {event.created_at ?? <span style={{ color: "var(--text-tertiary)" }}>&mdash;</span>}
+              {event.created_at ?? <span style={{ color: "var(--text-tertiary)" }}>-</span>}
             </p>
           </div>
 
@@ -322,6 +389,7 @@ export default function EventsPage() {
         limit: pageSize,
         offset: page * pageSize,
       }),
+    refetchInterval: 10_000,
   });
 
   const handleClose = useCallback(() => setSelectedEvent(null), []);
@@ -336,12 +404,9 @@ export default function EventsPage() {
     [events]
   );
 
-  const inputStyle = {
-    background: "var(--card)",
-    borderColor: "var(--border)",
-    borderRadius: "var(--radius-sm)",
-    color: "var(--fg)",
-  };
+  // Filter inputs now use the .filter-input utility class from globals.css
+
+  const hasFilters = !!(agentFilter || kindFilter || sessionFilter);
 
   return (
     <div className="space-y-4">
@@ -350,29 +415,34 @@ export default function EventsPage() {
         <LiveBadge />
       </div>
 
-      <div className="flex flex-wrap gap-3 text-sm">
+      {/* Filter bar */}
+      <div
+        className="flex flex-wrap items-center gap-3 p-3 border text-sm"
+        style={{
+          background: "var(--surface)",
+          borderColor: "var(--border)",
+          borderRadius: "var(--radius-md)",
+        }}
+      >
         <input
           placeholder="Filter by agent_id"
           value={agentFilter}
           onChange={(e) => { setAgentFilter(e.target.value); setPage(0); }}
-          className="border px-3 py-2 text-sm w-48 outline-none transition-colors focus:border-[var(--accent)]"
-          style={inputStyle}
+          className="filter-input w-48"
         />
         <input
           placeholder="Filter by kind"
           value={kindFilter}
           onChange={(e) => { setKindFilter(e.target.value); setPage(0); }}
-          className="border px-3 py-2 text-sm w-48 outline-none transition-colors focus:border-[var(--accent)]"
-          style={inputStyle}
+          className="filter-input w-48"
         />
         <input
           placeholder="Filter by session_id"
           value={sessionFilter}
           onChange={(e) => { setSessionFilter(e.target.value); setPage(0); }}
-          className="border px-3 py-2 text-sm w-64 outline-none transition-colors focus:border-[var(--accent)]"
-          style={inputStyle}
+          className="filter-input w-64"
         />
-        {(agentFilter || kindFilter || sessionFilter) && (
+        {hasFilters && (
           <button
             onClick={() => {
               setAgentFilter("");
@@ -380,10 +450,14 @@ export default function EventsPage() {
               setSessionFilter("");
               setPage(0);
             }}
-            className="text-xs transition-colors hover:text-white"
-            style={{ color: "var(--text-tertiary)" }}
+            className="text-xs px-3 py-2 border transition-colors hover:text-white hover:border-[var(--text-tertiary)]"
+            style={{
+              color: "var(--text-tertiary)",
+              borderColor: "var(--border)",
+              borderRadius: "var(--radius-sm)",
+            }}
           >
-            Clear filters
+            Reset
           </button>
         )}
       </div>
@@ -400,7 +474,7 @@ export default function EventsPage() {
           <span className="text-sm" style={{ color: "var(--text-tertiary)" }}>
             Session {sessionFilter.slice(0, 8)}...:
           </span>
-          <VerifyButton sessionId={sessionFilter} />
+          <VerifyButton sessionId={sessionFilter} prominent />
         </div>
       )}
 
@@ -409,7 +483,7 @@ export default function EventsPage() {
       ) : !events || events.length === 0 ? (
         <div className="text-center py-12">
           <p style={{ color: "var(--text-tertiary)" }}>
-            {agentFilter || kindFilter || sessionFilter
+            {hasFilters
               ? "No events match your filters."
               : "No audit events yet. Start logging from the SDK."}
           </p>
@@ -429,64 +503,68 @@ export default function EventsPage() {
               </tr>
             </thead>
             <tbody>
-              {events.map((e) => (
+              {events.map((e, idx) => (
                 <tr
                   key={e.event_id}
                   onClick={() => setSelectedEvent(e)}
-                  className="border-b hover:bg-white/[0.03] transition-colors cursor-pointer"
-                  style={{ borderColor: "var(--border)" }}
+                  className="border-b transition-colors cursor-pointer hover:bg-white/[0.06]"
+                  style={{
+                    borderColor: "var(--border)",
+                    background: idx % 2 === 1 ? "rgba(255, 255, 255, 0.02)" : "transparent",
+                  }}
                 >
-                  <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
+                  <td className="py-2.5 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                     {e.chain_seq}
                   </td>
-                  <td className="py-2 pr-3">
+                  <td className="py-2.5 pr-3">
                     <EventKind kind={e.kind} />
                   </td>
-                  <td className="py-2 pr-3 text-sm">{e.agent_id}</td>
-                  <td className="py-2 pr-3 text-xs font-mono" style={{ color: "var(--text-tertiary)" }}>
-                    {e.model ?? (e.metadata as Record<string, unknown>)?.model as string ?? "\u2014"}
+                  <td className="py-2.5 pr-3 text-sm">{e.agent_id}</td>
+                  <td className="py-2.5 pr-3 text-xs font-mono" style={{ color: "var(--text-tertiary)" }}>
+                    {e.model ?? (e.metadata as Record<string, unknown>)?.model as string ?? "-"}
                   </td>
-                  <td className="py-2 pr-3">
-                    <button
-                      onClick={(ev) => {
-                        ev.stopPropagation();
-                        setSessionFilter(e.session_id);
-                      }}
-                      className="hover:underline font-mono text-xs"
-                      style={{ color: "var(--accent)" }}
-                    >
-                      {e.session_id.slice(0, 8)}...
-                    </button>
+                  <td className="py-2.5 pr-3">
+                    <SessionIdCell
+                      sessionId={e.session_id}
+                      onFilter={() => setSessionFilter(e.session_id)}
+                    />
                   </td>
-                  <td className="py-2 pr-3 max-w-xs">
+                  <td className="py-2.5 pr-3 max-w-xs">
                     <MetadataViewer data={e.metadata as Record<string, unknown>} />
                   </td>
-                  <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
+                  <td className="py-2.5 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                     <TimeAgo iso={e.created_at} />
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          <div className="flex items-center justify-between mt-3">
+
+          {/* Pagination */}
+          <div className="flex items-center justify-between mt-4 pt-3 border-t" style={{ borderColor: "var(--border)" }}>
             <div className="flex items-center gap-2">
               <label className="text-xs" style={{ color: "var(--text-tertiary)" }}>Page size:</label>
               <select
                 value={pageSize}
                 onChange={(e) => { setPageSize(Number(e.target.value)); setPage(0); }}
                 className="border px-2 py-1 text-xs outline-none"
-                style={inputStyle}
+                style={{
+                  background: "var(--card)",
+                  borderColor: "var(--border)",
+                  borderRadius: "var(--radius-sm)",
+                  color: "var(--fg)",
+                }}
               >
                 <option value={25}>25</option>
                 <option value={50}>50</option>
                 <option value={100}>100</option>
               </select>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-1">
               <button
                 onClick={() => setPage((p) => Math.max(0, p - 1))}
                 disabled={page === 0}
-                className="text-xs px-3 py-1.5 border disabled:opacity-30 transition-colors"
+                className="text-xs px-3 py-1.5 border transition-colors disabled:opacity-20 disabled:cursor-not-allowed"
                 style={{
                   borderColor: "var(--border)",
                   color: "var(--text-tertiary)",
@@ -495,11 +573,21 @@ export default function EventsPage() {
               >
                 Prev
               </button>
-              <span className="text-xs" style={{ color: "var(--text-tertiary)" }}>Page {page + 1}</span>
+              <span
+                className="text-xs font-medium px-3 py-1.5 border"
+                style={{
+                  borderColor: "var(--accent)",
+                  color: "var(--accent)",
+                  background: "rgba(130, 40, 245, 0.1)",
+                  borderRadius: "var(--radius-sm)",
+                }}
+              >
+                {page + 1}
+              </span>
               <button
                 onClick={() => setPage((p) => p + 1)}
                 disabled={!events || events.length < pageSize}
-                className="text-xs px-3 py-1.5 border disabled:opacity-30 transition-colors"
+                className="text-xs px-3 py-1.5 border transition-colors disabled:opacity-20 disabled:cursor-not-allowed"
                 style={{
                   borderColor: "var(--border)",
                   color: "var(--text-tertiary)",

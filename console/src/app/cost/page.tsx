@@ -32,10 +32,28 @@ function PricingReference() {
     <div>
       <button
         onClick={() => setOpen(!open)}
-        className="text-xs transition-colors"
+        className="text-xs transition-colors flex items-center gap-1.5"
         style={{ color: "var(--accent)" }}
       >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 12 12"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="round"
+          className="transition-transform"
+          style={{ transform: open ? "rotate(90deg)" : "rotate(0deg)" }}
+        >
+          <path d="M4 2l4 4-4 4" />
+        </svg>
         {open ? "Hide pricing reference" : "View model pricing reference"}
+        {!open && (
+          <span style={{ color: "var(--text-tertiary)" }}>
+            - {Object.keys(MODEL_PRICING).length} models
+          </span>
+        )}
       </button>
       {open && (
         <div className="mt-3 overflow-x-auto animate-fade-in-up">
@@ -48,11 +66,14 @@ function PricingReference() {
               </tr>
             </thead>
             <tbody>
-              {Object.entries(MODEL_PRICING).map(([model, prices]) => (
+              {Object.entries(MODEL_PRICING).map(([model, prices], idx) => (
                 <tr
                   key={model}
                   className="border-b"
-                  style={{ borderColor: "var(--border)" }}
+                  style={{
+                    borderColor: "var(--border)",
+                    background: idx % 2 === 1 ? "rgba(255, 255, 255, 0.02)" : "transparent",
+                  }}
                 >
                   <td className="py-1.5 pr-3 font-mono">{model}</td>
                   <td className="py-1.5 pr-3 text-right font-mono">${prices.input.toFixed(2)}</td>
@@ -75,10 +96,17 @@ export default function CostPage() {
   const { data: agents, isLoading: agentsLoading } = useQuery({
     queryKey: ["cost-agents"],
     queryFn: api.costAgents,
+    refetchInterval: 10_000,
   });
   const { data: sessions, isLoading: sessionsLoading } = useQuery({
     queryKey: ["cost-sessions"],
     queryFn: () => api.costSessions(),
+    refetchInterval: 10_000,
+  });
+  const { data: models, isLoading: modelsLoading } = useQuery({
+    queryKey: ["cost-models"],
+    queryFn: api.costModels,
+    refetchInterval: 10_000,
   });
 
   return (
@@ -114,13 +142,20 @@ export default function CostPage() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {agents?.map((a) => {
-              const overBudget = a.usd_used_today > 10; // visual indicator if spending is high
+              const DAILY_BUDGET = 10; // $10 soft daily budget threshold
+              const pct = Math.min((a.usd_used_today / DAILY_BUDGET) * 100, 100);
+              const overBudget = a.usd_used_today > DAILY_BUDGET;
+              const barColor = overBudget
+                ? "var(--danger)"
+                : pct > 75
+                  ? "var(--warn)"
+                  : "var(--accent)";
               return (
                 <div
                   key={a.agent_id}
                   className="border p-4"
                   style={{
-                    borderColor: overBudget ? "rgba(234, 179, 8, 0.3)" : "var(--border)",
+                    borderColor: overBudget ? "rgba(239, 68, 68, 0.3)" : "var(--border)",
                     background: "var(--card)",
                     borderRadius: "var(--radius-md)",
                   }}
@@ -129,6 +164,35 @@ export default function CostPage() {
                   <div className="mt-2 flex justify-between text-sm">
                     <span style={{ color: "var(--text-tertiary)" }}>USD today</span>
                     <span className="font-mono">${a.usd_used_today.toFixed(4)}</span>
+                  </div>
+                  {/* Spend progress bar */}
+                  <div className="mt-1.5 mb-2">
+                    <div
+                      className="h-1.5 w-full overflow-hidden"
+                      style={{
+                        background: "rgba(255, 255, 255, 0.06)",
+                        borderRadius: "9999px",
+                      }}
+                    >
+                      <div
+                        className="h-full transition-all duration-500"
+                        style={{
+                          width: `${pct}%`,
+                          background: barColor,
+                          borderRadius: "9999px",
+                        }}
+                      />
+                    </div>
+                    <div className="flex justify-between mt-0.5">
+                      <span className="text-[10px]" style={{ color: "var(--text-tertiary)" }}>
+                        {pct.toFixed(0)}% of ${DAILY_BUDGET} daily budget
+                      </span>
+                      {overBudget && (
+                        <span className="text-[10px] font-medium" style={{ color: "var(--danger)" }}>
+                          Over budget
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex justify-between text-sm">
                     <span style={{ color: "var(--text-tertiary)" }}>Tokens today</span>
@@ -165,15 +229,24 @@ export default function CostPage() {
                 </tr>
               </thead>
               <tbody>
-                {sessions?.map((s) => (
+                {sessions?.map((s, idx) => (
                   <tr
                     key={`${s.agent_id}-${s.session_id}`}
-                    className="border-b hover:bg-white/[0.03] transition-colors"
-                    style={{ borderColor: "var(--border)" }}
+                    className="border-b hover:bg-white/[0.06] transition-colors"
+                    style={{
+                      borderColor: "var(--border)",
+                      background: idx % 2 === 1 ? "rgba(255, 255, 255, 0.02)" : "transparent",
+                    }}
                   >
                     <td className="py-2 pr-3">{s.agent_id}</td>
-                    <td className="py-2 pr-3 font-mono text-xs">
-                      {s.session_id.slice(0, 8)}...
+                    <td className="py-2 pr-3">
+                      <span
+                        className="font-mono text-xs truncate inline-block max-w-[8rem] align-bottom"
+                        title={s.session_id}
+                        style={{ color: "var(--accent)" }}
+                      >
+                        {s.session_id.slice(0, 12)}...
+                      </span>
                     </td>
                     <td className="py-2 pr-3 text-right font-mono">
                       ${s.usd_used.toFixed(6)}
@@ -184,12 +257,96 @@ export default function CostPage() {
                     <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                       {s.last_updated
                         ? new Date(s.last_updated).toLocaleString()
-                        : "\u2014"}
+                        : "-"}
                     </td>
                   </tr>
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+      </section>
+
+      <section>
+        <h2 className="text-lg font-semibold mb-3">Model Breakdown (today)</h2>
+        {modelsLoading ? (
+          <TableSkeleton rows={5} />
+        ) : !models || models.length === 0 ? (
+          <div
+            className="text-center py-8 border border-dashed"
+            style={{ borderColor: "var(--border)", borderRadius: "var(--radius-md)" }}
+          >
+            <p style={{ color: "var(--text-tertiary)" }}>No per-model cost data yet.</p>
+            <p className="text-xs mt-1" style={{ color: "var(--text-tertiary)" }}>
+              Model-level tracking requires the model field on audit events.
+            </p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            {(() => {
+              const maxSpend = Math.max(...models.map((m) => m.usd_used_today), 0.000001);
+              return (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-left border-b" style={{ borderColor: "var(--border)", color: "var(--text-tertiary)" }}>
+                      <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Model</th>
+                      <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Agent</th>
+                      <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider min-w-[140px]">Spend</th>
+                      <th className="py-2 pr-3 text-right font-medium text-xs uppercase tracking-wider">USD</th>
+                      <th className="py-2 pr-3 text-right font-medium text-xs uppercase tracking-wider">Tokens</th>
+                      <th className="py-2 pr-3 font-medium text-xs uppercase tracking-wider">Last updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {models.map((m, i) => {
+                      const barPct = (m.usd_used_today / maxSpend) * 100;
+                      return (
+                        <tr
+                          key={`${m.agent_id}-${m.model}-${i}`}
+                          className="border-b hover:bg-white/[0.06] transition-colors"
+                          style={{
+                            borderColor: "var(--border)",
+                            background: i % 2 === 1 ? "rgba(255, 255, 255, 0.02)" : "transparent",
+                          }}
+                        >
+                          <td className="py-2 pr-3 font-mono text-xs">{m.model}</td>
+                          <td className="py-2 pr-3">{m.agent_id}</td>
+                          <td className="py-2 pr-3">
+                            <div
+                              className="h-2 w-full overflow-hidden"
+                              style={{
+                                background: "rgba(255, 255, 255, 0.06)",
+                                borderRadius: "9999px",
+                              }}
+                            >
+                              <div
+                                className="h-full transition-all duration-500"
+                                style={{
+                                  width: `${barPct}%`,
+                                  background: "var(--accent)",
+                                  borderRadius: "9999px",
+                                }}
+                              />
+                            </div>
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono">
+                            ${m.usd_used_today.toFixed(6)}
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono">
+                            {m.tokens_used_today.toLocaleString()}
+                          </td>
+                          <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
+                            {m.last_updated
+                              ? new Date(m.last_updated).toLocaleString()
+                              : "-"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              );
+            })()}
           </div>
         )}
       </section>

@@ -1104,12 +1104,43 @@ async def governance_posture() -> dict[str, Any]:
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
             }
 
+        # Budget policies for WARN threshold calculation
+        budget_policies: dict[str, dict[str, Any]] = {}
+        try:
+            policies_res = await conn.execute(
+                text(
+                    "SELECT agent_id, policy_json "
+                    "FROM governance_policies "
+                    "WHERE policy_type = 'budget'"
+                )
+            )
+            for r in policies_res.mappings():
+                pj = r["policy_json"]
+                if isinstance(pj, dict):
+                    budget_policies[r["agent_id"]] = pj
+        except Exception:
+            # Table may not exist yet; treat as no policies
+            pass
+
     posture: list[dict[str, Any]] = []
     for agent_id, info in agents.items():
         v_count = violations.get(agent_id, 0)
         b = budgets.get(agent_id, {})
         p_count = pending.get(agent_id, 0)
         e_count = exceeded.get(agent_id, 0)
+
+        # Cost status: FAIL if budget exceeded, WARN if spend > 50% of any
+        # registered budget cap, PASS otherwise (including uncapped agents).
+        usd_today = float(b.get("usd_used", 0))
+        cost_status = "PASS"
+        if e_count > 0:
+            cost_status = "FAIL"
+        elif agent_id in budget_policies and usd_today > 0:
+            bp = budget_policies[agent_id]
+            daily_cap = bp.get("per_agent_usd_daily")
+            if daily_cap is not None and float(daily_cap) > 0:
+                if usd_today > float(daily_cap) * 0.5:
+                    cost_status = "WARN"
 
         posture.append(
             {
@@ -1124,10 +1155,8 @@ async def governance_posture() -> dict[str, Any]:
                     "latest_violation": latest_violations.get(agent_id),
                 },
                 "cost": {
-                    "status": "FAIL"
-                    if e_count > 0
-                    else ("WARN" if float(b.get("usd_used", 0)) > 0 else "PASS"),
-                    "usd_today": float(b.get("usd_used", 0)),
+                    "status": cost_status,
+                    "usd_today": usd_today,
                     "tokens_today": int(b.get("tokens_used", 0)),
                     "exceeded_today": e_count,
                 },

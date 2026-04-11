@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import structlog
 
@@ -78,7 +78,8 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         self._sdk = sdk
         self._agent_id = agent_id
         self._enforce = enforce
-        self._session_id = session_id
+        self._session_id = session_id if session_id is not None else uuid4()
+        self._last_model: str | None = None
 
     # -- helpers ---------------------------------------------------------------
 
@@ -143,11 +144,8 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     async def _cost_track(self, tokens: int, usd: float) -> None:
         """Track cost, swallowing all errors."""
         try:
-            from uuid import uuid4
-
-            sid = uuid4()
             await self._sdk.cost.track(
-                self._agent_id, sid, tokens=tokens, usd=usd
+                self._agent_id, self._session_id, tokens=tokens, usd=usd
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(
@@ -172,8 +170,10 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         """
         try:
             model = serialized.get("name", serialized.get("id", ["unknown"])[-1])
+            # Also check invocation_params for the model name (more reliable)
             invocation_params = kwargs.get("invocation_params", {})
             if isinstance(invocation_params, dict):
+                model = invocation_params.get("model_name", invocation_params.get("model", model))
                 tools = invocation_params.get("tools")
                 if isinstance(tools, list):
                     tool_names = [
@@ -193,6 +193,7 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                                 and t.get("function", {}).get("name", "") in hidden
                             )
                         ]
+            self._last_model = str(model)
             _run_async(
                 self._audit_log(
                     "llm.call",
@@ -219,11 +220,18 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                 token_usage = response.llm_output.get("token_usage", {})
 
             total_tokens = int(token_usage.get("total_tokens", 0))
+            usd = 0.0
+            if self._last_model and total_tokens > 0:
+                from codeatelier_governance.cost.pricing import estimate_cost
+
+                prompt_tokens = int(token_usage.get("prompt_tokens", 0))
+                completion_tokens = int(token_usage.get("completion_tokens", 0))
+                usd = estimate_cost(self._last_model, prompt_tokens, completion_tokens)
             _run_async(
                 self._audit_log("llm.result", {"token_usage": token_usage})
             )
             if total_tokens > 0:
-                _run_async(self._cost_track(total_tokens, 0.0))
+                _run_async(self._cost_track(total_tokens, usd))
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.on_llm_end_failed",
@@ -380,6 +388,10 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         """Async variant of on_llm_start."""
         try:
             model = serialized.get("name", serialized.get("id", ["unknown"])[-1])
+            invocation_params = kwargs.get("invocation_params", {})
+            if isinstance(invocation_params, dict):
+                model = invocation_params.get("model_name", invocation_params.get("model", model))
+            self._last_model = str(model)
             await self._audit_log(
                 "llm.call",
                 {"model": str(model), "prompt_count": len(prompts)},
@@ -404,9 +416,16 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                 token_usage = response.llm_output.get("token_usage", {})
 
             total_tokens = int(token_usage.get("total_tokens", 0))
+            usd = 0.0
+            if self._last_model and total_tokens > 0:
+                from codeatelier_governance.cost.pricing import estimate_cost
+
+                prompt_tokens = int(token_usage.get("prompt_tokens", 0))
+                completion_tokens = int(token_usage.get("completion_tokens", 0))
+                usd = estimate_cost(self._last_model, prompt_tokens, completion_tokens)
             await self._audit_log("llm.result", {"token_usage": token_usage})
             if total_tokens > 0:
-                await self._cost_track(total_tokens, 0.0)
+                await self._cost_track(total_tokens, usd)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "governance.langchain_handler.aon_llm_end_failed",

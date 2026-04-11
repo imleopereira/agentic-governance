@@ -21,7 +21,7 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (res.status === 401) {
-    // Session expired or invalid — clear stale token and let AuthProvider handle redirect
+    // Session expired or invalid - clear stale token and let AuthProvider handle redirect
     localStorage.removeItem("governance_token");
     throw new Error("Authentication required");
   }
@@ -99,6 +99,14 @@ export interface CostSession {
   last_updated: string | null;
 }
 
+export interface CostModel {
+  agent_id: string;
+  model: string;
+  usd_used_today: number;
+  tokens_used_today: number;
+  last_updated: string | null;
+}
+
 export interface GatePending {
   request_id: string;
   agent_id: string;
@@ -170,6 +178,7 @@ export const api = {
       "/api/cost/sessions",
       agentId ? { agent_id: agentId } : {}
     ),
+  costModels: () => get<CostModel[]>("/api/cost/models"),
   gatesPending: () => get<GatePending[]>("/api/gates/pending"),
   gatesRecent: (limit = 50) =>
     get<GateResolved[]>("/api/gates/recent", { limit: String(limit) }),

@@ -2,12 +2,26 @@
 
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Activity, CircleDollarSign, Clock } from "lucide-react";
 import { api, type PostureAgent } from "@/lib/api";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CardSkeleton } from "@/components/Skeleton";
 import { LiveBadge } from "@/components/LiveBadge";
 import { TimeAgo } from "@/components/TimeAgo";
 import { GettingStarted } from "@/components/GettingStarted";
+
+/** Derive a left-border accent color from the agent's four statuses. */
+function agentBorderColor(agent: PostureAgent): string {
+  const statuses = [
+    agent.scope.status,
+    agent.cost.status,
+    agent.gates.status,
+    agent.audit.status,
+  ];
+  if (statuses.includes("FAIL")) return "var(--danger)";
+  if (statuses.includes("WARN")) return "var(--warn)";
+  return "var(--success)";
+}
 
 function ViolationDetails({ agent }: { agent: PostureAgent }) {
   const [expanded, setExpanded] = useState(false);
@@ -47,7 +61,7 @@ function ViolationDetails({ agent }: { agent: PostureAgent }) {
             </span>
             {violation.created_at && (
               <>
-                {" "}&mdash;{" "}
+                {" - "}
                 <TimeAgo iso={violation.created_at} />
               </>
             )}
@@ -62,16 +76,30 @@ function PostureCard({ agent }: { agent: PostureAgent }) {
   return (
     <a
       href={`/events?agent_id=${encodeURIComponent(agent.agent_id)}`}
-      className="block border p-4 space-y-3 transition-all hover:shadow-lg"
+      className="block border p-4 space-y-3 transition-all hover:-translate-y-0.5"
       style={{
         borderColor: "var(--border)",
         background: "var(--card)",
         borderRadius: "var(--radius-md)",
+        borderLeft: `3px solid ${agentBorderColor(agent)}`,
+        boxShadow: "0 1px 2px rgba(0,0,0,0.1)",
+      }}
+      onMouseEnter={(e) => {
+        e.currentTarget.style.boxShadow =
+          "0 4px 16px rgba(0,0,0,0.25), 0 1px 3px rgba(0,0,0,0.15)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.boxShadow = "0 1px 2px rgba(0,0,0,0.1)";
       }}
     >
-      <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-sm truncate">{agent.agent_id}</h3>
-        <span className="text-xs" style={{ color: "var(--text-tertiary)" }}>
+      <div className="flex items-center justify-between gap-2">
+        <h3
+          className="font-semibold text-sm truncate font-mono"
+          style={{ color: "var(--fg)" }}
+        >
+          {agent.agent_id}
+        </h3>
+        <span className="text-xs flex-shrink-0" style={{ color: "var(--text-tertiary)" }}>
           {agent.event_count.toLocaleString()} events
         </span>
       </div>
@@ -89,7 +117,7 @@ function PostureCard({ agent }: { agent: PostureAgent }) {
                 borderRadius: "var(--radius-sm)",
               }}
             >
-              <span>{label}</span>
+              <span style={{ color: "var(--text-secondary)" }}>{label}</span>
               <StatusBadge status={status} />
             </div>
           );
@@ -123,46 +151,67 @@ function StatsBar({ agents }: { agents: PostureAgent[] }) {
   const pendingGates = agents.reduce((s, a) => s + a.gates.pending, 0);
 
   const stats = [
-    { label: "Total events", value: totalEvents.toLocaleString() },
-    { label: "Spend today", value: `$${totalSpend.toFixed(4)}` },
+    {
+      label: "Total events",
+      value: totalEvents.toLocaleString(),
+      icon: Activity,
+    },
+    {
+      label: "Spend today",
+      value: `$${totalSpend.toFixed(4)}`,
+      icon: CircleDollarSign,
+    },
     {
       label: "Pending approvals",
       value: String(pendingGates),
       highlight: pendingGates > 0,
+      icon: Clock,
     },
   ];
 
   return (
     <div className="grid grid-cols-3 gap-4">
-      {stats.map((s) => (
-        <div
-          key={s.label}
-          className="border p-3 text-center"
-          style={{
-            borderColor: "var(--border)",
-            background: "var(--card)",
-            borderRadius: "var(--radius-md)",
-          }}
-        >
-          <p
-            className="text-2xl font-bold font-mono"
-            style={{ color: s.highlight ? "var(--warn)" : "var(--fg)" }}
+      {stats.map((s) => {
+        const Icon = s.icon;
+        return (
+          <div
+            key={s.label}
+            className="border p-4 text-center space-y-1"
+            style={{
+              borderColor: "var(--border)",
+              background: "var(--card)",
+              borderRadius: "var(--radius-md)",
+            }}
           >
-            {s.value}
-          </p>
-          <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
-            {s.label}
-          </p>
-        </div>
-      ))}
+            <div className="flex items-center justify-center gap-2">
+              <Icon
+                size={16}
+                style={{
+                  color: s.highlight ? "var(--warn)" : "var(--text-tertiary)",
+                }}
+              />
+              <p
+                className="text-2xl font-bold font-mono"
+                style={{ color: s.highlight ? "var(--warn)" : "var(--fg)" }}
+              >
+                {s.value}
+              </p>
+            </div>
+            <p className="text-xs" style={{ color: "var(--text-tertiary)" }}>
+              {s.label}
+            </p>
+          </div>
+        );
+      })}
     </div>
   );
 }
 
 export default function PosturePage() {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, dataUpdatedAt } = useQuery({
     queryKey: ["posture"],
     queryFn: api.posture,
+    refetchInterval: 10_000,
   });
 
   if (isLoading) {
@@ -188,7 +237,14 @@ export default function PosturePage() {
   if (error) {
     return (
       <div className="text-center py-20">
-        <div className="inline-flex items-center justify-center w-12 h-12 mb-4 border" style={{ borderColor: "rgba(239, 68, 68, 0.3)", borderRadius: "var(--radius-md)", background: "rgba(239, 68, 68, 0.08)" }}>
+        <div
+          className="inline-flex items-center justify-center w-12 h-12 mb-4 border"
+          style={{
+            borderColor: "rgba(239, 68, 68, 0.3)",
+            borderRadius: "var(--radius-md)",
+            background: "rgba(239, 68, 68, 0.08)",
+          }}
+        >
           <span className="text-xl" style={{ color: "var(--danger)" }}>!</span>
         </div>
         <h2 className="text-xl mb-2" style={{ color: "var(--danger)" }}>
@@ -226,8 +282,12 @@ export default function PosturePage() {
       a.audit.status === "PASS"
   );
 
+  const lastRefreshed = dataUpdatedAt
+    ? new Date(dataUpdatedAt).toLocaleTimeString()
+    : null;
+
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Governance Posture</h1>
@@ -235,13 +295,22 @@ export default function PosturePage() {
             {data.agent_count} agent{data.agent_count !== 1 ? "s" : ""} monitored
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <LiveBadge />
-          <div className="flex items-center gap-2">
-            <span className="text-sm" style={{ color: "var(--text-secondary)" }}>
-              Overall:
-            </span>
-            <StatusBadge status={overall ? "PASS" : "WARN"} />
+        <div className="flex items-center gap-4">
+          <div className="flex flex-col items-end gap-1">
+            <div className="flex items-center gap-3">
+              <LiveBadge />
+              <div className="flex items-center gap-2">
+                <span className="text-sm" style={{ color: "var(--text-secondary)" }}>
+                  Overall:
+                </span>
+                <StatusBadge status={overall ? "PASS" : "WARN"} />
+              </div>
+            </div>
+            {lastRefreshed && (
+              <span className="text-[10px]" style={{ color: "var(--text-tertiary)" }}>
+                Refreshed at {lastRefreshed}
+              </span>
+            )}
           </div>
         </div>
       </div>
