@@ -421,6 +421,21 @@ class AuditModule:
                 raise ChainIntegrityError(
                     f"audit chain integrity violation at event {record.event_id}"
                 )
+
+        # Detect chain forks: two events sharing the same prev_hash means
+        # the chain was branched (e.g. an attacker inserted a second root
+        # or spliced a parallel branch).
+        seen_prev: dict[str | None, UUID] = {}
+        for record in events:
+            key = record.prev_hash
+            if key in seen_prev:
+                raise ChainIntegrityError(
+                    f"audit chain fork detected: events "
+                    f"{seen_prev[key]} and {record.event_id} "
+                    f"share prev_hash {key!r}"
+                )
+            seen_prev[key] = record.event_id
+
         return events
 
     # --- decorator ----------------------------------------------------------

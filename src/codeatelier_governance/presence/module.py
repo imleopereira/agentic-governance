@@ -59,14 +59,34 @@ class PresenceModule:
     _MAX_METADATA_BYTES = 65536
     _MAX_AGENTS = 10000
 
+    _MAX_OPERATOR_ID_LEN = 256
+
     async def heartbeat(
-        self, agent_id: str, metadata: dict[str, Any] | None = None,
+        self,
+        agent_id: str,
+        metadata: dict[str, Any] | None = None,
+        operator_id: str | None = None,
     ) -> None:
-        """UPSERT agent as 'live' with current timestamp."""
+        """UPSERT agent as 'live' with current timestamp.
+
+        Args:
+            agent_id: Unique identifier for the agent.
+            metadata: Optional JSON-serialisable metadata dict.
+            operator_id: Optional ID of the human operator who owns this agent.
+                Used by the console to enforce self-approval prevention on HITL
+                gates.
+        """
         if not agent_id or len(agent_id) > self._MAX_AGENT_ID_LEN:
             logger.warning(
                 "presence.heartbeat_invalid_agent_id",
                 agent_id_len=len(agent_id) if agent_id else 0,
+            )
+            return
+        if operator_id is not None and len(operator_id) > self._MAX_OPERATOR_ID_LEN:
+            logger.warning(
+                "presence.heartbeat_invalid_operator_id",
+                agent_id=agent_id,
+                operator_id_len=len(operator_id),
             )
             return
         if metadata is not None:
@@ -76,12 +96,15 @@ class PresenceModule:
                 return
         engine = self._get_engine()
         if engine is not None:
-            await self._heartbeat_postgres(engine, agent_id, metadata)
+            await self._heartbeat_postgres(engine, agent_id, metadata, operator_id)
         else:
-            await self._heartbeat_memory(agent_id, metadata)
+            await self._heartbeat_memory(agent_id, metadata, operator_id)
 
     async def _heartbeat_memory(
-        self, agent_id: str, metadata: dict[str, Any] | None,
+        self,
+        agent_id: str,
+        metadata: dict[str, Any] | None,
+        operator_id: str | None,
     ) -> None:
         now = datetime.now(timezone.utc)
         async with self._lock:
@@ -92,10 +115,15 @@ class PresenceModule:
                 "last_heartbeat": now,
                 "started_at": started,
                 "metadata": metadata or {},
+                "operator_id": operator_id,
             }
 
     async def _heartbeat_postgres(
-        self, engine: Any, agent_id: str, metadata: dict[str, Any] | None,
+        self,
+        engine: Any,
+        agent_id: str,
+        metadata: dict[str, Any] | None,
+        operator_id: str | None,
     ) -> None:
         import json
 
@@ -107,13 +135,14 @@ class PresenceModule:
                 await conn.execute(
                     text(
                         "INSERT INTO governance_agent_presence "
-                        "(agent_id, status, last_heartbeat, started_at, metadata_json) "
-                        "VALUES (:agent_id, 'live', NOW(), NOW(), CAST(:meta AS jsonb)) "
+                        "(agent_id, status, last_heartbeat, started_at, metadata_json, operator_id) "
+                        "VALUES (:agent_id, 'live', NOW(), NOW(), CAST(:meta AS jsonb), :operator_id) "
                         "ON CONFLICT (agent_id) DO UPDATE SET "
                         "status = 'live', last_heartbeat = NOW(), "
-                        "metadata_json = CAST(:meta AS jsonb)"
+                        "metadata_json = CAST(:meta AS jsonb), "
+                        "operator_id = :operator_id"
                     ),
-                    {"agent_id": agent_id, "meta": meta_json},
+                    {"agent_id": agent_id, "meta": meta_json, "operator_id": operator_id},
                 )
         except Exception as exc:
             logger.error(
@@ -202,6 +231,7 @@ class PresenceModule:
                     "last_heartbeat": data["last_heartbeat"].isoformat(),
                     "started_at": data["started_at"].isoformat(),
                     "metadata": data["metadata"],
+                    "operator_id": data.get("operator_id"),
                 }
                 for aid, data in self._agents.items()
             ]
@@ -213,7 +243,8 @@ class PresenceModule:
             async with engine.connect() as conn:
                 res = await conn.execute(
                     text(
-                        "SELECT agent_id, status, last_heartbeat, started_at, metadata_json "
+                        "SELECT agent_id, status, last_heartbeat, started_at, "
+                        "metadata_json, operator_id "
                         "FROM governance_agent_presence "
                         "ORDER BY agent_id"
                     )
@@ -226,6 +257,7 @@ class PresenceModule:
                     "last_heartbeat": row["last_heartbeat"].isoformat(),
                     "started_at": row["started_at"].isoformat(),
                     "metadata": row["metadata_json"],
+                    "operator_id": row["operator_id"],
                 }
                 for row in rows
             ]

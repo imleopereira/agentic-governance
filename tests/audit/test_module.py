@@ -45,8 +45,8 @@ async def test_trace_returns_provenance_chain(audit: AuditModule) -> None:
         grandchild = await audit.log(
             AuditEvent(agent_id="a", kind="gc", parent_event_id=child.event_id)
         )
-    # Wait for the background flush so the store is populated
-    await asyncio.sleep(0.1)
+    # Flush the batching writer so the store is populated
+    await audit._writer.flush()
     chain = await audit.trace(grandchild.event_id)
     assert [c.kind for c in chain] == ["root", "child", "gc"]
 
@@ -54,7 +54,7 @@ async def test_trace_returns_provenance_chain(audit: AuditModule) -> None:
 @pytest.mark.asyncio
 async def test_trace_detects_tampered_chain(audit: AuditModule) -> None:
     record = await audit.log(AuditEvent(agent_id="a", kind="k"))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     # Reach into the in-memory store and corrupt one row.
     store = audit._store  # type: ignore[attr-defined]
     assert isinstance(store, InMemoryAuditStore)

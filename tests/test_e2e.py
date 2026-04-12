@@ -6,7 +6,6 @@ All in one test, under 10 lines of test body.
 """
 from __future__ import annotations
 
-import asyncio
 import secrets
 
 import pytest
@@ -31,7 +30,7 @@ async def test_five_lines_to_enforcement() -> None:
     with pytest.raises(ScopeViolation):
         await scope.check(agent_id="bot", tool="delete")       # blocked
     record = await audit.log(AuditEvent(agent_id="bot", kind="tool.call"))
-    await asyncio.sleep(0.05)
+    await audit._writer.flush()
     chain = await audit.trace_session_chain(record.session_id)  # verified
     assert len(chain) >= 1
     await audit.close()

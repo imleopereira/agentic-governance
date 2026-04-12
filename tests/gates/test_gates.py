@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from codeatelier_governance.audit import InMemoryAuditStore
+from codeatelier_governance.audit import AuditModule, InMemoryAuditStore
 from codeatelier_governance.gates import (
     ApprovalDenied,
     ApprovalPending,
@@ -33,11 +33,11 @@ async def test_request_returns_signed_token(gates: GatesModule) -> None:
 
 @pytest.mark.asyncio
 async def test_grant_resolves_request(
-    gates: GatesModule, audit_store: InMemoryAuditStore
+    gates: GatesModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     req = await gates.request("delete.user", "a", payload={})
     await gates.grant(req.token)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     granted_events = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -49,11 +49,11 @@ async def test_grant_resolves_request(
 
 @pytest.mark.asyncio
 async def test_deny_logs_denial(
-    gates: GatesModule, audit_store: InMemoryAuditStore
+    gates: GatesModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     req = await gates.request("delete.user", "a", payload={})
     await gates.deny(req.token)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     denied = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -67,6 +67,7 @@ async def test_wait_for_resolves_after_grant(gates: GatesModule) -> None:
     req = await gates.request("k", "a", payload={})
 
     async def grant_later() -> None:
+        # Brief delay to simulate async human approval arriving after wait_for starts
         await asyncio.sleep(0.05)
         await gates.grant(req.token)
 
@@ -80,6 +81,7 @@ async def test_wait_for_raises_on_deny(gates: GatesModule) -> None:
     req = await gates.request("k", "a", payload={})
 
     async def deny_later() -> None:
+        # Brief delay to simulate async human denial arriving after wait_for starts
         await asyncio.sleep(0.05)
         await gates.deny(req.token)
 
@@ -105,6 +107,7 @@ async def test_blocking_decorator_runs_after_grant(gates: GatesModule) -> None:
 
     # Walk the in-memory store after the decorator opens the request.
     async def approve_eventually() -> None:
+        # Brief delay so the decorator's wait_for loop starts before we grant
         await asyncio.sleep(0.1)
         store = gates._store  # type: ignore[attr-defined]
         # InMemoryGatesStore exposes _pending dict for tests

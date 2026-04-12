@@ -3,6 +3,7 @@
 **Enforcement gates for AI agents — in-process, just Postgres.**
 
 [![tests](https://github.com/imleopereira/code-atelier-governance/actions/workflows/test.yml/badge.svg)](https://github.com/imleopereira/code-atelier-governance/actions/workflows/test.yml)
+[![PyPI](https://img.shields.io/pypi/v/code-atelier-governance)](https://pypi.org/project/code-atelier-governance/)
 
 Most LLM tools tell you what your agent did, after the fact. Code Atelier
 Governance gates decisions *before* the LLM call fires. Budget caps, scope
@@ -11,37 +12,44 @@ and a tamper-evident audit trail — all from one `pip install`, all writing to
 the Postgres your application already has.
 
 ```python
-import os
-from codeatelier_governance import GovernanceSDK, ScopePolicy, BudgetPolicy
+from codeatelier_governance import GovernanceSDK, ScopePolicy, BudgetPolicy, AuditEvent
+import uuid
 
-async with GovernanceSDK(database_url=os.environ["DATABASE_URL"]) as sdk:
+async with GovernanceSDK(database_url="postgresql://...") as sdk:
     sdk.scope.register(ScopePolicy(
         agent_id="billing-agent",
         allowed_tools=frozenset({"read_invoice", "send_email"}),
-        hidden_tools=frozenset({"delete_all_data"}),
     ))
     sdk.cost.register(BudgetPolicy(
-        agent_id="billing-agent",
-        per_session_usd=0.50,
-        per_agent_usd_daily=10.00,
-        per_session_seconds=300,
+        agent_id="billing-agent", per_session_usd=5.00,
     ))
 
-    await sdk.scope.check("billing-agent", tool="read_invoice")  # PASS
-    await sdk.cost.check_or_raise("billing-agent", session_id)   # PASS or BudgetExceeded
-    await sdk.cost.track_usage("billing-agent", session_id,
-        model="gpt-4o", input_tokens=1000, output_tokens=500)    # auto-USD from pricing table
+    await sdk.scope.check("billing-agent", tool="read_invoice")       # PASS
+    await sdk.cost.check_or_raise("billing-agent", session_id)        # PASS or BudgetExceeded
+    await sdk.audit.log(AuditEvent(
+        agent_id="billing-agent", kind="invoice.read", session_id=session_id,
+    ))
+```
+
+### Sync support (Flask / Django)
+
+```python
+from codeatelier_governance import GovernanceSDKSync
+
+with GovernanceSDKSync(database_url="postgresql://...") as sdk:
+    sdk.scope.check("my-agent", tool="send_email")
+    sdk.cost.check_or_raise("my-agent", session_id)
 ```
 
 ## Install
 
 ```bash
-pip install codeatelier-governance                     # core SDK
-pip install "codeatelier-governance[console]"          # + governance console GUI
-pip install "codeatelier-governance[openai]"           # + OpenAI wrapper
-pip install "codeatelier-governance[anthropic]"        # + Anthropic wrapper
-pip install "codeatelier-governance[langchain]"        # + LangChain handler
-pip install "codeatelier-governance[otel]"             # + OpenTelemetry export
+pip install code-atelier-governance                      # core SDK
+pip install "code-atelier-governance[console]"            # + governance console GUI
+pip install "code-atelier-governance[openai]"             # + OpenAI wrapper
+pip install "code-atelier-governance[anthropic]"          # + Anthropic wrapper
+pip install "code-atelier-governance[langchain]"          # + LangChain handler
+pip install "code-atelier-governance[otel]"               # + OpenTelemetry export
 ```
 
 ## Setup
@@ -58,25 +66,25 @@ governance console add-user --username admin --role admin
 
 | Module | What it does |
 |--------|-------------|
-| **Audit** | HMAC-chained, append-only, tamper-evident event log with step-level provenance |
+| **Audit** | HMAC-chained, append-only, tamper-evident event log with step-level provenance and chain fork detection |
 | **Scope** | Whitelist tools and APIs per agent. Hidden tools removed from agent context. Default deny. |
-| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 24 models. |
-| **Gates** | Human-in-the-loop approval with HMAC-signed single-use tokens |
-| **Loop Detection** | Sliding window detection of repeated tool calls. Auto-kill runaway agents. |
-| **Presence** | Live/idle/unresponsive agent heartbeat tracking |
+| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 25+ models. Combined budget query for low-latency enforcement. |
+| **Gates** | Human-in-the-loop approval with HMAC-signed single-use tokens. Self-approval prevention (fail-closed). |
+| **Loop Detection** | Sliding window detection of repeated tool calls. Auto-halt runaway agents. |
+| **Presence** | Live/idle/unresponsive/halted agent heartbeat tracking with operator identity. |
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Auto-generate EU AI Act Article 12 reports from the audit trail |
 
 ## Framework adapters
 
 ```python
-# OpenAI — 1 line
+# OpenAI — 1 line (async and sync clients supported)
 from codeatelier_governance.integrations.openai_wrap import wrap_openai
-client = wrap_openai(OpenAI(), sdk=sdk, agent_id="my-agent")
+client = wrap_openai(AsyncOpenAI(), sdk=sdk, agent_id="my-agent")
 
 # Anthropic — 1 line
 from codeatelier_governance.integrations.anthropic_wrap import wrap_anthropic
-client = wrap_anthropic(Anthropic(), sdk=sdk, agent_id="my-agent")
+client = wrap_anthropic(AsyncAnthropic(), sdk=sdk, agent_id="my-agent")
 
 # LangChain — 1 line
 from codeatelier_governance.integrations.langchain_handler import GovernanceCallbackHandler
@@ -85,12 +93,16 @@ handler = GovernanceCallbackHandler(sdk=sdk, agent_id="my-agent", enforce=True)
 
 ## Governance Console
 
-A web dashboard for posture overview, event exploration, cost monitoring,
-gate approvals, and user management. Ships as a FastAPI backend + Next.js frontend.
+A web dashboard with real-time SSE event streaming, agent topology view,
+HITL approval queue, cost monitoring, and chain verification. Ships as a
+FastAPI backend + Next.js frontend.
 
 ```bash
-# Start the console
-GOVERNANCE_DATABASE_URL=postgresql://... uvicorn codeatelier_governance.console.app:app
+# Start the console backend
+GOVERNANCE_DATABASE_URL=postgresql://... python -m codeatelier_governance.console
+
+# Start the frontend (dev)
+cd console && npm run dev
 ```
 
 ## CLI
@@ -104,11 +116,18 @@ governance report      # Generate EU AI Act Article 12 compliance report
 governance console     # User management (add-user, list-users, disable-user, reset-password)
 ```
 
+## Performance
+
+- **Shared connection pool**: single engine, ~15 connections per SDK instance
+- **Concurrent audit writes**: pre-call audit backgrounded, post-call ops parallelized
+- **Combined budget query**: session + daily counters in one DB round-trip
+- **Serverless ready**: policies loaded on start(), no 30s cold-start gap
+
 ## Resilience contract
 
 **Observation surfaces never break the host call.** `sdk.audit.log()`,
 `sdk.cost.track()`, and `sdk.gates.request()` log a warning and continue
-if storage is unreachable.
+if storage is unreachable. Graceful JSONL fallback on read-only filesystems.
 
 **Enforcement surfaces fail closed by default.** `sdk.cost.check_or_raise()`,
 `sdk.scope.check()`, and `sdk.gates.wait_for()` raise by contract. On storage
@@ -122,13 +141,16 @@ application already has.
 
 ## Security
 
-- HMAC-SHA256 chain on every audit event (tamper-evident)
+- HMAC-SHA256 chain on every audit event (tamper-evident, fork-detecting)
+- Self-approval prevention on HITL gates (fail-closed)
 - 13-point security checklist on every feature
 - PBKDF2-HMAC-SHA256 password hashing (600k iterations)
 - Pydantic strict models with size caps throughout
 - Login rate limiting (5 attempts/IP/60s)
 - Constant-time token comparison
 - All SQL parameterized (zero injection vectors)
+- Error messages sanitized (no DB URLs, SQL, or internal paths leak)
+- Weak audit secret detection (entropy check)
 
 ## Standards alignment
 

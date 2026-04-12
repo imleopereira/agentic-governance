@@ -1,7 +1,6 @@
 """Tests for the behavioral contracts module."""
 from __future__ import annotations
 
-import asyncio
 from uuid import uuid4
 
 import pytest
@@ -133,7 +132,7 @@ async def test_post_audit_logged_passes(
         )
     )
     # Give the batching writer time to flush
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     contract = Contract(
         agent_id="a",
         tool="charge_customer",
@@ -196,6 +195,7 @@ async def test_audit_event_on_pre_violation(
     contracts: ContractsModule,
     scope: ScopeModule,
     audit_store: InMemoryAuditStore,
+    audit: AuditModule,
 ) -> None:
     scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"safe"})))
     contract = Contract(
@@ -207,7 +207,7 @@ async def test_audit_event_on_pre_violation(
     sid = uuid4()
     with pytest.raises(ContractViolation):
         await contracts.check_pre("a", sid, "bad_tool")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = list(audit_store._events.values())
     violations = [e for e in events if e.kind == "contract.pre_violation"]
     assert len(violations) >= 1
@@ -222,6 +222,7 @@ async def test_audit_event_on_pre_violation(
 async def test_audit_event_on_post_violation(
     contracts: ContractsModule,
     audit_store: InMemoryAuditStore,
+    audit: AuditModule,
 ) -> None:
     sid = uuid4()
     contract = Contract(
@@ -232,7 +233,7 @@ async def test_audit_event_on_post_violation(
     contracts.register(contract)
     with pytest.raises(ContractViolation):
         await contracts.check_post("a", sid, "missing_tool")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = list(audit_store._events.values())
     violations = [e for e in events if e.kind == "contract.post_violation"]
     assert len(violations) >= 1
@@ -311,7 +312,7 @@ async def test_enforce_context_manager(
             metadata={"tool": "do_thing"},
         )
     )
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     contract = Contract(
         agent_id="a",
         tool="do_thing",

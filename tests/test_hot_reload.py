@@ -42,11 +42,10 @@ async def test_hot_reload_polls_policies() -> None:
         hot_reload=True,
         hot_reload_interval=1,
     )
-    call_count = 0
+    polled = asyncio.Event()
 
     async def mock_poll() -> None:
-        nonlocal call_count
-        call_count += 1
+        polled.set()
 
     sdk._poll_policies = mock_poll  # type: ignore[assignment]
     sdk.audit.start = AsyncMock()  # type: ignore[method-assign]
@@ -54,11 +53,14 @@ async def test_hot_reload_polls_policies() -> None:
     sdk.loop.close = AsyncMock()  # type: ignore[method-assign]
     sdk.presence.close = AsyncMock()  # type: ignore[method-assign]
 
+    # Use a very short interval so we don't wait long
+    sdk._hot_reload_interval = 0.05
+
     await sdk.start()
-    # Wait enough time for at least one poll
-    await asyncio.sleep(1.5)
+    # Wait for the event to be set (poll was called) with a timeout
+    await asyncio.wait_for(polled.wait(), timeout=2.0)
     await sdk.close()
-    assert call_count >= 1
+    assert polled.is_set()
 
 
 @pytest.mark.asyncio
@@ -70,12 +72,15 @@ async def test_hot_reload_error_does_not_crash() -> None:
         hot_reload_interval=1,
     )
     call_count = 0
+    second_call = asyncio.Event()
 
     async def mock_poll_with_error() -> None:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise RuntimeError("simulated DB error")
+        # Signal that we survived the error and got called again
+        second_call.set()
 
     sdk._poll_policies = mock_poll_with_error  # type: ignore[assignment]
     sdk.audit.start = AsyncMock()  # type: ignore[method-assign]
@@ -83,8 +88,12 @@ async def test_hot_reload_error_does_not_crash() -> None:
     sdk.loop.close = AsyncMock()  # type: ignore[method-assign]
     sdk.presence.close = AsyncMock()  # type: ignore[method-assign]
 
+    # Use a very short interval so we don't wait long
+    sdk._hot_reload_interval = 0.05
+
     await sdk.start()
-    await asyncio.sleep(2.5)
+    # Wait until the second poll succeeds (proving the loop survived the error)
+    await asyncio.wait_for(second_call.wait(), timeout=2.0)
     await sdk.close()
     # Should have been called at least twice (first errored, second succeeded)
     assert call_count >= 2

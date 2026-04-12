@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from codeatelier_governance.audit import InMemoryAuditStore
+from codeatelier_governance.audit import AuditModule, InMemoryAuditStore
 from codeatelier_governance.loop import (
     LoopDetected,
     LoopModule,
@@ -58,7 +58,7 @@ async def test_window_expiry(loop: LoopModule) -> None:
     sid = uuid4()
     await loop.record_call("a", sid, "read_file")
     await loop.record_call("a", sid, "read_file")
-    # Wait for window to expire
+    # Genuine timing test: wait for the 1-second detection window to expire
     await asyncio.sleep(1.1)
     # These should be fine now -- old calls expired
     await loop.record_call("a", sid, "read_file")
@@ -67,7 +67,7 @@ async def test_window_expiry(loop: LoopModule) -> None:
 
 @pytest.mark.asyncio
 async def test_action_log_does_not_raise(
-    loop: LoopModule, audit_store: InMemoryAuditStore,
+    loop: LoopModule, audit_store: InMemoryAuditStore, audit: AuditModule,
 ) -> None:
     """action='log' should emit event but not raise."""
     loop.register(
@@ -78,8 +78,7 @@ async def test_action_log_does_not_raise(
     await loop.record_call("a", sid, "read_file")
     # This should NOT raise even though it exceeds threshold
     await loop.record_call("a", sid, "read_file")
-    # Wait for audit flush
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = [
         e
         for e in audit_store._events.values()
@@ -91,7 +90,7 @@ async def test_action_log_does_not_raise(
 
 @pytest.mark.asyncio
 async def test_audit_event_emitted_on_detection(
-    loop: LoopModule, audit_store: InMemoryAuditStore,
+    loop: LoopModule, audit_store: InMemoryAuditStore, audit: AuditModule,
 ) -> None:
     """Loop detection should emit a loop.detected audit event."""
     loop.register(LoopPolicy(agent_id="a", max_calls=2, window_seconds=60))
@@ -100,7 +99,7 @@ async def test_audit_event_emitted_on_detection(
     await loop.record_call("a", sid, "read_file")
     with pytest.raises(LoopDetected):
         await loop.record_call("a", sid, "read_file")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = [
         e
         for e in audit_store._events.values()

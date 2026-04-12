@@ -1014,8 +1014,67 @@ async def gates_recent(
         ]
 
 
+async def _check_self_approval(
+    conn: Any,
+    agent_id: str,
+    user_id: str,
+    request_id: UUID,
+) -> None:
+    """Enforce self-approval prevention on HITL gates.
+
+    Looks up the agent's operator_id from the presence table and compares
+    it to the authenticated console user. Three outcomes:
+
+    - operator_id matches user_id: raise 403 (blocked)
+    - operator_id is NULL: allow but log an audit warning
+    - operator_id differs from user_id: allow (verified safe)
+    """
+    res = await conn.execute(
+        text(
+            "SELECT operator_id FROM governance_agent_presence "
+            "WHERE agent_id = :agent_id"
+        ),
+        {"agent_id": agent_id},
+    )
+    presence_row = res.mappings().first()
+    operator_id = presence_row["operator_id"] if presence_row else None
+
+    if operator_id is not None and operator_id == user_id:
+        _logger.warning(
+            "console.self_approval_blocked",
+            agent_id=agent_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+        raise HTTPException(
+            403, "Cannot approve your own agent's requests."
+        )
+
+    if operator_id is None:
+        _logger.warning(
+            "console.self_approval_blocked_no_operator",
+            agent_id=agent_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+        raise HTTPException(
+            403,
+            "Cannot verify operator identity: agent has no operator_id set. "
+            "Register operator_id via sdk.presence.heartbeat(agent_id, operator_id=...) "
+            "before requesting HITL approval.",
+        )
+    else:
+        _logger.info(
+            "console.self_approval_check_passed",
+            agent_id=agent_id,
+            operator_id=operator_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+
+
 @app.post("/api/gates/{request_id}/grant", dependencies=[Depends(authenticate)])
-async def grant_gate(request_id: UUID) -> dict[str, Any]:
+async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     """Grant a pending approval gate request."""
     if not AUDIT_SECRET:
         raise HTTPException(
@@ -1025,6 +1084,7 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
     secret = AUDIT_SECRET.encode("utf-8")
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", None)
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -1038,6 +1098,10 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
         row = res.mappings().first()
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Self-approval prevention
+        if user_id is not None:
+            await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
         # Verify the HMAC signature on the token
         token_value = row["token"]
@@ -1081,7 +1145,7 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
 
 
 @app.post("/api/gates/{request_id}/deny", dependencies=[Depends(authenticate)])
-async def deny_gate(request_id: UUID) -> dict[str, Any]:
+async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     """Deny a pending approval gate request."""
     if not AUDIT_SECRET:
         raise HTTPException(
@@ -1091,6 +1155,7 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
     secret = AUDIT_SECRET.encode("utf-8")
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", None)
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -1104,6 +1169,10 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
         row = res.mappings().first()
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Self-approval prevention
+        if user_id is not None:
+            await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
         # Verify the HMAC signature on the token
         token_value = row["token"]

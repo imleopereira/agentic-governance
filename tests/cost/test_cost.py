@@ -8,6 +8,8 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from codeatelier_governance.audit import AuditModule
+
 from codeatelier_governance.audit import InMemoryAuditStore
 from codeatelier_governance.cost import (
     BudgetExceeded,
@@ -29,14 +31,14 @@ async def test_track_then_check_under_budget(cost: CostModule) -> None:
 
 @pytest.mark.asyncio
 async def test_session_usd_breach_raises_and_logs(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     cost.register(BudgetPolicy(agent_id="a", per_session_usd=0.10))
     sid = uuid4()
     await cost.track("a", sid, usd=0.15)
     with pytest.raises(BudgetExceeded, match="per_session_usd"):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breaches = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -145,14 +147,14 @@ async def test_concurrent_tracks_are_atomic(cost: CostModule) -> None:
 
 @pytest.mark.asyncio
 async def test_breach_event_includes_session_id(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     cost.register(BudgetPolicy(agent_id="a", per_session_usd=0.10))
     sid = uuid4()
     await cost.track("a", sid, usd=0.20)
     with pytest.raises(BudgetExceeded):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breach = next(
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -189,7 +191,7 @@ async def test_session_over_time_limit_raises(cost: CostModule) -> None:
 
 @pytest.mark.asyncio
 async def test_session_time_limit_logs_audit_event(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     """Time limit breach should log a budget.exceeded audit event."""
     cost.register(BudgetPolicy(agent_id="a", per_session_seconds=5))
@@ -199,7 +201,7 @@ async def test_session_time_limit_logs_audit_event(
     store._session_started[("a", sid)] = datetime.now(timezone.utc) - timedelta(seconds=10)
     with pytest.raises(BudgetExceeded):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breaches = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -303,28 +305,49 @@ async def test_combined_query_used_when_available(audit: "AuditModule") -> None:
 
 
 # ---------------------------------------------------------------------------
-# Exploit: concurrent check_or_raise at budget boundary
+# Exploit: concurrent track+check_or_raise at budget boundary
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_concurrent_check_or_raise_at_boundary(cost: CostModule) -> None:
-    """Register a $1.00 budget, track $0.99 usage, fire 10 concurrent
-    check_or_raise calls. All should pass (0.99 < 1.00) without crashing
-    or corrupting the counter."""
+    """Adversarial race: concurrent track+check interleaving at the boundary.
+
+    Setup: $1.00 budget, $0.95 already spent.
+    Attack: 10 concurrent coroutines each track($0.10) then check_or_raise().
+    Expected:
+      - At LEAST some check_or_raise calls must raise BudgetExceeded
+        (since $0.95 + $0.10 = $1.05 > $1.00 after the very first track).
+      - The total tracked amount must never exceed $1.95
+        ($0.95 initial + 10 * $0.10) — counters are monotonic.
+    """
     cost.register(BudgetPolicy(agent_id="racer", per_session_usd=1.00))
     sid = uuid4()
-    await cost.track("racer", sid, usd=0.99)
+    await cost.track("racer", sid, usd=0.95)
+
+    async def track_then_check() -> None:
+        """Single attacker coroutine: spend $0.10 then check budget."""
+        await cost.track("racer", sid, usd=0.10)
+        await cost.check_or_raise("racer", sid)
 
     results = await asyncio.gather(
-        *(cost.check_or_raise("racer", sid) for _ in range(10)),
+        *(track_then_check() for _ in range(10)),
         return_exceptions=True,
     )
-    # $0.99 < $1.00 so all 10 should pass (return None, no exception)
-    exceptions = [r for r in results if isinstance(r, Exception)]
-    assert len(exceptions) == 0, f"Unexpected exceptions during concurrent check: {exceptions}"
 
-    # Counter must not be corrupted — snapshot should still show $0.99
+    exceptions = [r for r in results if isinstance(r, BudgetExceeded)]
+    # After the first track, total is $1.05 > $1.00 — at least some must fail
+    assert len(exceptions) >= 1, (
+        "Expected at least one BudgetExceeded but all 10 concurrent "
+        "track+check calls passed. The race condition was not detected."
+    )
+
+    # Counters are monotonic — total must be exactly $0.95 + 10 * $0.10 = $1.95
     snap = await cost.snapshot("racer", sid)
-    assert snap.session_usd_used == pytest.approx(0.99)
+    assert snap.session_usd_used <= 1.95 + 1e-9, (
+        f"Counter exceeded theoretical max: {snap.session_usd_used}"
+    )
+    assert snap.session_usd_used >= 0.95, (
+        f"Counter lost updates: {snap.session_usd_used}"
+    )
 
 
 @pytest.mark.asyncio

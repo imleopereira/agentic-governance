@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from codeatelier_governance.audit import InMemoryAuditStore
+from codeatelier_governance.audit import AuditModule, InMemoryAuditStore
 from codeatelier_governance.scope import (
     PolicyNotRegistered,
     ScopeModule,
@@ -31,14 +31,14 @@ async def test_allowed_tool_passes(scope: ScopeModule) -> None:
 
 @pytest.mark.asyncio
 async def test_disallowed_tool_raises_and_logs(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     scope.register(
         ScopePolicy(agent_id="a", allowed_tools=frozenset({"read_invoice"}))
     )
     with pytest.raises(ScopeViolation):
         await scope.check(agent_id="a", tool="delete_customer")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = list(audit_store._events.values())  # type: ignore[attr-defined]
     violations = [e for e in events if e.kind == "scope.violation"]
     assert len(violations) == 1
@@ -48,11 +48,11 @@ async def test_disallowed_tool_raises_and_logs(
 
 @pytest.mark.asyncio
 async def test_unknown_agent_default_denies(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     with pytest.raises(PolicyNotRegistered):
         await scope.check(agent_id="ghost", tool="anything")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -176,7 +176,7 @@ async def test_decorator_rejects_sync_function(scope: ScopeModule) -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_checks_all_log_independently(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"x"})))
     # 20 concurrent denied calls
@@ -187,7 +187,7 @@ async def test_concurrent_checks_all_log_independently(
         )
     )
     assert all(isinstance(r, ScopeViolation) for r in results)
-    await asyncio.sleep(0.2)
+    await audit._writer.flush()
     violations = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
