@@ -416,7 +416,7 @@ class TestSelfApprovalPrevention:
 
         from fastapi import HTTPException
 
-        from codeatelier_governance.console.app import deny_gate
+        from codeatelier_governance.console.app import deny_gate, DenyRequest
 
         request_id = uuid4()
         agent_id = "my-agent"
@@ -436,7 +436,7 @@ class TestSelfApprovalPrevention:
              patch("codeatelier_governance.console.app.AUDIT_SECRET", "x" * 32), \
              patch("codeatelier_governance.console.app.audit_module", None):
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(deny_gate(request_id, request))
+                asyncio.run(deny_gate(request_id, DenyRequest(rationale="test deny"), request))
             assert exc_info.value.status_code == 403
             assert "Cannot approve" in str(exc_info.value.detail)
 
@@ -457,9 +457,10 @@ class TestSSEEndpointAuth:
         request.cookies.get.return_value = None
         request.headers.get.return_value = None
 
-        with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(stream_events(request, last_event_id=None))
-        assert exc_info.value.status_code == 401
+        with patch("codeatelier_governance.console.app.DEV_MODE", False):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(stream_events(request, last_event_id=None))
+            assert exc_info.value.status_code == 401
 
     def test_sse_accepts_token_header(self) -> None:
         """SSE endpoint should accept x-governance-token header."""
@@ -470,9 +471,10 @@ class TestSSEEndpointAuth:
 
         request = MagicMock()
         request.cookies.get.return_value = None
-        request.headers.get.return_value = "some-token"
+        # The new auth validates the token value against CONSOLE_TOKEN
+        request.headers.get.return_value = "Bearer test-secret-token"
 
-        with patch("codeatelier_governance.console.app.engine", None):
+        with patch("codeatelier_governance.console.app.engine", None),              patch("codeatelier_governance.console.app.CONSOLE_TOKEN", "test-secret-token"),              patch("codeatelier_governance.console.app.DEV_MODE", False):
             # With no engine, it should still return a StreamingResponse
             # (the generator will just sleep)
             result = asyncio.run(stream_events(request, last_event_id=None))

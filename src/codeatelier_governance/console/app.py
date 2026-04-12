@@ -17,15 +17,19 @@ Security constraints:
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
 import os
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
+import asyncpg  # type: ignore[import-untyped]
 import structlog
 
 try:
@@ -111,6 +115,24 @@ def _record_login_attempt(ip: str) -> None:
 # ---------------------------------------------------------------------------
 audit_module: AuditModule | None = None
 
+# ---------------------------------------------------------------------------
+# SSE: shared asyncpg LISTEN/NOTIFY state (per-worker, in-memory fan-out)
+# ---------------------------------------------------------------------------
+_SSE_QUEUE_MAX = 200           # drop oldest when a client queue exceeds this
+_SSE_HEARTBEAT_INTERVAL = 15   # seconds between keepalive / housekeeping ticks
+_SSE_REVALIDATE_INTERVAL = 30  # seconds between session re-validation checks
+_SSE_MAX_DURATION = 4 * 3600   # maximum SSE connection lifetime (4 hours)
+_SSE_REPLAY_CAP = 500          # max events replayed on Last-Event-ID reconnect
+_SSE_CLAIM_STALE_SECS = 300    # stale reviewer claim threshold: 5 minutes
+
+# client_id -> asyncio.Queue (str payload or None sentinel for revocation)
+_sse_clients: dict[str, asyncio.Queue[str | None]] = {}
+# session_cookie -> set[client_id] for instant server-side revocation
+_sse_session_map: dict[str, set[str]] = defaultdict(set)
+# background LISTEN task handle
+_sse_listen_task: asyncio.Task[None] | None = None
+
+
 
 def _normalize_url(url: str) -> str:
     if not url:
@@ -122,6 +144,130 @@ def _normalize_url(url: str) -> str:
     from ..utils import normalize_db_url
     return normalize_db_url(url, component="console")
 
+
+
+
+def _asyncpg_url(sqlalchemy_url: str) -> str:
+    """Convert SQLAlchemy asyncpg URL to raw asyncpg DSN.
+
+    asyncpg.connect() expects postgresql:// not postgresql+asyncpg://.
+    """
+    if sqlalchemy_url.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + sqlalchemy_url[len("postgresql+asyncpg://"):]
+    return sqlalchemy_url
+
+
+def _broadcast_sse(msg: str) -> None:
+    """Fan-out a message string to all connected SSE client queues.
+
+    Backpressure: if a queue exceeds _SSE_QUEUE_MAX, the oldest item is
+    dropped before enqueueing the new message.
+    """
+    for q in list(_sse_clients.values()):
+        if q.qsize() >= _SSE_QUEUE_MAX:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            pass
+
+
+def _revoke_sse_session(session_cookie: str) -> None:
+    """Signal all SSE connections for a session to close immediately.
+
+    Pushes None (sentinel) to every client queue for this session. The SSE
+    generator treats None as a shutdown signal and exits within one
+    queue-read timeout (~1 s), satisfying the security requirement that
+    revoked sessions close within 5 s.
+    """
+    client_ids = _sse_session_map.pop(session_cookie, set())
+    for client_id in client_ids:
+        q = _sse_clients.get(client_id)
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+
+
+async def _sse_listen_loop() -> None:
+    """Shared asyncpg LISTEN connection for SSE fan-out.
+
+    Runs for the lifetime of the worker process. Reconnects automatically
+    with exponential back-off (1s -> 60s) on connection failure.
+
+    Periodic housekeeping on every _SSE_HEARTBEAT_INTERVAL tick:
+      1. Stale claim release: NULL out reviewer_id/reviewing_since on gates
+         held > _SSE_CLAIM_STALE_SECS without resolution. The resulting
+         UPDATE fires gate_change_notify, broadcasting the state change to
+         all SSE clients via NOTIFY (no pg_cron required).
+      2. Heartbeat broadcast: sends keepalive to all client queues to
+         prevent proxy/LB connection timeouts.
+    """
+    global engine
+
+    backoff = 1.0
+    pg_conn: Any = None
+
+    while True:
+        try:
+            raw_url = _asyncpg_url(_normalize_url(DATABASE_URL))
+            pg_conn = await asyncpg.connect(raw_url)
+
+            def _on_notify(
+                conn: Any, pid: int, channel: str, payload: str
+            ) -> None:
+                msg = json.dumps({"channel": channel, "payload": payload})
+                _broadcast_sse(msg)
+
+            await pg_conn.add_listener("governance_events", _on_notify)
+            await pg_conn.add_listener("governance_gates", _on_notify)
+            await pg_conn.add_listener("governance_presence", _on_notify)
+
+            backoff = 1.0
+            _logger.info("sse.listen_connected")
+
+            while True:
+                await asyncio.sleep(_SSE_HEARTBEAT_INTERVAL)
+                _broadcast_sse(": keepalive")
+
+                if engine is not None:
+                    try:
+                        async with engine.begin() as conn:
+                            await conn.execute(
+                                text(
+                                    "UPDATE governance_gates_pending "
+                                    "SET reviewer_id = NULL, reviewing_since = NULL "
+                                    "WHERE reviewer_id IS NOT NULL "
+                                    "AND resolved_at IS NULL "
+                                    "AND reviewing_since < NOW() - "
+                                    "make_interval(secs => :stale_secs)"
+                                ),
+                                {"stale_secs": _SSE_CLAIM_STALE_SECS},
+                            )
+                    except Exception:
+                        _logger.warning(
+                            "sse.stale_claim_cleanup_failed", exc_info=False
+                        )
+
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            _logger.warning(
+                "sse.listen_reconnecting", backoff=backoff, exc_info=False
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+        finally:
+            if pg_conn is not None:
+                try:
+                    await pg_conn.close()
+                except Exception:
+                    pass
+                pg_conn = None
 
 def _redact_metadata(meta: dict[str, Any] | list[Any] | Any) -> Any:
     """Strip sensitive keys from metadata before serving to the frontend.
@@ -162,7 +308,7 @@ def _validate_cors_origins(origins: list[str]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
     _validate_cors_origins(CORS_ORIGINS)
-    global engine, audit_module
+    global engine, audit_module, _sse_listen_task
     engine = create_async_engine(
         _normalize_url(DATABASE_URL),
         pool_pre_ping=True,
@@ -182,7 +328,22 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
         except ValueError:
             _logger.warning("console.audit_module_init_skipped_weak_secret")
             audit_module = None
+
+    # Start shared asyncpg LISTEN loop for SSE fan-out
+    if DATABASE_URL:
+        _sse_listen_task = asyncio.create_task(_sse_listen_loop())
+
     yield
+
+    # Graceful shutdown: cancel the LISTEN task first
+    if _sse_listen_task is not None:
+        _sse_listen_task.cancel()
+        try:
+            await _sse_listen_task
+        except asyncio.CancelledError:
+            pass
+        _sse_listen_task = None
+
     if audit_module is not None:
         await audit_module.close()
     if engine is not None:
@@ -312,29 +473,38 @@ async def health() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# SSE: real-time event stream
+# SSE: real-time event stream (asyncpg LISTEN/NOTIFY + asyncio.Queue fan-out)
 # ---------------------------------------------------------------------------
 @app.get("/api/stream/events")
 async def stream_events(
     request: Request,
     last_event_id: str | None = Query(None),
 ) -> Any:
-    """Server-Sent Events endpoint for real-time audit events, gate changes,
-    and presence updates.
+    """Server-Sent Events endpoint: audit events, gate changes, presence updates.
 
-    Polls the database every 2 seconds for new events. The client sends
-    ``last_event_id`` (chain_seq) on reconnect for replay.
+    Architecture: one shared asyncpg LISTEN connection per worker (started in
+    lifespan). Each connecting client registers an asyncio.Queue. The shared
+    LISTEN callback fans out NOTIFY payloads to all queues simultaneously.
 
-    Auth: same session cookie as all other endpoints.
+    Auth: session cookie (same as all other endpoints). Re-validated every
+    30 s. Maximum connection duration: 4 hours (forced reconnect thereafter).
+    On server-side session revocation, the connection closes within 1 s.
+
+    Reconnect: client sends Last-Event-ID (chain_seq of last seen audit event).
+    Server replays up to _SSE_REPLAY_CAP missed events from governance_audit_events.
+
+    Backpressure: if a client queue exceeds _SSE_QUEUE_MAX items, the oldest
+    is dropped. Heartbeat: keepalive comment every _SSE_HEARTBEAT_INTERVAL s.
     """
     from starlette.responses import StreamingResponse
 
-    # Validate session (reuse the authenticate dependency logic)
     session_cookie = request.cookies.get("governance_session")
-    token_header = request.headers.get("x-governance-token")
-    if not session_cookie and not token_header:
-        raise HTTPException(401, "Authentication required for SSE stream.")
+    if not session_cookie and not DEV_MODE:
+        token_header = request.headers.get("x-governance-token", "")
+        if not (CONSOLE_TOKEN and token_header == f"Bearer {CONSOLE_TOKEN}"):
+            raise HTTPException(401, "Authentication required for SSE stream.")
 
+    # Initial session validation before opening the stream
     if session_cookie and engine is not None:
         async with engine.connect() as conn:
             res = await conn.execute(
@@ -346,117 +516,123 @@ async def stream_events(
                 {"sid": session_cookie},
             )
             if res.first() is None:
-                raise HTTPException(401, "Session expired.")
+                raise HTTPException(401, "Session expired or revoked.")
+
+    client_id = str(uuid4())
+    q: asyncio.Queue[str | None] = asyncio.Queue()
+    _sse_clients[client_id] = q
+    if session_cookie:
+        _sse_session_map[session_cookie].add(client_id)
 
     async def event_generator() -> Any:
-        """Yield SSE events by polling governance tables."""
-        import asyncio
-        import json
+        """Yield SSE events from the fan-out queue plus initial replay."""
+        try:
+            start_time = time.monotonic()
+            last_revalidate = time.monotonic()
 
-        last_seq: int | None = None
-        if last_event_id:
-            try:
-                last_seq = int(last_event_id)
-            except ValueError:
-                last_seq = None
-
-        revalidate_counter = 0
-
-        while True:
-            if await request.is_disconnected():
-                break
-
-            # Re-validate session every 15 iterations (~30s at 2s interval)
-            revalidate_counter += 1
-            if revalidate_counter >= 15 and session_cookie and engine is not None:
-                revalidate_counter = 0
-                async with engine.connect() as conn:
-                    res = await conn.execute(
-                        text(
-                            "SELECT 1 FROM governance_console_sessions "
-                            "WHERE session_id = :sid AND expires_at > NOW() "
-                            "AND revoked = FALSE"
-                        ),
-                        {"sid": session_cookie},
-                    )
-                    if res.first() is None:
-                        break
-
-            if engine is None:
-                await asyncio.sleep(2)
-                continue
-
-            try:
-                async with engine.connect() as conn:
-                    # Fetch new audit events
-                    if last_seq is not None:
-                        q = text(
-                            "SELECT event_id, agent_id, session_id, kind, "
-                            "model, metadata_json AS metadata, created_at, chain_seq "
-                            "FROM governance_audit_events "
-                            "WHERE chain_seq > :seq "
-                            "ORDER BY chain_seq ASC LIMIT 100"
-                        )
-                        res = await conn.execute(q, {"seq": last_seq})
-                    else:
-                        q = text(
-                            "SELECT event_id, agent_id, session_id, kind, "
-                            "model, metadata_json AS metadata, created_at, chain_seq "
-                            "FROM governance_audit_events "
-                            "ORDER BY chain_seq DESC LIMIT 20"
-                        )
-                        res = await conn.execute(q)
-
-                    rows = res.mappings().all()
-                    if not last_seq:
-                        rows = list(reversed(rows))
-
-                    for row in rows:
-                        meta = row["metadata"]
-                        if isinstance(meta, str):
-                            try:
-                                meta = json.loads(meta)
-                            except (json.JSONDecodeError, TypeError):
-                                meta = {}
-                        safe_meta = _redact_metadata(meta) if meta else {}
-                        evt = {
-                            "event_id": str(row["event_id"]),
-                            "agent_id": row["agent_id"],
-                            "session_id": str(row["session_id"]) if row["session_id"] else None,
-                            "kind": row["kind"],
-                            "model": row.get("model"),
-                            "metadata": safe_meta,
-                            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                            "chain_seq": row["chain_seq"],
-                        }
-                        seq = row["chain_seq"]
-                        data = json.dumps(evt)
-                        yield f"id: {seq}\nevent: audit\ndata: {data}\n\n"
-                        last_seq = seq
-
-                    # Fetch presence changes
-                    async with engine.connect() as conn2:
-                        pres_res = await conn2.execute(
+            # Replay missed events when client reconnects with Last-Event-ID
+            if last_event_id and engine is not None:
+                try:
+                    last_seq = int(last_event_id)
+                    async with engine.connect() as conn:
+                        res = await conn.execute(
                             text(
-                                "SELECT agent_id, status, last_heartbeat "
-                                "FROM governance_agent_presence "
-                                "ORDER BY last_heartbeat DESC LIMIT 10"
-                            )
+                                "SELECT event_id, agent_id, session_id, kind, "
+                                "created_at, chain_seq "
+                                "FROM governance_audit_events "
+                                "WHERE chain_seq > :seq "
+                                "ORDER BY chain_seq ASC "
+                                "LIMIT :cap"
+                            ),
+                            {"seq": last_seq, "cap": _SSE_REPLAY_CAP},
                         )
-                        for prow in pres_res.mappings().all():
-                            pevt = {
-                                "agent_id": prow["agent_id"],
-                                "status": prow["status"],
-                                "last_heartbeat": prow["last_heartbeat"].isoformat() if prow["last_heartbeat"] else None,
+                        for row in res.mappings():
+                            evt = {
+                                "event_id": str(row["event_id"]),
+                                "agent_id": row["agent_id"],
+                                "session_id": str(row["session_id"])
+                                if row["session_id"] else None,
+                                "kind": row["kind"],
+                                "chain_seq": row["chain_seq"],
+                                "created_at": row["created_at"].isoformat()
+                                if row["created_at"] else None,
                             }
-                            yield f"event: presence\ndata: {json.dumps(pevt)}\n\n"
+                            seq = row["chain_seq"]
+                            yield f"id: {seq}\nevent: audit\ndata: {json.dumps(evt)}\n\n"
+                except (ValueError, Exception):
+                    pass
 
-            except Exception:
-                _logger.warning("sse.poll_error", exc_info=False)
+            while True:
+                if time.monotonic() - start_time > _SSE_MAX_DURATION:
+                    _logger.info("sse.max_duration_reached", client_id=client_id)
+                    break
 
-            # Keepalive
-            yield ": keepalive\n\n"
-            await asyncio.sleep(2)
+                if await request.is_disconnected():
+                    break
+
+                if (
+                    time.monotonic() - last_revalidate > _SSE_REVALIDATE_INTERVAL
+                    and session_cookie
+                    and engine is not None
+                ):
+                    last_revalidate = time.monotonic()
+                    async with engine.connect() as conn:
+                        res = await conn.execute(
+                            text(
+                                "SELECT 1 FROM governance_console_sessions "
+                                "WHERE session_id = :sid AND expires_at > NOW() "
+                                "AND revoked = FALSE"
+                            ),
+                            {"sid": session_cookie},
+                        )
+                        if res.first() is None:
+                            _logger.info("sse.session_expired", client_id=client_id)
+                            break
+
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+
+                if msg is None:
+                    break
+
+                if msg == ": keepalive":
+                    yield ": keepalive\n\n"
+                    continue
+
+                try:
+                    envelope = json.loads(msg)
+                    channel = envelope.get("channel", "")
+                    payload_str = envelope.get("payload", "{}")
+
+                    if channel == "governance_events":
+                        event_type = "audit"
+                        payload_data = json.loads(payload_str)
+                        event_id_str = str(payload_data.get("chain_seq", ""))
+                    elif channel == "governance_gates":
+                        event_type = "gate"
+                        payload_data = json.loads(payload_str)
+                        event_id_str = "gate-" + str(payload_data.get("request_id", ""))
+                    elif channel == "governance_presence":
+                        event_type = "presence"
+                        payload_data = json.loads(payload_str)
+                        event_id_str = "presence-" + str(payload_data.get("agent_id", ""))
+                    else:
+                        continue
+
+                    yield (
+                        f"id: {event_id_str}\n"
+                        f"event: {event_type}\n"
+                        f"data: {json.dumps(payload_data)}\n\n"
+                    )
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    _logger.warning("sse.malformed_payload", exc_info=False)
+
+        finally:
+            _sse_clients.pop(client_id, None)
+            if session_cookie:
+                _sse_session_map.get(session_cookie, set()).discard(client_id)
 
     return StreamingResponse(
         event_generator(),
@@ -557,6 +733,8 @@ async def logout(request: Request) -> JSONResponse:
                 ),
                 {"sid": session_cookie},
             )
+        # Signal all SSE connections for this session to close within 1 s
+        _revoke_sse_session(session_cookie)
     response = JSONResponse(content={"ok": True})
     response.delete_cookie(key="governance_session", path="/api")
     return response
@@ -719,6 +897,8 @@ async def revoke_session(session_id: UUID) -> dict[str, Any]:
         )
         if res.rowcount == 0:
             raise HTTPException(404, "Session not found or already revoked.")
+    # Signal all SSE connections for this session to close within 1 s
+    _revoke_sse_session(str(session_id))
     return {"ok": True, "session_id": str(session_id)}
 
 
@@ -956,7 +1136,7 @@ async def gates_pending() -> list[dict[str, Any]]:
         res = await conn.execute(
             text(
                 "SELECT request_id, agent_id, kind, action_hash, "
-                "created_at, expires_at "
+                "created_at, expires_at, reviewer_id, reviewing_since "
                 "FROM governance_gates_pending "
                 "WHERE resolved_at IS NULL "
                 "ORDER BY created_at DESC"
@@ -969,11 +1149,13 @@ async def gates_pending() -> list[dict[str, Any]]:
                 "kind": row["kind"],
                 "action_hash": row["action_hash"],
                 "created_at": row["created_at"].isoformat()
-                if row["created_at"]
-                else None,
+                if row["created_at"] else None,
                 "expires_at": row["expires_at"].isoformat()
-                if row["expires_at"]
-                else None,
+                if row["expires_at"] else None,
+                "reviewer_id": str(row["reviewer_id"])
+                if row["reviewer_id"] else None,
+                "reviewing_since": row["reviewing_since"].isoformat()
+                if row.get("reviewing_since") else None,
             }
             for row in res.mappings()
         ]
@@ -1089,7 +1271,7 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
         # Read the pending gate row
         res = await conn.execute(
             text(
-                "SELECT request_id, agent_id, kind, token, action_hash "
+                "SELECT request_id, agent_id, kind, token, action_hash, reviewer_id "
                 "FROM governance_gates_pending "
                 "WHERE request_id = :rid AND resolved_at IS NULL"
             ),
@@ -1099,9 +1281,19 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
 
-        # Self-approval prevention
+        # Self-approval prevention (fail-closed on missing operator_id)
         if user_id is not None:
             await _check_self_approval(conn, row["agent_id"], user_id, request_id)
+
+        # Claim enforcement: if claimed, acting user must be the claimant
+        reviewer_id = row.get("reviewer_id")
+        if reviewer_id is not None and user_id is not None:
+            if str(reviewer_id) != user_id:
+                raise HTTPException(
+                    403,
+                    "Gate is claimed by another reviewer. "
+                    "Wait for the reviewer to act or for the claim to expire.",
+                )
 
         # Verify the HMAC signature on the token
         token_value = row["token"]
@@ -1137,6 +1329,7 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
                 metadata={
                     "request_id": str(request_id),
                     "gate_kind": row["kind"],
+                    "granted_by": user_id,
                 },
             )
         )
@@ -1144,9 +1337,32 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     return {"ok": True, "request_id": str(request_id), "resolution": "granted"}
 
 
+
+class DenyRequest(BaseModel):
+    """Deny gate request body."""
+
+    model_config = ConfigDict(strict=True)
+
+    rationale: str = Field(
+        min_length=1,
+        max_length=2000,
+        description=(
+            "Plain-text reason for denial. Stored in the HMAC-chained audit event "
+            "and in the gate row. Never rendered as HTML."
+        ),
+    )
+
+
 @app.post("/api/gates/{request_id}/deny", dependencies=[Depends(authenticate)])
-async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
-    """Deny a pending approval gate request."""
+async def deny_gate(
+    request_id: UUID, body: DenyRequest, request: Request
+) -> dict[str, Any]:
+    """Deny a pending approval gate request. Requires a rationale.
+
+    The rationale is stored as plain text in:
+      1. governance_gates_pending.rationale (mutable column for display)
+      2. The HMAC-chained audit event metadata (immutable, tamper-evident)
+    """
     if not AUDIT_SECRET:
         raise HTTPException(
             500,
@@ -1157,10 +1373,9 @@ async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     user_id = getattr(request.state, "user_id", None)
     async with engine.begin() as conn:
-        # Read the pending gate row
         res = await conn.execute(
             text(
-                "SELECT request_id, agent_id, kind, token, action_hash "
+                "SELECT request_id, agent_id, kind, token, action_hash, reviewer_id "
                 "FROM governance_gates_pending "
                 "WHERE request_id = :rid AND resolved_at IS NULL"
             ),
@@ -1170,11 +1385,18 @@ async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
 
-        # Self-approval prevention
         if user_id is not None:
             await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
-        # Verify the HMAC signature on the token
+        reviewer_id = row.get("reviewer_id")
+        if reviewer_id is not None and user_id is not None:
+            if str(reviewer_id) != user_id:
+                raise HTTPException(
+                    403,
+                    "Gate is claimed by another reviewer. "
+                    "Wait for the reviewer to act or for the claim to expire.",
+                )
+
         token_value = row["token"]
         if token_value:
             expected = hmac.new(
@@ -1184,17 +1406,21 @@ async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
-        # Resolve the gate as denied
         await conn.execute(
             text(
                 "UPDATE governance_gates_pending "
-                "SET resolved_at = :now, resolution = :resolution "
+                "SET resolved_at = :now, resolution = :resolution, "
+                "rationale = :rationale "
                 "WHERE request_id = :rid AND resolved_at IS NULL"
             ),
-            {"now": now, "resolution": "denied", "rid": str(request_id)},
+            {
+                "now": now,
+                "resolution": "denied",
+                "rationale": body.rationale,
+                "rid": str(request_id),
+            },
         )
 
-    # Audit event via SDK — part of the HMAC chain
     if audit_module is not None:
         session_id = UUID(
             hashlib.md5(str(request_id).encode("utf-8")).hexdigest()
@@ -1207,6 +1433,8 @@ async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
                 metadata={
                     "request_id": str(request_id),
                     "gate_kind": row["kind"],
+                    "denied_by": user_id,
+                    "rationale": body.rationale,
                 },
             )
         )
@@ -1516,3 +1744,470 @@ async def agent_presence() -> list[dict[str, Any]]:
             exc_type=type(exc).__name__,
         )
         return []
+
+# ---------------------------------------------------------------------------
+# New endpoint: Agent kill switch
+# ---------------------------------------------------------------------------
+class KillRequest(BaseModel):
+    """Kill-switch request body."""
+
+    model_config = ConfigDict(strict=True)
+
+    reason: str = Field(
+        min_length=1,
+        max_length=2000,
+        description="Required: why the agent is being killed.",
+    )
+
+
+@app.post(
+    "/api/agents/{agent_id}/kill",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def kill_agent(
+    agent_id: str, body: KillRequest, request: Request
+) -> dict[str, Any]:
+    """Kill (halt) an agent -- admin only. Audit-logged. Requires reason.
+
+    Sets the agent's presence status to unresponsive and records kill
+    metadata in metadata_json. Process termination is the host's responsibility.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", "unknown")
+    now = datetime.now(timezone.utc)
+
+    async with engine.begin() as conn:
+        res = await conn.execute(
+            text("SELECT agent_id FROM governance_agent_presence WHERE agent_id = :aid"),
+            {"aid": agent_id},
+        )
+        if res.first() is None:
+            raise HTTPException(404, "Agent not found in presence table.")
+
+        kill_meta = json.dumps({
+            "_killed_by": user_id,
+            "_killed_at": now.isoformat(),
+            "_kill_reason": body.reason,
+        })
+        await conn.execute(
+            text(
+                "UPDATE governance_agent_presence "
+                "SET status = 'unresponsive', "
+                "    metadata_json = COALESCE(metadata_json, '{}'::jsonb) "
+                "                    || :meta::jsonb "
+                "WHERE agent_id = :aid"
+            ),
+            {"aid": agent_id, "meta": kill_meta},
+        )
+
+    if audit_module is not None:
+        session_id = UUID(
+            hashlib.md5(("kill:" + agent_id + ":" + now.isoformat()).encode()).hexdigest()
+        )
+        await audit_module.log(
+            AuditEvent(
+                agent_id=agent_id,
+                session_id=session_id,
+                kind="agent.killed",
+                metadata={
+                    "killed_by": user_id,
+                    "reason": body.reason,
+                    "killed_at": now.isoformat(),
+                },
+            )
+        )
+
+    _logger.info("console.agent_killed", agent_id=agent_id, killed_by=user_id)
+    return {"ok": True, "agent_id": agent_id, "action": "killed", "killed_at": now.isoformat()}
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: Event stats
+# ---------------------------------------------------------------------------
+@app.get("/api/events/stats", dependencies=[Depends(authenticate)])
+async def event_stats() -> dict[str, Any]:
+    """Event counts for the last hour, grouped by kind.
+
+    Returns total_last_hour, per_kind_counts, events_per_minute (rolling 5 min).
+    Query timeout: 2 s to prevent slow COUNT queries from blocking the pool.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(text("SET LOCAL statement_timeout = '2000'"))
+            res = await conn.execute(
+                text(
+                    "SELECT kind, COUNT(*) AS cnt "
+                    "FROM governance_audit_events "
+                    "WHERE created_at >= NOW() - INTERVAL '1 hour' "
+                    "GROUP BY kind"
+                )
+            )
+            per_kind: dict[str, int] = {
+                row["kind"]: int(row["cnt"]) for row in res.mappings()
+            }
+            res2 = await conn.execute(
+                text(
+                    "SELECT COUNT(*) AS cnt "
+                    "FROM governance_audit_events "
+                    "WHERE created_at >= NOW() - INTERVAL '5 minutes'"
+                )
+            )
+            five_min_row = res2.first()
+            five_min_count = int(five_min_row[0]) if five_min_row else 0
+        return {
+            "total_last_hour": sum(per_kind.values()),
+            "per_kind_counts": per_kind,
+            "events_per_minute": five_min_count / 5.0,
+        }
+    except Exception:
+        _logger.warning("console.event_stats_failed", exc_info=False)
+        raise HTTPException(503, "Event stats temporarily unavailable.") from None
+
+# ---------------------------------------------------------------------------
+# New endpoint: Gate rich context
+# ---------------------------------------------------------------------------
+@app.get("/api/gates/{request_id}/context", dependencies=[Depends(authenticate)])
+async def gate_context(request_id: UUID) -> dict[str, Any]:
+    """Rich context for an approval decision.
+
+    Returns gate record, agent presence, recent agent events (last 10),
+    agent cost today, and risk level derived from payload_json.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT request_id, agent_id, kind, action_hash, "
+                "created_at, expires_at, resolved_at, resolution, "
+                "payload_json, reviewer_id, reviewing_since, rationale "
+                "FROM governance_gates_pending WHERE request_id = :rid"
+            ),
+            {"rid": str(request_id)},
+        )
+        row = res.mappings().first()
+        if not row:
+            raise HTTPException(404, "Gate request not found.")
+
+        agent_id = row["agent_id"]
+
+        pres_res = await conn.execute(
+            text(
+                "SELECT agent_id, status, last_heartbeat "
+                "FROM governance_agent_presence WHERE agent_id = :aid"
+            ),
+            {"aid": agent_id},
+        )
+        pres_row = pres_res.mappings().first()
+
+        events_res = await conn.execute(
+            text(
+                "SELECT kind, created_at FROM governance_audit_events "
+                "WHERE agent_id = :aid ORDER BY created_at DESC LIMIT 10"
+            ),
+            {"aid": agent_id},
+        )
+        recent_events = [
+            {
+                "kind": r["kind"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in events_res.mappings()
+        ]
+
+        cost_res = await conn.execute(
+            text(
+                "SELECT usd_used FROM governance_cost_agent_daily "
+                "WHERE agent_id = :aid AND day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"
+            ),
+            {"aid": agent_id},
+        )
+        cost_row = cost_res.first()
+
+    payload = row["payload_json"] or {}
+    risk = payload.get("risk", "UNKNOWN") if isinstance(payload, dict) else "UNKNOWN"
+
+    return {
+        "request_id": str(row["request_id"]),
+        "agent_id": agent_id,
+        "kind": row["kind"],
+        "action_hash": row["action_hash"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
+        "resolved_at": row["resolved_at"].isoformat() if row["resolved_at"] else None,
+        "resolution": row["resolution"],
+        "reviewer_id": str(row["reviewer_id"]) if row["reviewer_id"] else None,
+        "reviewing_since": row["reviewing_since"].isoformat()
+        if row.get("reviewing_since") else None,
+        "rationale": row.get("rationale"),
+        "payload": _redact_metadata(payload if isinstance(payload, dict) else {}),
+        "risk": risk,
+        "agent_presence": {
+            "status": pres_row["status"],
+            "last_heartbeat": pres_row["last_heartbeat"].isoformat()
+            if pres_row["last_heartbeat"] else None,
+        } if pres_row else None,
+        "recent_agent_events": recent_events,
+        "agent_cost_today_usd": float(cost_row[0]) if cost_row else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: Reviewer claim
+# ---------------------------------------------------------------------------
+@app.post("/api/gates/{request_id}/claim", dependencies=[Depends(authenticate)])
+async def claim_gate(request_id: UUID, request: Request) -> dict[str, Any]:
+    """Claim a pending gate for review. Atomic: only succeeds if unclaimed.
+
+    Uses UPDATE ... WHERE reviewer_id IS NULL to prevent double-claim
+    across concurrent requests (Security review Item 5).
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(403, "Cannot determine reviewer identity.")
+
+    reviewer_uuid: UUID | None = None
+    if user_id not in ("dev", "legacy-token"):
+        try:
+            reviewer_uuid = UUID(user_id)
+        except ValueError:
+            raise HTTPException(403, "Reviewer identity is not a valid UUID.") from None
+
+    now = datetime.now(timezone.utc)
+    async with engine.begin() as conn:
+        check_res = await conn.execute(
+            text(
+                "SELECT resolved_at, reviewer_id FROM governance_gates_pending "
+                "WHERE request_id = :rid"
+            ),
+            {"rid": str(request_id)},
+        )
+        check_row = check_res.mappings().first()
+        if not check_row:
+            raise HTTPException(404, "Gate request not found.")
+        if check_row["resolved_at"] is not None:
+            raise HTTPException(409, "Gate is already resolved.")
+
+        if reviewer_uuid is not None:
+            update_res = await conn.execute(
+                text(
+                    "UPDATE governance_gates_pending "
+                    "SET reviewer_id = :uid, reviewing_since = :now "
+                    "WHERE request_id = :rid "
+                    "AND reviewer_id IS NULL AND resolved_at IS NULL "
+                    "RETURNING request_id"
+                ),
+                {"uid": str(reviewer_uuid), "now": now, "rid": str(request_id)},
+            )
+            if not update_res.first():
+                raise HTTPException(409, "Gate is already claimed by another reviewer.")
+
+    return {
+        "ok": True,
+        "request_id": str(request_id),
+        "reviewer_id": str(reviewer_uuid) if reviewer_uuid else user_id,
+        "reviewing_since": now.isoformat(),
+    }
+
+# ---------------------------------------------------------------------------
+# New endpoint: Escalate gate
+# ---------------------------------------------------------------------------
+class EscalateRequest(BaseModel):
+    """Escalate gate request body."""
+
+    model_config = ConfigDict(strict=True)
+
+    escalate_to: str = Field(
+        min_length=1, max_length=256, description="User ID or role to escalate to."
+    )
+
+
+@app.post("/api/gates/{request_id}/escalate", dependencies=[Depends(authenticate)])
+async def escalate_gate(
+    request_id: UUID, body: EscalateRequest, request: Request
+) -> dict[str, Any]:
+    """Escalate a pending gate to another reviewer.
+
+    Releases the current claim and records escalation metadata in payload_json.
+    The resulting UPDATE fires gate_change_notify, broadcasting to SSE clients.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", "unknown")
+    now = datetime.now(timezone.utc)
+
+    async with engine.begin() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT request_id, resolved_at, payload_json "
+                "FROM governance_gates_pending WHERE request_id = :rid"
+            ),
+            {"rid": str(request_id)},
+        )
+        row = res.mappings().first()
+        if not row:
+            raise HTTPException(404, "Gate request not found.")
+        if row["resolved_at"] is not None:
+            raise HTTPException(409, "Gate is already resolved.")
+
+        existing_payload = row["payload_json"] or {}
+        if not isinstance(existing_payload, dict):
+            existing_payload = {}
+        existing_payload["escalated_by"] = user_id
+        existing_payload["escalated_to"] = body.escalate_to
+        existing_payload["escalated_at"] = now.isoformat()
+
+        import json as _json
+        await conn.execute(
+            text(
+                "UPDATE governance_gates_pending "
+                "SET payload_json = :payload::jsonb, "
+                "    reviewer_id = NULL, reviewing_since = NULL "
+                "WHERE request_id = :rid AND resolved_at IS NULL"
+            ),
+            {"payload": _json.dumps(existing_payload), "rid": str(request_id)},
+        )
+
+    _logger.info(
+        "console.gate_escalated",
+        request_id=str(request_id),
+        escalated_by=user_id,
+        escalated_to=body.escalate_to,
+    )
+    return {
+        "ok": True,
+        "request_id": str(request_id),
+        "escalated_to": body.escalate_to,
+        "escalated_at": now.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# New endpoint: Batch approve
+# ---------------------------------------------------------------------------
+_BATCH_APPROVE_MAX = 50
+
+
+class BatchApproveRequest(BaseModel):
+    """Batch approve request body."""
+
+    model_config = ConfigDict(strict=True)
+
+    request_ids: list[UUID] = Field(
+        min_length=1,
+        max_length=_BATCH_APPROVE_MAX,
+        description=f"Gate request IDs to approve. Hard cap: {_BATCH_APPROVE_MAX}.",
+    )
+
+
+@app.post(
+    "/api/gates/batch-approve",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def batch_approve(body: BatchApproveRequest, request: Request) -> dict[str, Any]:
+    """Batch approve up to 50 LOW-risk gates. Admin only.
+
+    Security: hard cap 50, server-side risk re-verify, individual audit events,
+    self-approval prevention, claim enforcement per gate.
+    """
+    if len(body.request_ids) > _BATCH_APPROVE_MAX:
+        raise HTTPException(400, f"Batch size cannot exceed {_BATCH_APPROVE_MAX}.")
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    if not AUDIT_SECRET:
+        raise HTTPException(500, "GOVERNANCE_AUDIT_SECRET env var required for gate operations.")
+
+    user_id = getattr(request.state, "user_id", None)
+    approved: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for rid in body.request_ids:
+        try:
+            async with engine.begin() as conn:
+                res = await conn.execute(
+                    text(
+                        "SELECT request_id, agent_id, kind, "
+                        "payload_json, resolved_at, reviewer_id "
+                        "FROM governance_gates_pending WHERE request_id = :rid"
+                    ),
+                    {"rid": str(rid)},
+                )
+                row = res.mappings().first()
+                if not row:
+                    failed.append({"request_id": str(rid), "reason": "not_found"})
+                    continue
+                if row["resolved_at"] is not None:
+                    failed.append({"request_id": str(rid), "reason": "already_resolved"})
+                    continue
+
+                payload = row["payload_json"] or {}
+                risk = payload.get("risk", "UNKNOWN") if isinstance(payload, dict) else "UNKNOWN"
+                if risk != "LOW":
+                    failed.append({
+                        "request_id": str(rid),
+                        "reason": f"risk_{risk}_not_eligible_for_batch",
+                    })
+                    continue
+
+                if user_id is not None:
+                    try:
+                        await _check_self_approval(conn, row["agent_id"], user_id, rid)
+                    except HTTPException:
+                        failed.append({"request_id": str(rid), "reason": "self_approval_blocked"})
+                        continue
+
+                reviewer_id = row.get("reviewer_id")
+                if reviewer_id is not None and user_id is not None:
+                    if str(reviewer_id) != user_id:
+                        failed.append({"request_id": str(rid), "reason": "claimed_by_other_reviewer"})
+                        continue
+
+                now = datetime.now(timezone.utc)
+                await conn.execute(
+                    text(
+                        "UPDATE governance_gates_pending "
+                        "SET resolved_at = :now, resolution = 'granted' "
+                        "WHERE request_id = :rid AND resolved_at IS NULL"
+                    ),
+                    {"now": now, "rid": str(rid)},
+                )
+
+            if audit_module is not None:
+                session_id = UUID(hashlib.md5(str(rid).encode("utf-8")).hexdigest())
+                await audit_module.log(
+                    AuditEvent(
+                        agent_id=row["agent_id"],
+                        session_id=session_id,
+                        kind="approval.granted.batch",
+                        metadata={
+                            "request_id": str(rid),
+                            "gate_kind": row["kind"],
+                            "approved_by": user_id,
+                        },
+                    )
+                )
+
+            approved.append(str(rid))
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _logger.warning(
+                "console.batch_approve_item_failed",
+                request_id=str(rid),
+                exc_type=type(exc).__name__,
+            )
+            failed.append({"request_id": str(rid), "reason": "internal_error"})
+
+    return {
+        "ok": True,
+        "approved": approved,
+        "failed": failed,
+        "approved_count": len(approved),
+        "failed_count": len(failed),
+    }
