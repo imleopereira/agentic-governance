@@ -233,9 +233,16 @@ def test_filter_tools_no_hidden_returns_full_list(scope: ScopeModule) -> None:
     assert scope.filter_tools("a", tools) == tools
 
 
-def test_filter_tools_no_policy_returns_full_list(scope: ScopeModule) -> None:
-    """Unknown agent gets the full list (no filtering)."""
-    assert scope.filter_tools("unknown", ["a", "b"]) == ["a", "b"]
+def test_filter_tools_no_policy_raises(scope: ScopeModule) -> None:
+    """Unknown agent fails closed with PolicyNotRegistered (v0.5.1 fix).
+
+    Prior to v0.5.1 this method returned the full tool list unchanged
+    when no policy was registered — an unintentional bypass that let
+    ``hidden_tools`` leak to unregistered agents.  The fix mirrors
+    ``check()``'s default-deny contract.
+    """
+    with pytest.raises(PolicyNotRegistered):
+        scope.filter_tools("unknown", ["a", "b"])
 
 
 @pytest.mark.asyncio

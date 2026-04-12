@@ -182,7 +182,28 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                         else ""
                         for t in tools
                     ]
-                    filtered = self._sdk.scope.filter_tools(self._agent_id, tool_names)
+                    # filter_tools raises PolicyNotRegistered for unknown
+                    # agents (v0.5.1 fail-closed).  Handle that explicitly
+                    # so the broad except below does not silently pass the
+                    # unfiltered tool list through to the LLM.
+                    from ..scope.errors import PolicyNotRegistered
+                    try:
+                        filtered = self._sdk.scope.filter_tools(
+                            self._agent_id, tool_names
+                        )
+                    except PolicyNotRegistered:
+                        logger.warning(
+                            "governance.langchain_handler.scope_not_registered",
+                            agent_id=self._agent_id,
+                            detail=(
+                                "No scope policy registered for this "
+                                "agent.  Fail-closed: removing ALL tools "
+                                "from the LLM invocation."
+                            ),
+                        )
+                        invocation_params["tools"] = []
+                        filtered = []
+                        tool_names = []
                     if len(filtered) < len(tool_names):
                         hidden = set(tool_names) - set(filtered)
                         invocation_params["tools"] = [

@@ -3,11 +3,13 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from .audit.models import AuditEvent
 from .contracts.errors import ContractViolation
+from .errors import GovernanceError
 from .contracts.models import Contract, PostCondition, PreCondition
 from .cost.models import BudgetPolicy
 from .loop.errors import LoopDetected
 from .loop.models import LoopPolicy
 from .presence.models import AgentStatus
+from .routing.models import RoutingPolicy
 from .scope.models import ScopePolicy
 from .sdk import GovernanceConfig, GovernanceSDK
 from .sync import GovernanceSDKSync
@@ -25,12 +27,14 @@ __all__ = [
     "Contract",
     "ContractViolation",
     "GovernanceConfig",
+    "GovernanceError",
     "GovernanceSDK",
     "GovernanceSDKSync",
     "LoopDetected",
     "LoopPolicy",
     "PostCondition",
     "PreCondition",
+    "RoutingPolicy",
     "ScopePolicy",
     "__version__",
 ]

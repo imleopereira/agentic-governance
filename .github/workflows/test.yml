@@ -97,10 +97,19 @@ jobs:
           test-venv/bin/python -m pip install dist/*.whl
       - name: smoke test (no source tree)
         run: |
+          # Read the authoritative version from pyproject.toml so this
+          # step never needs to be edited on a release bump.  The smoke
+          # test asserts the installed wheel's __version__ matches what
+          # pyproject.toml declared at build time — catches stale-wheel
+          # and mis-stamped-build bugs without hardcoding a version.
+          EXPECTED_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "expected version from pyproject.toml: $EXPECTED_VERSION"
           mkdir -p /tmp/smoke && cd /tmp/smoke
           ${{ github.workspace }}/test-venv/bin/python -c "
           import codeatelier_governance, importlib.resources as res
-          assert codeatelier_governance.__version__ == '0.4.0'
+          expected = '$EXPECTED_VERSION'
+          actual = codeatelier_governance.__version__
+          assert actual == expected, f'version mismatch: wheel={actual!r} pyproject={expected!r}'
           assert (res.files('codeatelier_governance.audit') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.cost') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.gates') / 'ddl.sql').is_file()

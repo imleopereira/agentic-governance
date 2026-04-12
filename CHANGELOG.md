@@ -1,5 +1,73 @@
 # Changelog
 
+## v0.5.1 (2026-04-12)
+
+Hotfix release covering four findings from a product-wide DX audit: three systemic
+opt-in / activation-consistency bugs and one silent HITL failure in Postgres deployments.
+No audit trail data was lost or corrupted — the HMAC chain is intact regardless of
+these issues.
+
+### Security
+
+- **HITL gates were silently broken on Postgres backends.** `ContractsModule._check_hitl_approved`
+  returned `False` unconditionally for `PostgresGatesStore`, causing **HITL-gated actions to
+  be blocked even after human approval** (over-blocking, not bypass). Any contract with a
+  `PreCondition(check="hitl_approved", ...)` would have emitted a flood of
+  `contract.pre_violation` audit events for legitimately approved actions. Fix: new
+  `GatesStore.has_granted_approval(agent_id)` abstract method, implemented with a SQL
+  query in Postgres and strict agent_id + expiry filtering in the in-memory store.
+- **`ScopeModule.filter_tools` silently returned the full tool list when no policy was
+  registered**, bypassing `hidden_tools` for unregistered agents and contradicting the
+  module's documented default-deny contract. Fix: raises `PolicyNotRegistered` instead.
+  The LangChain handler catches the new exception and fails closed (drops the tool list
+  entirely rather than passing it to the LLM).
+
+### Breaking changes
+
+- **`enable_audit`, `enable_scope`, `enable_cost`, `enable_gates`, `enable_prompts` flags
+  are now honored.** In v0.2–v0.5.0 these flags were accepted by `GovernanceConfig` but
+  never read — modules were constructed unconditionally regardless of flag value. Now
+  `sdk.scope` / `sdk.cost` / `sdk.gates` / `sdk.contracts` do not exist when their flag
+  is `False`; calling them raises `AttributeError`. `enable_audit=False` swaps the audit
+  substrate to an in-memory ring buffer with no persistence (the attribute stays because
+  every other module needs it to log events). Contracts cascades off when scope or cost
+  is off; routing cascades off when cost is off. **Customers who set any of these flags
+  expecting them to disable the corresponding module should review their deployment
+  immediately.**
+- **`ScopeModule.filter_tools("unknown_agent", ...)` now raises `PolicyNotRegistered`**
+  instead of returning the full tool list. Callers that previously relied on the
+  pass-through behaviour must register a policy for every agent or catch the exception
+  explicitly.
+
+### New modules
+
+- **Routing (Model Selection Policy)** — advisory `sdk.routing.suggest()` that can
+  remap the requested model based on remaining budget (`cost_aware`) or an explicit
+  rewrite table (`rules`). Off by default: both `enable_routing=True` at SDK init AND
+  at least one registered `RoutingPolicy` are required for routing to touch the LLM
+  call path. Honors `ScopePolicy.allowed_models` as a hard constraint. Emits
+  `routing.policy_changed` (on register) and `routing.suggestion` (on every model
+  substitution) audit events in the HMAC chain. Wraps `wrap_openai` and `wrap_anthropic`
+  transparently — no caller code changes.
+
+### Fixes
+
+- **`asyncio.run()` no longer called from the sync registration path** in scope, cost,
+  and routing modules. Policies registered before the event loop is running are now
+  queued in `_pending_upsert_policies` and drained by `flush_pending_upserts()` during
+  `sdk.start()`. Removes a hidden sync-over-async that could deadlock sync startup in
+  codebases owning an outer loop (violated architectural invariant #3).
+- Background policy-upsert tasks now hold strong references via per-module
+  `_pending_upsert_tasks` sets so Python's GC cannot collect them mid-execution.
+- `ScopePolicy` gains an `allowed_models: frozenset[str]` field — a hard ceiling that
+  routing cannot exceed regardless of budget state.
+
+### Tests
+
+- 322 → 356 tests (+21 routing module, +13 hotfix regression pins in
+  `tests/test_hotfix_v0_5_1.py`).
+- Full suite: 356 passed, 0 failures, 0 regressions.
+
 ## v0.5.0 (2026-04-12)
 
 ### Security

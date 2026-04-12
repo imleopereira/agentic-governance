@@ -14,6 +14,7 @@ MAX_AGENT_ID_LEN = 256
 MAX_TOOL_NAME_LEN = 256
 MAX_API_PATTERN_LEN = 512
 MAX_SET_SIZE = 1024
+MAX_MODEL_NAME_LEN = 128
 
 
 class ScopePolicy(BaseModel):
@@ -41,6 +42,7 @@ class ScopePolicy(BaseModel):
     allowed_tools: frozenset[str] = Field(default_factory=frozenset)
     allowed_apis: frozenset[str] = Field(default_factory=frozenset)
     hidden_tools: frozenset[str] = Field(default_factory=frozenset)
+    allowed_models: frozenset[str] = Field(default_factory=frozenset)
 
     def model_post_init(self, __context: object) -> None:
         if len(self.allowed_tools) > MAX_SET_SIZE:
@@ -72,4 +74,9 @@ class ScopePolicy(BaseModel):
             if len(tool) > MAX_TOOL_NAME_LEN or not tool:
                 raise ValueError(
                     f"scope policy: hidden tool name {tool!r} must be 1-{MAX_TOOL_NAME_LEN} chars"
+                )
+        for model in self.allowed_models:
+            if not model or len(model) > MAX_MODEL_NAME_LEN:
+                raise ValueError(
+                    f"scope policy: model name {model!r} must be 1-{MAX_MODEL_NAME_LEN} chars"
                 )

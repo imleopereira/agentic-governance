@@ -186,6 +186,30 @@ class PostgresGatesStore(GatesStore):
             return "denied"
         return None
 
+    async def has_granted_approval(
+        self,
+        agent_id: str,
+    ) -> bool:
+        """Return True if at least one unexpired granted approval exists for ``agent_id``.
+
+        Fixed in v0.5.1 — prior versions returned ``False`` unconditionally
+        via ContractsModule's private-attr fallback, which broke every
+        HITL-gated contract deployed with a Postgres backend.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT 1 FROM governance_gates_pending "
+                    "WHERE agent_id = :agent_id "
+                    "  AND resolution = 'granted' "
+                    "  AND expires_at > NOW() "
+                    "LIMIT 1"
+                ),
+                {"agent_id": agent_id},
+            )
+            row = res.first()
+        return row is not None
+
     async def cleanup_resolved(
         self,
         older_than_days: int = 90,

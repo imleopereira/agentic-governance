@@ -64,6 +64,12 @@ class CostModule:
         self._database_url = database_url
         self._engine: Any = engine
         self._owns_engine = False
+        # Strong references to in-flight DB upsert tasks (GC safety).
+        self._pending_upsert_tasks: set[asyncio.Task[Any]] = set()
+        # Policies registered before any event loop was running.  Drained
+        # by ``flush_pending_upserts()`` at SDK start().  Replaces the
+        # v0.5.0 inline ``asyncio.run()`` anti-pattern.
+        self._pending_upsert_policies: list[BudgetPolicy] = []
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
@@ -94,7 +100,13 @@ class CostModule:
     def _persist_policy_best_effort(
         self, agent_id: str, policy_type: str, policy: BudgetPolicy,
     ) -> None:
-        """Best-effort upsert of a policy to Postgres. Never raises."""
+        """Best-effort upsert of a policy to Postgres. Never raises.
+
+        See :meth:`ScopeModule._persist_policy_best_effort` for the full
+        design rationale — same defer-to-start pattern, replacing the
+        v0.5.0 inline ``asyncio.run()`` which could deadlock sync
+        startup in codebases that already owned an outer loop.
+        """
         engine = self._get_engine()
         if engine is None:
             return
@@ -106,12 +118,23 @@ class CostModule:
                 pass
 
             if loop is not None and loop.is_running():
-                loop.create_task(
+                task = loop.create_task(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
+                self._pending_upsert_tasks.add(task)
+                task.add_done_callback(
+                    self._pending_upsert_tasks.discard
+                )
             else:
-                asyncio.run(
-                    self._upsert_policy(engine, agent_id, policy_type, policy)
+                self._pending_upsert_policies.append(policy)
+                logger.info(
+                    "cost.persist_policy_deferred",
+                    agent_id=agent_id,
+                    policy_type=policy_type,
+                    detail=(
+                        "No event loop running at register() time; "
+                        "upsert deferred until sdk.start()."
+                    ),
                 )
         except Exception as exc:
             logger.warning(
@@ -120,6 +143,28 @@ class CostModule:
                 policy_type=policy_type,
                 exc_type=type(exc).__name__,
             )
+
+    async def flush_pending_upserts(self) -> None:
+        """Drain policies registered before the event loop started."""
+        if not self._pending_upsert_policies:
+            return
+        engine = self._get_engine()
+        if engine is None:
+            self._pending_upsert_policies.clear()
+            return
+        pending = self._pending_upsert_policies
+        self._pending_upsert_policies = []
+        for policy in pending:
+            try:
+                await self._upsert_policy(
+                    engine, policy.agent_id, "budget", policy
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "cost.deferred_upsert_failed",
+                    agent_id=policy.agent_id,
+                    exc_type=type(exc).__name__,
+                )
 
     @staticmethod
     async def _upsert_policy(

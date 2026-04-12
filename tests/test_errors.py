@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import secrets as _secrets
 from typing import AsyncIterator
-from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
