@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import secrets
 from typing import Any
-from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -135,23 +134,22 @@ async def test_double_wrap_warns_and_returns(
 
 
 @pytest.mark.asyncio
-async def test_audit_events_emitted_on_success(
+async def test_sync_wrapper_raises_in_async_context(
     sdk: FakeSDK, store: InMemoryAuditStore
 ) -> None:
-    """wrap_anthropic on a sync client should log llm.call and llm.result."""
+    """wrap_anthropic sync wrapper must raise RuntimeError inside event loop.
+
+    The sync wrapper detects a running event loop and raises a clear error
+    directing the developer to use the async API instead.
+    """
     response = FakeResponse(usage=FakeUsage(10, 20))
     client = FakeSyncClient(response)
 
     wrapped = wrap_anthropic(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
     assert wrapped is client
 
-    # Inside an event loop the sync wrapper yields a coroutine.
-    result = await wrapped.messages.create(model="claude-sonnet-4-6")
-    assert result is response
-
-    count = await store.count()
-    # At least llm.call + llm.result = 2 events
-    assert count >= 2
+    with pytest.raises(RuntimeError, match="sync Anthropic wrapper called inside a running event loop"):
+        wrapped.messages.create(model="claude-sonnet-4-6")
 
 
 @pytest.mark.asyncio
@@ -181,12 +179,14 @@ async def test_cost_tracked_on_success(
 async def test_audit_event_emitted_on_error(
     sdk: FakeSDK, store: InMemoryAuditStore
 ) -> None:
-    """On LLM error, wrap_anthropic should log llm.error and re-raise."""
+    """On async LLM error, wrap_anthropic should log llm.error and re-raise."""
     response = FakeResponse()
-    client = FakeSyncClient(response)
-    # Make the original create raise
-    client.messages = FakeMessages(response)
-    client.messages.create = MagicMock(side_effect=RuntimeError("API error"))  # type: ignore[method-assign]
+    client = FakeAsyncClient(response)
+
+    async def failing_create(**kwargs: Any) -> FakeResponse:
+        raise RuntimeError("API error")
+
+    client.messages.create = failing_create  # type: ignore[method-assign]
 
     wrapped = wrap_anthropic(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
 
@@ -319,3 +319,52 @@ async def test_model_field_set_on_audit_events(
     for event in llm_events:
         assert event.model is not None
         assert "claude" in event.model
+
+
+# -- Gap #1: Streaming response detection (Anthropic) --------------------------
+
+
+class TestIsStreamingResponseAnthropic:
+    """_is_streaming_response should detect Anthropic streaming types by class name."""
+
+    def test_message_stream_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        class MessageStream:
+            pass
+
+        assert _is_streaming_response(MessageStream()) is True
+
+    def test_async_message_stream_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        class AsyncMessageStream:
+            pass
+
+        assert _is_streaming_response(AsyncMessageStream()) is True
+
+    def test_stream_type_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        class Stream:
+            pass
+
+        assert _is_streaming_response(Stream()) is True
+
+    def test_async_stream_type_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        class AsyncStream:
+            pass
+
+        assert _is_streaming_response(AsyncStream()) is True
+
+    def test_normal_response_not_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        assert _is_streaming_response(FakeResponse()) is False
+
+    def test_none_not_detected(self) -> None:
+        from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
+
+        assert _is_streaming_response(None) is False

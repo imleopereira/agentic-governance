@@ -43,12 +43,34 @@ class JsonlFallbackStore(AuditStore):
     prev_hash linkage is monotonic within each session.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    # Maximum fallback file size before rotation (default 50 MB).
+    _MAX_FILE_BYTES: int = 50 * 1024 * 1024
+    # Batch size for chunked drain operations.
+    _DRAIN_BATCH_SIZE: int = 1000
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_file_bytes: int = 50 * 1024 * 1024,
+    ) -> None:
         self._path = Path(path)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Harden file permissions: owner-only read/write (0600)
-        if self._path.exists():
-            self._path.chmod(0o600)
+        self._MAX_FILE_BYTES = max_file_bytes
+        self._fs_available = True
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Harden file permissions: owner-only read/write (0600)
+            if self._path.exists():
+                self._path.chmod(0o600)
+        except OSError as exc:
+            logger.warning(
+                "audit.jsonl_fallback_fs_unavailable",
+                path=str(self._path),
+                error_type=type(exc).__name__,
+                detail="Falling back to in-memory buffer. Events will not survive restarts.",
+            )
+            self._fs_available = False
+        self._memory_buffer: list[AuditEventRecord] = []
         self._global_lock = asyncio.Lock()
         self._session_locks: dict[UUID, asyncio.Lock] = {}
         # Cache the most-recent hmac per session in memory so we don't
@@ -82,12 +104,23 @@ class JsonlFallbackStore(AuditStore):
         original session and we just want to flush them to disk in order.
         """
         async with self._global_lock:
-            created = not self._path.exists()
-            with self._path.open("a") as fp:
-                for event in events:
-                    fp.write(_serialize(event) + "\n")
-            if created:
-                self._path.chmod(0o600)
+            if not self._fs_available:
+                self._memory_buffer.extend(events)
+                return
+            try:
+                created = not self._path.exists()
+                with self._path.open("a") as fp:
+                    for event in events:
+                        fp.write(_serialize(event) + "\n")
+                if created:
+                    self._path.chmod(0o600)
+            except OSError as exc:
+                logger.warning(
+                    "audit.jsonl_write_batch_fs_failed",
+                    error_type=type(exc).__name__,
+                )
+                self._fs_available = False
+                self._memory_buffer.extend(events)
 
     async def get_event(self, event_id: UUID) -> AuditEventRecord | None:
         async with self._global_lock:
@@ -125,38 +158,87 @@ class JsonlFallbackStore(AuditStore):
                 return sum(1 for line in fp if line.strip())
 
     async def drain_to(self, target: AuditStore) -> int:
-        """Drain every event from the JSONL into ``target``.
+        """Drain events from the JSONL into ``target`` in batches.
 
-        On success, truncates the file. On failure, leaves the file intact
-        so the operator can retry. Returns the number of events drained.
+        Reads and writes in chunks of ``_DRAIN_BATCH_SIZE`` (default 1000)
+        to avoid loading the entire file into memory at once. On success,
+        truncates the file. On failure mid-drain, leaves the remaining
+        events intact so the operator can retry.
 
-        IMPORTANT: this preserves each event's existing chain fields
-        (prev_hash, hmac, chain_seq sequence intent). It does NOT recompute
-        the chain. The drain creates a new chain segment in the primary
-        starting from the JSONL's earliest event — auditors will see a
-        boundary marker if the SDK emits one.
+        Also drains any in-memory buffer (from read-only FS fallback).
+
+        Returns the total number of events drained.
         """
+        total_drained = 0
+
         async with self._global_lock:
-            if not self._path.exists():
-                return 0
-            events: list[AuditEventRecord] = list(self._read_all())
-            if not events:
-                return 0
+            # Drain in-memory buffer first (from read-only FS fallback)
+            if self._memory_buffer:
+                mem_events = list(self._memory_buffer)
+                for i in range(0, len(mem_events), self._DRAIN_BATCH_SIZE):
+                    batch = mem_events[i : i + self._DRAIN_BATCH_SIZE]
+                    try:
+                        await target.write_batch(batch)
+                        total_drained += len(batch)
+                    except Exception as exc:
+                        logger.error(
+                            "audit.jsonl_drain_memory_failed",
+                            error_type=type(exc).__name__,
+                            pending=len(mem_events) - i,
+                        )
+                        # Keep undrained events in memory buffer
+                        self._memory_buffer = mem_events[i:]
+                        if total_drained > 0:
+                            logger.info("audit.jsonl_drained", events=total_drained)
+                        raise
+                self._memory_buffer.clear()
+
+            # Drain disk file in chunks
+            if not self._fs_available or not self._path.exists():
+                if total_drained > 0:
+                    logger.info("audit.jsonl_drained", events=total_drained)
+                return total_drained
+
+            # Stream from file in batches to avoid loading everything
+            file_batch: list[AuditEventRecord] = []
             try:
-                await target.write_batch(events)
+                with self._path.open() as fp:
+                    for line in fp:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        try:
+                            file_batch.append(_deserialize(data))
+                        except Exception:
+                            continue
+                        if len(file_batch) >= self._DRAIN_BATCH_SIZE:
+                            await target.write_batch(file_batch)
+                            total_drained += len(file_batch)
+                            file_batch = []
+
+                # Flush remaining batch
+                if file_batch:
+                    await target.write_batch(file_batch)
+                    total_drained += len(file_batch)
             except Exception as exc:
                 logger.error(
                     "audit.jsonl_drain_failed",
                     error_type=type(exc).__name__,
-                    pending=len(events),
+                    drained_so_far=total_drained,
                 )
                 raise
+
             # Drain succeeded — truncate the file
             self._path.unlink()
             self._initialized.clear()
             self._last_hmac.clear()
-        logger.info("audit.jsonl_drained", events=len(events))
-        return len(events)
+
+        if total_drained > 0:
+            logger.info("audit.jsonl_drained", events=total_drained)
+        return total_drained
 
     async def close(self) -> None:
         return None
@@ -164,32 +246,72 @@ class JsonlFallbackStore(AuditStore):
     # --- internals ---------------------------------------------------------
     async def _append(self, record: AuditEventRecord) -> None:
         async with self._global_lock:
-            created = not self._path.exists()
-            with self._path.open("a") as fp:
-                fp.write(_serialize(record) + "\n")
-            if created:
-                self._path.chmod(0o600)
+            if not self._fs_available:
+                self._memory_buffer.append(record)
+                return
+            try:
+                # Rotate if file exceeds size cap
+                if self._path.exists():
+                    try:
+                        size = self._path.stat().st_size
+                    except OSError:
+                        size = 0
+                    if size >= self._MAX_FILE_BYTES:
+                        rotated = self._path.with_suffix(".jsonl.1")
+                        try:
+                            self._path.rename(rotated)
+                            logger.warning(
+                                "audit.jsonl_fallback_rotated",
+                                old_size_bytes=size,
+                                rotated_path=str(rotated),
+                            )
+                        except OSError as exc:
+                            logger.warning(
+                                "audit.jsonl_fallback_rotate_failed",
+                                error_type=type(exc).__name__,
+                            )
+                            # Truncate instead of rotating
+                            self._path.unlink(missing_ok=True)
+
+                created = not self._path.exists()
+                with self._path.open("a") as fp:
+                    fp.write(_serialize(record) + "\n")
+                if created:
+                    self._path.chmod(0o600)
+            except OSError as exc:
+                logger.warning(
+                    "audit.jsonl_append_fs_failed",
+                    error_type=type(exc).__name__,
+                    detail="Falling back to in-memory buffer.",
+                )
+                self._fs_available = False
+                self._memory_buffer.append(record)
 
     async def _scan_last_hmac(self, session_id: UUID) -> str | None:
         """Scan the file for the most recent event in the session.
 
         O(N) on file size. Only called once per session (on first event)
-        thanks to the in-memory ``_last_hmac`` cache.
+        thanks to the in-memory ``_last_hmac`` cache. Also checks the
+        in-memory buffer when the filesystem is unavailable.
         """
         async with self._global_lock:
-            if not self._path.exists():
-                return None
             last: str | None = None
-            with self._path.open() as fp:
-                for line in fp:
-                    if not line.strip():
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if str(data.get("session_id")) == str(session_id):
-                        last = data.get("hmac")
+            # Scan disk file if available
+            if self._fs_available and self._path.exists():
+                with self._path.open() as fp:
+                    for line in fp:
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if str(data.get("session_id")) == str(session_id):
+                            last = data.get("hmac")
+            # Also scan in-memory buffer
+            for record in self._memory_buffer:
+                if record.session_id == session_id:
+                    last = record.hmac
             return last
 
     def _read_all(self) -> list[AuditEventRecord]:

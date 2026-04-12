@@ -1,8 +1,10 @@
 """Human-in-the-loop gate exceptions."""
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class GateError(Exception):
+
+class GateError(GovernanceError):
     """Base class for HITL gate errors."""
 
 
@@ -16,7 +18,8 @@ class ApprovalPending(GateError):
     def __init__(self, request_id: str) -> None:
         super().__init__(
             f"approval required (request_id={request_id}). "
-            f"Resolve via sdk.gates.grant(token) or sdk.gates.deny(token)."
+            f"Resolve via sdk.gates.grant(token) or sdk.gates.deny(token).",
+            recovery_hint="Call sdk.gates.grant(token) or sdk.gates.deny(token) to resolve.",
         )
         self.request_id = request_id
 

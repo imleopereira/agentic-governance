@@ -9,5 +9,6 @@ CREATE TABLE IF NOT EXISTS governance_agent_presence (
                         CHECK (status IN ('live', 'idle', 'unresponsive')),
     last_heartbeat  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
     started_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-    metadata_json   JSONB         DEFAULT '{}'::jsonb
+    metadata_json   JSONB         DEFAULT '{}'::jsonb,
+    operator_id     VARCHAR(256)  DEFAULT NULL
 );

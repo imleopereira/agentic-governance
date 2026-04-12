@@ -44,17 +44,18 @@ class ScopeModule:
         policies: list[ScopePolicy] | None = None,
         *,
         database_url: str | None = None,
+        engine: Any = None,
     ) -> None:
         self._audit = audit
         self._policies: dict[str, ScopePolicy] = {}
-        self._lock = asyncio.Lock()
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -69,6 +70,7 @@ class ScopeModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     def register(self, policy: ScopePolicy) -> None:
@@ -100,11 +102,12 @@ class ScopeModule:
                 _asyncio.run(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "scope.persist_policy_failed",
                 agent_id=agent_id,
                 policy_type=policy_type,
+                exc_type=type(exc).__name__,
             )
 
     @staticmethod
@@ -122,9 +125,9 @@ class ScopeModule:
             await conn.execute(
                 text(
                     "INSERT INTO governance_policies (agent_id, policy_type, policy_json, updated_at) "
-                    "VALUES (:agent_id, :policy_type, :policy_json::jsonb, NOW()) "
+                    "VALUES (:agent_id, :policy_type, CAST(:policy_json AS jsonb), NOW()) "
                     "ON CONFLICT (agent_id, policy_type) "
-                    "DO UPDATE SET policy_json = :policy_json::jsonb, updated_at = NOW()"
+                    "DO UPDATE SET policy_json = CAST(:policy_json AS jsonb), updated_at = NOW()"
                 ),
                 {
                     "agent_id": agent_id,
@@ -197,23 +200,33 @@ class ScopeModule:
                 agent_id, tool, api, reason="no policy registered"
             )
             raise PolicyNotRegistered(
-                f"scope check failed: no policy registered for agent_id={agent_id!r}. "
-                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., allowed_tools=...)) "
-                f"at startup."
+                f"scope check failed: no policy registered for agent_id={agent_id!r}.\n"
+                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., allowed_tools=...)) at startup.",
+                recovery_hint="Register a ScopePolicy for this agent_id before calling check().",
             )
         if tool is not None and tool not in policy.allowed_tools:
             await self._log_violation(
                 agent_id, tool, api, reason="tool not whitelisted"
             )
+            allowed_preview = sorted(policy.allowed_tools)[:10]
+            suffix = f" ... and {len(policy.allowed_tools) - 10} more" if len(policy.allowed_tools) > 10 else ""
             raise ScopeViolation(
-                f"scope violation: tool={tool!r} is not in scope for agent={agent_id!r}"
+                f"Scope violation: tool {tool!r} is not allowed for agent {agent_id!r}.\n"
+                f"Allowed tools: [{', '.join(allowed_preview)}{suffix}]\n"
+                f"Fix: add {tool!r} to ScopePolicy.allowed_tools for this agent.",
+                recovery_hint=f"Add {tool!r} to ScopePolicy(allowed_tools=frozenset({{...}})) at startup.",
             )
         if api is not None and not _api_matches(api, policy.allowed_apis):
             await self._log_violation(
                 agent_id, tool, api, reason="api not whitelisted"
             )
+            allowed_preview = sorted(policy.allowed_apis)[:10]
+            suffix = f" ... and {len(policy.allowed_apis) - 10} more" if len(policy.allowed_apis) > 10 else ""
             raise ScopeViolation(
-                f"scope violation: api={api!r} is not in scope for agent={agent_id!r}"
+                f"Scope violation: api {api!r} is not allowed for agent {agent_id!r}.\n"
+                f"Allowed APIs: [{', '.join(allowed_preview)}{suffix}]\n"
+                f"Fix: add {api!r} to ScopePolicy.allowed_apis for this agent.",
+                recovery_hint=f"Add {api!r} to ScopePolicy(allowed_apis=frozenset({{...}})) at startup.",
             )
 
     async def _log_violation(
@@ -249,7 +262,8 @@ class ScopeModule:
             if not inspect.iscoroutinefunction(func):
                 raise TypeError(
                     f"@scope.require_tool requires an async function; "
-                    f"{func.__name__} is sync."
+                    f"{func.__name__} is sync. "
+                    f"Fix: convert to `async def {func.__name__}(...)`."
                 )
 
             @functools.wraps(func)

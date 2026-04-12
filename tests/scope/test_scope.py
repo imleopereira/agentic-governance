@@ -6,7 +6,7 @@ import asyncio
 import pytest
 from pydantic import ValidationError
 
-from codeatelier_governance.audit import InMemoryAuditStore
+from codeatelier_governance.audit import AuditModule, InMemoryAuditStore
 from codeatelier_governance.scope import (
     PolicyNotRegistered,
     ScopeModule,
@@ -31,14 +31,14 @@ async def test_allowed_tool_passes(scope: ScopeModule) -> None:
 
 @pytest.mark.asyncio
 async def test_disallowed_tool_raises_and_logs(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     scope.register(
         ScopePolicy(agent_id="a", allowed_tools=frozenset({"read_invoice"}))
     )
     with pytest.raises(ScopeViolation):
         await scope.check(agent_id="a", tool="delete_customer")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = list(audit_store._events.values())  # type: ignore[attr-defined]
     violations = [e for e in events if e.kind == "scope.violation"]
     assert len(violations) == 1
@@ -48,11 +48,11 @@ async def test_disallowed_tool_raises_and_logs(
 
 @pytest.mark.asyncio
 async def test_unknown_agent_default_denies(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     with pytest.raises(PolicyNotRegistered):
         await scope.check(agent_id="ghost", tool="anything")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     events = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -176,7 +176,7 @@ async def test_decorator_rejects_sync_function(scope: ScopeModule) -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_checks_all_log_independently(
-    scope: ScopeModule, audit_store: InMemoryAuditStore
+    scope: ScopeModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     scope.register(ScopePolicy(agent_id="a", allowed_tools=frozenset({"x"})))
     # 20 concurrent denied calls
@@ -187,7 +187,7 @@ async def test_concurrent_checks_all_log_independently(
         )
     )
     assert all(isinstance(r, ScopeViolation) for r in results)
-    await asyncio.sleep(0.2)
+    await audit._writer.flush()
     violations = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -266,3 +266,44 @@ def test_policy_with_both_allowed_and_hidden(scope: ScopeModule) -> None:
     assert "write" not in result
     assert "read" in result
     assert "list" in result
+
+
+# ---------------------------------------------------------------------------
+# Exploit: case-sensitivity bypass
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_case_sensitive_tool_check(scope: ScopeModule) -> None:
+    """Register policy with 'read_file', check 'READ_FILE' — must be denied.
+
+    This proves an attacker cannot bypass the whitelist by changing case.
+    Tool matching is case-sensitive by design (frozenset membership test).
+    """
+    scope.register(
+        ScopePolicy(agent_id="case-test", allowed_tools=frozenset({"read_file"}))
+    )
+    # Exact match works
+    await scope.check(agent_id="case-test", tool="read_file")
+    # Case variations must all be denied
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="READ_FILE")
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="Read_File")
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="READ_file")
+
+
+# ---------------------------------------------------------------------------
+# Exploit: SQL injection in tool name
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_sql_injection_in_tool_name(scope: ScopeModule) -> None:
+    """SQL injection payload as tool name must raise ScopeViolation, not
+    execute the SQL."""
+    scope.register(
+        ScopePolicy(agent_id="sqli", allowed_tools=frozenset({"safe_tool"}))
+    )
+    with pytest.raises(ScopeViolation):
+        await scope.check(
+            agent_id="sqli",
+            tool="'; DROP TABLE governance_audit_events; --",
+        )

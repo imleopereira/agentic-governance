@@ -20,6 +20,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from ..utils import normalize_db_url
 from .errors import StoreUnavailableError
 from .models import AuditEventRecord
 from .store import AuditStore, ChainBuilder
@@ -57,28 +58,30 @@ audit_events = Table(
 )
 
 
-def _normalize_url(url: str) -> str:
-    """Convert plain postgresql:// URLs to the async asyncpg dialect."""
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    raise ValueError(
-        "audit store: expected a postgresql:// connection string. "
-        "Fix: pass database_url='postgresql://user:pass@host/db'"
-    )
-
-
 class PostgresAuditStore(AuditStore):
     """SQLAlchemy/asyncpg-backed AuditStore."""
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(
-            _normalize_url(database_url),
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
-        )
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        engine: AsyncEngine | None = None,
+    ) -> None:
+        if engine is not None:
+            self._engine: AsyncEngine = engine
+            self._owns_engine = False
+        elif database_url is not None:
+            self._engine = create_async_engine(
+                normalize_db_url(database_url, component="audit store"),
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+            )
+            self._owns_engine = True
+        else:
+            raise ValueError(
+                "PostgresAuditStore requires either database_url or engine"
+            )
 
     async def insert_with_chain_lock(
         self,
@@ -250,7 +253,9 @@ class PostgresAuditStore(AuditStore):
         return [_row_to_record(row) for row in rows]
 
     async def close(self) -> None:
-        await self._engine.dispose()
+        """Dispose the engine only if this store owns it."""
+        if self._owns_engine:
+            await self._engine.dispose()
 
 
 def _row_to_record(row: Any) -> AuditEventRecord:

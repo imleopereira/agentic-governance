@@ -37,11 +37,13 @@ class LoopModule:
         policies: list[LoopPolicy] | None = None,
         *,
         database_url: str | None = None,
+        engine: Any = None,
     ) -> None:
         self._audit = audit
         self._policies: dict[str, LoopPolicy] = {}
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         # In-memory tracking: {(agent_id, session_id): [(tool_name, timestamp)]}
         self._calls: dict[tuple[str, UUID], list[tuple[str, float]]] = {}
         self._lock = asyncio.Lock()
@@ -49,7 +51,7 @@ class LoopModule:
             self._policies[policy.agent_id] = policy
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -64,6 +66,7 @@ class LoopModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     def register(self, policy: LoopPolicy) -> None:
@@ -326,7 +329,7 @@ class LoopModule:
             )
 
     async def close(self) -> None:
-        """Release resources."""
-        if self._engine is not None:
+        """Release resources. Disposes the engine only if this module owns it."""
+        if self._owns_engine and self._engine is not None:
             await self._engine.dispose()
             self._engine = None

@@ -1,7 +1,6 @@
 """Tests for the compliance report generator."""
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -45,7 +44,7 @@ async def test_article12_report_with_events(
         kind="agent.end",
     ))
     # Flush to ensure events are written
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_article12(session_ids=[sid])
     assert report.format == "article12"
@@ -71,7 +70,7 @@ async def test_article12_has_seven_sections(
         kind="agent.start",
         input_hash="c" * 64,
     ))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_article12(session_ids=[sid])
 
@@ -124,7 +123,7 @@ async def test_date_range_filtering(
         kind="agent.start",
         input_hash="d" * 64,
     ))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     # Use a future date range that excludes the event
     future = datetime.now(timezone.utc) + timedelta(days=10)
@@ -168,7 +167,7 @@ async def test_agent_id_filtering(
         input_hash="f" * 64,
         metadata={"tool": "search_tickets"},
     ))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_article12(agent_id="billing-agent")
 
@@ -208,7 +207,7 @@ async def test_summary_includes_violations(
         agent_id="risky-agent",
         kind="agent.start",
     ))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_summary(agent_id="risky-agent")
 
@@ -240,7 +239,7 @@ async def test_report_serializes_to_json(
         model="gpt-4",
         input_hash="g" * 64,
     ))
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_article12(session_ids=[sid])
 
@@ -340,7 +339,7 @@ async def test_article12_compliant_with_rich_data(
     ]
     for event in events:
         await audit.log(event)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     report = await generator.generate_article12(session_ids=[sid])
 

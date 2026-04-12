@@ -1,8 +1,6 @@
 """Tests for the @audit.track decorator."""
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from codeatelier_governance.audit import AuditModule
@@ -17,7 +15,7 @@ async def test_track_logs_start_and_end(audit: AuditModule) -> None:
     with audit.session() as sid:
         result = await add(2, 3)
     assert result == 5
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     store = audit._store  # type: ignore[attr-defined]
     events = sorted(
@@ -43,7 +41,7 @@ async def test_track_logs_error_and_reraises(audit: AuditModule) -> None:
     with audit.session() as sid:
         with pytest.raises(RuntimeError, match="nope"):
             await explode()
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     store = audit._store  # type: ignore[attr-defined]
     events = sorted(
@@ -72,7 +70,7 @@ async def test_track_capture_args_disabled(audit: AuditModule) -> None:
 
     with audit.session() as sid:
         await secret("password123")
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
 
     store = audit._store  # type: ignore[attr-defined]
     events = [e for e in store._events.values() if e.session_id == sid]  # type: ignore[attr-defined]

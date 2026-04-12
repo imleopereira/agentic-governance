@@ -13,7 +13,7 @@ Security constraints:
       It is NEVER serialized to the frontend.
     * Field-level redaction of metadata is applied before serving.
     * CORS is restricted to the console's own origin.
-    * Session-based auth with httpOnly cookies (v0.2.2+).
+    * Session-based auth with httpOnly cookies (v0.4.0+).
 """
 from __future__ import annotations
 
@@ -115,13 +115,12 @@ audit_module: AuditModule | None = None
 def _normalize_url(url: str) -> str:
     if not url:
         raise ValueError(
-            "GOVERNANCE_DATABASE_URL env var is required for the console."
+            "Console startup failed: GOVERNANCE_DATABASE_URL env var is not set.\n"
+            "Expected: a postgresql:// connection string.\n"
+            "Fix: export GOVERNANCE_DATABASE_URL=postgresql://user:pass@host/db"
         )
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    raise ValueError("GOVERNANCE_DATABASE_URL must be a postgresql:// URL.")
+    from ..utils import normalize_db_url
+    return normalize_db_url(url, component="console")
 
 
 def _redact_metadata(meta: dict[str, Any] | list[Any] | Any) -> Any:
@@ -195,7 +194,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Code Atelier Governance Console",
-    version="0.2.2",
+    version="0.4.0",
     lifespan=lifespan,
 )
 
@@ -309,7 +308,165 @@ def require_role(role: str) -> Any:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "version": "0.2.2"}
+    return {"ok": True, "version": "0.4.0"}
+
+
+# ---------------------------------------------------------------------------
+# SSE: real-time event stream
+# ---------------------------------------------------------------------------
+@app.get("/api/stream/events")
+async def stream_events(
+    request: Request,
+    last_event_id: str | None = Query(None),
+) -> Any:
+    """Server-Sent Events endpoint for real-time audit events, gate changes,
+    and presence updates.
+
+    Polls the database every 2 seconds for new events. The client sends
+    ``last_event_id`` (chain_seq) on reconnect for replay.
+
+    Auth: same session cookie as all other endpoints.
+    """
+    from starlette.responses import StreamingResponse
+
+    # Validate session (reuse the authenticate dependency logic)
+    session_cookie = request.cookies.get("governance_session")
+    token_header = request.headers.get("x-governance-token")
+    if not session_cookie and not token_header:
+        raise HTTPException(401, "Authentication required for SSE stream.")
+
+    if session_cookie and engine is not None:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT user_id FROM governance_console_sessions "
+                    "WHERE session_id = :sid AND expires_at > NOW() "
+                    "AND revoked = FALSE"
+                ),
+                {"sid": session_cookie},
+            )
+            if res.first() is None:
+                raise HTTPException(401, "Session expired.")
+
+    async def event_generator() -> Any:
+        """Yield SSE events by polling governance tables."""
+        import asyncio
+        import json
+
+        last_seq: int | None = None
+        if last_event_id:
+            try:
+                last_seq = int(last_event_id)
+            except ValueError:
+                last_seq = None
+
+        revalidate_counter = 0
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            # Re-validate session every 15 iterations (~30s at 2s interval)
+            revalidate_counter += 1
+            if revalidate_counter >= 15 and session_cookie and engine is not None:
+                revalidate_counter = 0
+                async with engine.connect() as conn:
+                    res = await conn.execute(
+                        text(
+                            "SELECT 1 FROM governance_console_sessions "
+                            "WHERE session_id = :sid AND expires_at > NOW() "
+                            "AND revoked = FALSE"
+                        ),
+                        {"sid": session_cookie},
+                    )
+                    if res.first() is None:
+                        break
+
+            if engine is None:
+                await asyncio.sleep(2)
+                continue
+
+            try:
+                async with engine.connect() as conn:
+                    # Fetch new audit events
+                    if last_seq is not None:
+                        q = text(
+                            "SELECT event_id, agent_id, session_id, kind, "
+                            "model, metadata_json AS metadata, created_at, chain_seq "
+                            "FROM governance_audit_events "
+                            "WHERE chain_seq > :seq "
+                            "ORDER BY chain_seq ASC LIMIT 100"
+                        )
+                        res = await conn.execute(q, {"seq": last_seq})
+                    else:
+                        q = text(
+                            "SELECT event_id, agent_id, session_id, kind, "
+                            "model, metadata_json AS metadata, created_at, chain_seq "
+                            "FROM governance_audit_events "
+                            "ORDER BY chain_seq DESC LIMIT 20"
+                        )
+                        res = await conn.execute(q)
+
+                    rows = res.mappings().all()
+                    if not last_seq:
+                        rows = list(reversed(rows))
+
+                    for row in rows:
+                        meta = row["metadata"]
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except (json.JSONDecodeError, TypeError):
+                                meta = {}
+                        safe_meta = _redact_metadata(meta) if meta else {}
+                        evt = {
+                            "event_id": str(row["event_id"]),
+                            "agent_id": row["agent_id"],
+                            "session_id": str(row["session_id"]) if row["session_id"] else None,
+                            "kind": row["kind"],
+                            "model": row.get("model"),
+                            "metadata": safe_meta,
+                            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                            "chain_seq": row["chain_seq"],
+                        }
+                        seq = row["chain_seq"]
+                        data = json.dumps(evt)
+                        yield f"id: {seq}\nevent: audit\ndata: {data}\n\n"
+                        last_seq = seq
+
+                    # Fetch presence changes
+                    async with engine.connect() as conn2:
+                        pres_res = await conn2.execute(
+                            text(
+                                "SELECT agent_id, status, last_heartbeat "
+                                "FROM governance_agent_presence "
+                                "ORDER BY last_heartbeat DESC LIMIT 10"
+                            )
+                        )
+                        for prow in pres_res.mappings().all():
+                            pevt = {
+                                "agent_id": prow["agent_id"],
+                                "status": prow["status"],
+                                "last_heartbeat": prow["last_heartbeat"].isoformat() if prow["last_heartbeat"] else None,
+                            }
+                            yield f"event: presence\ndata: {json.dumps(pevt)}\n\n"
+
+            except Exception:
+                _logger.warning("sse.poll_error", exc_info=False)
+
+            # Keepalive
+            yield ": keepalive\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +485,8 @@ async def login(body: LoginRequest, request: Request) -> JSONResponse:
             headers={"Retry-After": str(int(retry_after))},
         )
     _record_login_attempt(client_ip)
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     # Opportunistic session cleanup
     async with engine.begin() as conn:
         await conn.execute(
@@ -351,7 +509,11 @@ async def login(body: LoginRequest, request: Request) -> JSONResponse:
     if row is None or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(401, "Invalid username or password.")
     if row["disabled"]:
-        raise HTTPException(403, "Account is disabled.")
+        _logger.info(
+            "auth.login_disabled_account",
+            username_hash=hashlib.sha256(body.username.lower().encode()).hexdigest()[:16],
+        )
+        raise HTTPException(401, "Invalid username or password.")
     # Create session
     sid = create_session_id()
     expires = session_expires_at(SESSION_TTL_HOURS)
@@ -434,7 +596,8 @@ async def auth_me(request: Request) -> dict[str, Any]:
 )
 async def list_users() -> list[dict[str, Any]]:
     """List all console users (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -470,7 +633,8 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
         raise HTTPException(400, "Role must be 'viewer' or 'admin'.")
     if len(body.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters.")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     uid = uuid4()
     pw_hash = hash_password(body.password)
     now = datetime.now(timezone.utc)
@@ -491,9 +655,14 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
                 },
             )
     except Exception as exc:
-        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
-            raise HTTPException(409, f"Username '{body.username}' already exists.")
-        raise
+        from sqlalchemy.exc import IntegrityError
+        if isinstance(exc, IntegrityError):
+            raise HTTPException(409, f"Username '{body.username}' already exists.") from None
+        _logger.error(
+            "console.create_user_failed",
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(500, "Failed to create user. Check server logs.") from None
     return {"ok": True, "user_id": str(uid), "username": body.username.lower()}
 
 
@@ -503,7 +672,8 @@ async def create_user(body: CreateUserRequest) -> dict[str, Any]:
 )
 async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
     """Update a user's role or disabled status (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     updates: list[str] = []
     params: dict[str, Any] = {"uid": str(user_id), "now": datetime.now(timezone.utc)}
     if body.role is not None:
@@ -537,7 +707,8 @@ async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
 )
 async def revoke_session(session_id: UUID) -> dict[str, Any]:
     """Revoke a specific session (admin only)."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.begin() as conn:
         res = await conn.execute(
             text(
@@ -556,7 +727,8 @@ async def list_agents(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """List agents by recent activity."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -590,7 +762,8 @@ async def list_events(
     offset: int = Query(0, ge=0),
 ) -> list[dict[str, Any]]:
     """Paginated audit event explorer with filters."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     # Build the query using parameterized WHERE — no f-string interpolation
     # of user values. Each filter is a fixed string with a named parameter.
     base = (
@@ -657,7 +830,8 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for chain verification.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -716,7 +890,8 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
 @app.get("/api/cost/agents", dependencies=[Depends(authenticate)])
 async def cost_agents() -> list[dict[str, Any]]:
     """Cost summary per agent for today."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -742,7 +917,8 @@ async def cost_sessions(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """Cost per session, ordered by spend."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     clauses: list[str] = []
     params: dict[str, Any] = {"limit": limit}
     if agent_id:
@@ -774,7 +950,8 @@ async def cost_sessions(
 @app.get("/api/gates/pending", dependencies=[Depends(authenticate)])
 async def gates_pending() -> list[dict[str, Any]]:
     """List all unresolved approval requests."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -807,7 +984,8 @@ async def gates_recent(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """Recent gate resolutions."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -836,8 +1014,67 @@ async def gates_recent(
         ]
 
 
+async def _check_self_approval(
+    conn: Any,
+    agent_id: str,
+    user_id: str,
+    request_id: UUID,
+) -> None:
+    """Enforce self-approval prevention on HITL gates.
+
+    Looks up the agent's operator_id from the presence table and compares
+    it to the authenticated console user. Three outcomes:
+
+    - operator_id matches user_id: raise 403 (blocked)
+    - operator_id is NULL: allow but log an audit warning
+    - operator_id differs from user_id: allow (verified safe)
+    """
+    res = await conn.execute(
+        text(
+            "SELECT operator_id FROM governance_agent_presence "
+            "WHERE agent_id = :agent_id"
+        ),
+        {"agent_id": agent_id},
+    )
+    presence_row = res.mappings().first()
+    operator_id = presence_row["operator_id"] if presence_row else None
+
+    if operator_id is not None and operator_id == user_id:
+        _logger.warning(
+            "console.self_approval_blocked",
+            agent_id=agent_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+        raise HTTPException(
+            403, "Cannot approve your own agent's requests."
+        )
+
+    if operator_id is None:
+        _logger.warning(
+            "console.self_approval_blocked_no_operator",
+            agent_id=agent_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+        raise HTTPException(
+            403,
+            "Cannot verify operator identity: agent has no operator_id set. "
+            "Register operator_id via sdk.presence.heartbeat(agent_id, operator_id=...) "
+            "before requesting HITL approval.",
+        )
+    else:
+        _logger.info(
+            "console.self_approval_check_passed",
+            agent_id=agent_id,
+            operator_id=operator_id,
+            user_id=user_id,
+            request_id=str(request_id),
+        )
+
+
 @app.post("/api/gates/{request_id}/grant", dependencies=[Depends(authenticate)])
-async def grant_gate(request_id: UUID) -> dict[str, Any]:
+async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     """Grant a pending approval gate request."""
     if not AUDIT_SECRET:
         raise HTTPException(
@@ -845,7 +1082,9 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", None)
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -859,6 +1098,10 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
         row = res.mappings().first()
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Self-approval prevention
+        if user_id is not None:
+            await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
         # Verify the HMAC signature on the token
         token_value = row["token"]
@@ -902,7 +1145,7 @@ async def grant_gate(request_id: UUID) -> dict[str, Any]:
 
 
 @app.post("/api/gates/{request_id}/deny", dependencies=[Depends(authenticate)])
-async def deny_gate(request_id: UUID) -> dict[str, Any]:
+async def deny_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     """Deny a pending approval gate request."""
     if not AUDIT_SECRET:
         raise HTTPException(
@@ -910,7 +1153,9 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
             "GOVERNANCE_AUDIT_SECRET env var required for gate operations.",
         )
     secret = AUDIT_SECRET.encode("utf-8")
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    user_id = getattr(request.state, "user_id", None)
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -924,6 +1169,10 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
         row = res.mappings().first()
         if not row:
             raise HTTPException(404, "Gate request not found or already resolved.")
+
+        # Self-approval prevention
+        if user_id is not None:
+            await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
         # Verify the HMAC signature on the token
         token_value = row["token"]
@@ -968,7 +1217,8 @@ async def deny_gate(request_id: UUID) -> dict[str, Any]:
 @app.get("/api/policies", dependencies=[Depends(authenticate)])
 async def list_policies() -> list[dict[str, Any]]:
     """Return all policies from the governance_policies table."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -993,7 +1243,8 @@ async def list_policies() -> list[dict[str, Any]]:
 @app.get("/api/policies/{agent_id}", dependencies=[Depends(authenticate)])
 async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
     """Return scope + budget policies for a single agent."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
@@ -1024,7 +1275,8 @@ async def governance_posture() -> dict[str, Any]:
     Maps the four enforcement modules to a per-agent summary with
     pass/warn/fail status. One glance, one screenshot.
     """
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     async with engine.connect() as conn:
         # Agent activity
         agents_res = await conn.execute(
@@ -1118,9 +1370,12 @@ async def governance_posture() -> dict[str, Any]:
                 pj = r["policy_json"]
                 if isinstance(pj, dict):
                     budget_policies[r["agent_id"]] = pj
-        except Exception:
+        except Exception as exc:
             # Table may not exist yet; treat as no policies
-            pass
+            _logger.debug(
+                "console.budget_policies_query_skipped",
+                exc_type=type(exc).__name__,
+            )
 
     posture: list[dict[str, Any]] = []
     for agent_id, info in agents.items():
@@ -1187,7 +1442,8 @@ async def cost_model_breakdown(
     Returns rows from ``governance_cost_model_daily`` for the current UTC
     day. Filter by ``agent_id`` when provided; returns all agents otherwise.
     """
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     try:
         clauses: list[str] = ["day_utc = (NOW() AT TIME ZONE 'UTC')::DATE"]
         params: dict[str, Any] = {}
@@ -1216,15 +1472,20 @@ async def cost_model_breakdown(
                 }
                 for row in res.mappings()
             ]
-    except Exception:
+    except Exception as exc:
         # Table may not exist yet if migration hasn't been run
+        _logger.debug(
+            "console.cost_model_breakdown_skipped",
+            exc_type=type(exc).__name__,
+        )
         return []
 
 
 @app.get("/api/agents/presence", dependencies=[Depends(authenticate)])
 async def agent_presence() -> list[dict[str, Any]]:
     """List all agents with their presence status."""
-    assert engine is not None
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     try:
         async with engine.connect() as conn:
             res = await conn.execute(
@@ -1248,6 +1509,10 @@ async def agent_presence() -> list[dict[str, Any]]:
                 }
                 for row in res.mappings()
             ]
-    except Exception:
+    except Exception as exc:
         # Table may not exist yet if migration hasn't been run
+        _logger.debug(
+            "console.agent_presence_skipped",
+            exc_type=type(exc).__name__,
+        )
         return []

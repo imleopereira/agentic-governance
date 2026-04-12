@@ -102,3 +102,38 @@ async def test_agent_status_enum() -> None:
     assert AgentStatus.LIVE == "live"
     assert AgentStatus.IDLE == "idle"
     assert AgentStatus.UNRESPONSIVE == "unresponsive"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_with_operator_id(presence: PresenceModule) -> None:
+    """heartbeat() with operator_id should store it."""
+    await presence.heartbeat("agent-1", operator_id="team-lead-alice")
+    agents = await presence.list_agents()
+    assert len(agents) == 1
+    assert agents[0]["operator_id"] == "team-lead-alice"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_operator_id(presence: PresenceModule) -> None:
+    """heartbeat() without operator_id should default to None (backward compat)."""
+    await presence.heartbeat("agent-1")
+    agents = await presence.list_agents()
+    assert len(agents) == 1
+    assert agents[0]["operator_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_updates_operator_id(presence: PresenceModule) -> None:
+    """Subsequent heartbeat should update operator_id."""
+    await presence.heartbeat("agent-1", operator_id="alice")
+    await presence.heartbeat("agent-1", operator_id="bob")
+    agents = await presence.list_agents()
+    assert agents[0]["operator_id"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_rejects_oversized_operator_id(presence: PresenceModule) -> None:
+    """heartbeat() should silently reject operator_id exceeding 256 chars."""
+    await presence.heartbeat("agent-1", operator_id="x" * 257)
+    agents = await presence.list_agents()
+    assert len(agents) == 0

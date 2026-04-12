@@ -54,18 +54,21 @@ class CostModule:
         *,
         fail_open: bool = False,
         database_url: str | None = None,
+        engine: Any = None,
     ) -> None:
         self._audit = audit
         self._store: CostStore = store or InMemoryCostStore()
         self._fail_open = fail_open
         self._policies: dict[str, BudgetPolicy] = {}
+        self._no_policy_warned: set[str] = set()
         self._database_url = database_url
-        self._engine: Any = None
+        self._engine: Any = engine
+        self._owns_engine = False
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
     def _get_engine(self) -> Any:
-        """Lazily create and return the SQLAlchemy async engine."""
+        """Return the shared engine, or lazily create one if no shared engine was provided."""
         if self._engine is not None:
             return self._engine
         if self._database_url is None:
@@ -80,6 +83,7 @@ class CostModule:
         self._engine = create_async_engine(
             url, pool_pre_ping=True, pool_size=2, max_overflow=5,
         )
+        self._owns_engine = True
         return self._engine
 
     def register(self, policy: BudgetPolicy) -> None:
@@ -109,11 +113,12 @@ class CostModule:
                 asyncio.run(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "cost.persist_policy_failed",
                 agent_id=agent_id,
                 policy_type=policy_type,
+                exc_type=type(exc).__name__,
             )
 
     @staticmethod
@@ -131,9 +136,9 @@ class CostModule:
             await conn.execute(
                 text(
                     "INSERT INTO governance_policies (agent_id, policy_type, policy_json, updated_at) "
-                    "VALUES (:agent_id, :policy_type, :policy_json::jsonb, NOW()) "
+                    "VALUES (:agent_id, :policy_type, CAST(:policy_json AS jsonb), NOW()) "
                     "ON CONFLICT (agent_id, policy_type) "
-                    "DO UPDATE SET policy_json = :policy_json::jsonb, updated_at = NOW()"
+                    "DO UPDATE SET policy_json = CAST(:policy_json AS jsonb), updated_at = NOW()"
                 ),
                 {
                     "agent_id": agent_id,
@@ -171,7 +176,11 @@ class CostModule:
         return self._policies.get(agent_id)
 
     async def close(self) -> None:
+        """Release resources. Disposes the engine only if this module owns it."""
         await self._store.close()
+        if self._owns_engine and self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
 
     async def track_usage(
         self,
@@ -277,12 +286,32 @@ class CostModule:
         """
         policy = self._policies.get(agent_id)
         if policy is None:
+            if agent_id not in self._no_policy_warned:
+                self._no_policy_warned.add(agent_id)
+                logger.warning(
+                    "cost.no_policy_registered",
+                    agent_id=agent_id,
+                    detail=(
+                        f"No BudgetPolicy registered for agent {agent_id!r} "
+                        f"-- budget enforcement is inactive. All calls will "
+                        f"be allowed. Register a policy with "
+                        f"sdk.cost.register(BudgetPolicy(agent_id=...))."
+                    ),
+                )
             return
         try:
-            s_usd, s_tok = await self._store.get_session_usage(
-                agent_id, session_id
-            )
-            d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
+            # Use the combined query when available (PostgresCostStore)
+            # to halve the pre-call enforcement latency (1 DB round-trip
+            # instead of 2).
+            if hasattr(self._store, "get_session_and_daily_usage"):
+                s_usd, s_tok, d_usd, d_tok = await self._store.get_session_and_daily_usage(
+                    agent_id, session_id
+                )
+            else:
+                s_usd, s_tok = await self._store.get_session_usage(
+                    agent_id, session_id
+                )
+                d_usd, d_tok = await self._store.get_agent_daily_usage(agent_id)
         except Exception as exc:
             logger.critical(
                 "cost.check_failed_fail_closed",
@@ -314,7 +343,8 @@ class CostModule:
                 f"cost store unreachable; failing closed for safety. "
                 f"agent_id={agent_id!r}, error={type(exc).__name__}. "
                 f"Set fail_open=True at SDK init to allow the call instead "
-                f"(NOT recommended for production)."
+                f"(NOT recommended for production).",
+                recovery_hint="Check database connectivity. Set fail_open=True only for non-production.",
             )
 
         breach: tuple[str, float, float] | None = None
@@ -363,26 +393,39 @@ class CostModule:
                 )
             )
             raise BudgetExceeded(
-                f"budget exceeded: {cap_name}={used} > limit={limit} "
-                f"for agent_id={agent_id!r}"
+                f"Budget exceeded: {cap_name} for agent {agent_id!r} "
+                f"({used:.4f} > {limit:.4f}).\n"
+                f"Fix: increase the cap via BudgetPolicy({cap_name}=...) or start a new session.",
+                recovery_hint=f"Increase {cap_name} in BudgetPolicy or create a new session.",
             )
 
         if policy.per_session_seconds is not None:
+            elapsed: int | None = None
             try:
-                started = await self._store.get_session_start_time(
-                    agent_id, session_id
-                )
+                # Prefer Postgres-side elapsed computation to avoid
+                # mixed-clock skew between Python and database servers.
+                if hasattr(self._store, "get_session_elapsed_seconds"):
+                    elapsed_f = await self._store.get_session_elapsed_seconds(
+                        agent_id, session_id
+                    )
+                    if elapsed_f is not None:
+                        elapsed = int(elapsed_f)
+                else:
+                    started = await self._store.get_session_start_time(
+                        agent_id, session_id
+                    )
+                    if started is not None:
+                        elapsed = int(
+                            (datetime.now(timezone.utc) - started).total_seconds()
+                        )
             except Exception as exc:
                 logger.error(
                     "cost.session_time_check_failed",
                     error_type=type(exc).__name__,
                     agent_id=agent_id,
                 )
-                started = None
-            if started is not None:
-                elapsed = int(
-                    (datetime.now(timezone.utc) - started).total_seconds()
-                )
+                elapsed = None
+            if elapsed is not None:
                 if elapsed > policy.per_session_seconds:
                     await self._audit.log(
                         AuditEvent(
@@ -397,8 +440,10 @@ class CostModule:
                         )
                     )
                     raise BudgetExceeded(
-                        f"session time limit exceeded: "
-                        f"{elapsed}s > {policy.per_session_seconds}s limit"
+                        f"Session time limit exceeded for agent {agent_id!r}: "
+                        f"{elapsed}s > {policy.per_session_seconds}s.\n"
+                        f"Fix: increase per_session_seconds in BudgetPolicy or start a new session.",
+                        recovery_hint="Increase per_session_seconds or start a new session.",
                     )
 
     async def snapshot(

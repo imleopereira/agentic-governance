@@ -1,41 +1,16 @@
-"""Shared fixtures for audit tests."""
-from __future__ import annotations
+"""Shared fixtures for audit tests.
 
-import secrets
-from typing import AsyncIterator
+The audit_store and audit fixtures are inherited from tests/conftest.py.
+This file provides the 'store' alias used by audit-specific tests.
+"""
+from __future__ import annotations
 
 import pytest_asyncio
 
-from codeatelier_governance.audit import (
-    AuditModule,
-    BatchingWriter,
-    InMemoryAuditStore,
-)
+from codeatelier_governance.audit import InMemoryAuditStore
 
 
 @pytest_asyncio.fixture
-async def store() -> InMemoryAuditStore:
-    return InMemoryAuditStore(max_events=10_000)
-
-
-@pytest_asyncio.fixture
-async def secret() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest_asyncio.fixture
-async def audit(
-    store: InMemoryAuditStore, secret: bytes
-) -> AsyncIterator[AuditModule]:
-    writer = BatchingWriter(
-        primary=store,
-        batch_size=5,
-        flush_interval_s=0.02,
-        buffer_max=1000,
-    )
-    module = AuditModule(store, secret=secret, writer=writer)
-    await module.start()
-    try:
-        yield module
-    finally:
-        await module.close()
+async def store(audit_store: InMemoryAuditStore) -> InMemoryAuditStore:
+    """Alias: audit tests historically use 'store' instead of 'audit_store'."""
+    return audit_store

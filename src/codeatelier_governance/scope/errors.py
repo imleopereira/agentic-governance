@@ -6,8 +6,10 @@ messages.
 """
 from __future__ import annotations
 
+from ..errors import GovernanceError
 
-class ScopeError(Exception):
+
+class ScopeError(GovernanceError):
     """Base class for all scope module errors."""
 
 

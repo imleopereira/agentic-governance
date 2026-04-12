@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import secrets
 from typing import Any
-from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -102,13 +101,14 @@ async def sdk(audit: AuditModule) -> FakeSDK:
 
 
 @pytest.mark.asyncio
-async def test_wrap_sync_client_audit_events(
+async def test_wrap_sync_client_raises_in_async_context(
     sdk: FakeSDK, store: InMemoryAuditStore
 ) -> None:
-    """wrap_openai on a sync client should log llm.call and llm.result.
+    """wrap_openai on a sync client must raise RuntimeError inside an event loop.
 
-    When called from within a running event loop (like pytest-asyncio), the
-    sync wrapper returns a coroutine that must be awaited.
+    The sync wrapper detects a running event loop and raises a clear error
+    directing the developer to use the async API instead. This prevents the
+    old behavior of silently returning a coroutine object.
     """
     response = FakeResponse(usage=FakeUsage(10, 20, 30))
     client = FakeSyncClient(response)
@@ -116,34 +116,8 @@ async def test_wrap_sync_client_audit_events(
     wrapped = wrap_openai(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
     assert wrapped is client  # Same object returned
 
-    # Inside an event loop the sync wrapper yields a coroutine.
-    result = await wrapped.chat.completions.create(model="gpt-4o")
-    assert result is response
-
-    count = await store.count()
-    # At least llm.call + llm.result = 2 events
-    assert count >= 2
-
-
-@pytest.mark.asyncio
-async def test_wrap_sync_client_error_audit(
-    sdk: FakeSDK, store: InMemoryAuditStore
-) -> None:
-    """On LLM error, wrap_openai should log llm.error and re-raise."""
-    response = FakeResponse()
-    client = FakeSyncClient(response)
-    # Make the original create raise
-    client.chat.completions = FakeCompletions(response)
-    client.chat.completions.create = MagicMock(side_effect=RuntimeError("API error"))  # type: ignore[method-assign]
-
-    wrapped = wrap_openai(client, sdk=sdk, agent_id="test-agent")  # type: ignore[arg-type]
-
-    with pytest.raises(RuntimeError, match="API error"):
-        await wrapped.chat.completions.create(model="gpt-4o")
-
-    # Should have logged llm.call + llm.error
-    count = await store.count()
-    assert count >= 2
+    with pytest.raises(RuntimeError, match="sync OpenAI wrapper called inside a running event loop"):
+        wrapped.chat.completions.create(model="gpt-4o")
 
 
 # -- Async client tests --------------------------------------------------------
@@ -303,3 +277,41 @@ async def test_model_field_set_on_audit_events(
     assert len(llm_events) >= 2
     for event in llm_events:
         assert event.model == "gpt-4o"
+
+
+# -- Gap #1: Streaming response detection -------------------------------------
+
+
+class TestIsStreamingResponse:
+    """_is_streaming_response should detect OpenAI streaming types by class name."""
+
+    def test_stream_type_detected(self) -> None:
+        from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
+
+        class Stream:
+            pass
+
+        assert _is_streaming_response(Stream()) is True
+
+    def test_async_stream_type_detected(self) -> None:
+        from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
+
+        class AsyncStream:
+            pass
+
+        assert _is_streaming_response(AsyncStream()) is True
+
+    def test_normal_response_not_detected(self) -> None:
+        from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
+
+        assert _is_streaming_response(FakeResponse()) is False
+
+    def test_string_not_detected(self) -> None:
+        from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
+
+        assert _is_streaming_response("Stream") is False
+
+    def test_none_not_detected(self) -> None:
+        from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
+
+        assert _is_streaming_response(None) is False

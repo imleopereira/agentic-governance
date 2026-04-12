@@ -22,30 +22,35 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from ..utils import normalize_db_url
 from .errors import CostError
 from .store import CostStore
-
-
-def _normalize_url(url: str) -> str:
-    if url.startswith("postgresql+asyncpg://"):
-        return url
-    if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://") :]
-    raise ValueError(
-        "cost store: expected a postgresql:// connection string."
-    )
 
 
 class PostgresCostStore(CostStore):
     """SQLAlchemy/asyncpg-backed cost store."""
 
-    def __init__(self, database_url: str) -> None:
-        self._engine: AsyncEngine = create_async_engine(
-            _normalize_url(database_url),
-            pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=10,
-        )
+    def __init__(
+        self,
+        database_url: str | None = None,
+        *,
+        engine: AsyncEngine | None = None,
+    ) -> None:
+        if engine is not None:
+            self._engine: AsyncEngine = engine
+            self._owns_engine = False
+        elif database_url is not None:
+            self._engine = create_async_engine(
+                normalize_db_url(database_url, component="cost store"),
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+            )
+            self._owns_engine = True
+        else:
+            raise ValueError(
+                "PostgresCostStore requires either database_url or engine"
+            )
 
     async def track(
         self,
@@ -207,5 +212,71 @@ class PostgresCostStore(CostStore):
             for row in rows
         }
 
+    async def get_session_and_daily_usage(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> tuple[float, int, float, int]:
+        """Return session and daily usage in a single DB round-trip.
+
+        Returns ``(session_usd, session_tokens, daily_usd, daily_tokens)``.
+        This combines ``get_session_usage`` and ``get_agent_daily_usage``
+        into one query to halve the pre-call enforcement latency.
+
+        The race condition (two concurrent checks both read $0 and both
+        pass) is mitigated by the atomic UPSERT in track() — counters
+        never go backward. FOR UPDATE is not used here because Postgres
+        does not support FOR UPDATE on the nullable side of an outer join.
+        """
+        async with self._engine.begin() as conn:
+            res = await conn.execute(
+                text(
+                    """
+                    SELECT
+                        COALESCE(s.usd_used, 0) AS s_usd,
+                        COALESCE(s.tokens_used, 0) AS s_tok,
+                        COALESCE(d.usd_used, 0) AS d_usd,
+                        COALESCE(d.tokens_used, 0) AS d_tok
+                    FROM (SELECT 1) AS _dummy
+                    LEFT JOIN governance_cost_session_usage s
+                        ON s.agent_id = :agent_id AND s.session_id = :sid
+                    LEFT JOIN governance_cost_agent_daily d
+                        ON d.agent_id = :agent_id
+                        AND d.day_utc = (NOW() AT TIME ZONE 'UTC')::DATE
+                    """
+                ),
+                {"agent_id": agent_id, "sid": str(session_id)},
+            )
+            row = res.first()
+        if row is None:
+            return (0.0, 0, 0.0, 0)
+        return (float(row[0]), int(row[1]), float(row[2]), int(row[3]))
+
+    async def get_session_elapsed_seconds(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> float | None:
+        """Return elapsed seconds since session start, computed in Postgres.
+
+        Uses Postgres NOW() for both timestamps to avoid mixed-clock skew
+        between Python and database servers.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM NOW() - started_at) "
+                    "FROM governance_cost_session_usage "
+                    "WHERE agent_id = :agent_id AND session_id = :sid"
+                ),
+                {"agent_id": agent_id, "sid": str(session_id)},
+            )
+            row = res.first()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
+
     async def close(self) -> None:
-        await self._engine.dispose()
+        """Dispose the engine only if this store owns it."""
+        if self._owns_engine:
+            await self._engine.dispose()

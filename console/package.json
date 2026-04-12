@@ -1,6 +1,6 @@
 {
   "name": "codeatelier-governance-console",
-  "version": "0.2.2",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "dev": "next dev --port 3000",
@@ -9,17 +9,18 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@tanstack/react-query": "^5",
+    "lucide-react": "^0.500",
     "next": "^15.3",
     "react": "^19",
     "react-dom": "^19",
-    "@tanstack/react-query": "^5",
-    "lucide-react": "^0.500"
+    "zustand": "^5.0.12"
   },
   "devDependencies": {
-    "typescript": "^5.7",
+    "@tailwindcss/postcss": "^4",
     "@types/node": "^22",
     "@types/react": "^19",
     "tailwindcss": "^4",
-    "@tailwindcss/postcss": "^4"
+    "typescript": "^5.7"
   }
 }

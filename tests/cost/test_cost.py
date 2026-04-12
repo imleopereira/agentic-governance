@@ -8,6 +8,8 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
+from codeatelier_governance.audit import AuditModule
+
 from codeatelier_governance.audit import InMemoryAuditStore
 from codeatelier_governance.cost import (
     BudgetExceeded,
@@ -29,14 +31,14 @@ async def test_track_then_check_under_budget(cost: CostModule) -> None:
 
 @pytest.mark.asyncio
 async def test_session_usd_breach_raises_and_logs(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     cost.register(BudgetPolicy(agent_id="a", per_session_usd=0.10))
     sid = uuid4()
     await cost.track("a", sid, usd=0.15)
     with pytest.raises(BudgetExceeded, match="per_session_usd"):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breaches = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -145,14 +147,14 @@ async def test_concurrent_tracks_are_atomic(cost: CostModule) -> None:
 
 @pytest.mark.asyncio
 async def test_breach_event_includes_session_id(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     cost.register(BudgetPolicy(agent_id="a", per_session_usd=0.10))
     sid = uuid4()
     await cost.track("a", sid, usd=0.20)
     with pytest.raises(BudgetExceeded):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breach = next(
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -183,13 +185,13 @@ async def test_session_over_time_limit_raises(cost: CostModule) -> None:
     store = cost._store  # type: ignore[attr-defined]
     key = ("a", sid)
     store._session_started[key] = datetime.now(timezone.utc) - timedelta(seconds=15)
-    with pytest.raises(BudgetExceeded, match="session time limit exceeded"):
+    with pytest.raises(BudgetExceeded, match="(?i)session time limit exceeded"):
         await cost.check_or_raise("a", sid)
 
 
 @pytest.mark.asyncio
 async def test_session_time_limit_logs_audit_event(
-    cost: CostModule, audit_store: InMemoryAuditStore
+    cost: CostModule, audit_store: InMemoryAuditStore, audit: AuditModule
 ) -> None:
     """Time limit breach should log a budget.exceeded audit event."""
     cost.register(BudgetPolicy(agent_id="a", per_session_seconds=5))
@@ -199,7 +201,7 @@ async def test_session_time_limit_logs_audit_event(
     store._session_started[("a", sid)] = datetime.now(timezone.utc) - timedelta(seconds=10)
     with pytest.raises(BudgetExceeded):
         await cost.check_or_raise("a", sid)
-    await asyncio.sleep(0.1)
+    await audit._writer.flush()
     breaches = [
         e
         for e in audit_store._events.values()  # type: ignore[attr-defined]
@@ -226,3 +228,139 @@ def test_per_session_seconds_field_validation() -> None:
         BudgetPolicy(agent_id="a", per_session_seconds=86401)
     with pytest.raises(ValidationError):
         BudgetPolicy(agent_id="a", per_session_seconds=-1)
+
+
+# ---------------------------------------------------------------------------
+# Gap #5: Combined budget query — get_session_and_daily_usage
+# ---------------------------------------------------------------------------
+
+
+class _CombinedQueryStore:
+    """Fake store that has get_session_and_daily_usage like PostgresCostStore."""
+
+    def __init__(self) -> None:
+        self._session: dict[tuple[str, str], tuple[float, int]] = {}
+        self._daily: dict[str, tuple[float, int]] = {}
+        self.combined_called = False
+
+    async def track(
+        self,
+        agent_id: str,
+        session_id: "uuid4",  # type: ignore[valid-type]
+        *,
+        tokens: int = 0,
+        usd: float = 0.0,
+        model: str | None = None,
+    ) -> None:
+        key = (agent_id, str(session_id))
+        cur_usd, cur_tok = self._session.get(key, (0.0, 0))
+        self._session[key] = (cur_usd + usd, cur_tok + tokens)
+        d_usd, d_tok = self._daily.get(agent_id, (0.0, 0))
+        self._daily[agent_id] = (d_usd + usd, d_tok + tokens)
+
+    async def get_session_usage(
+        self, agent_id: str, session_id: "uuid4",  # type: ignore[valid-type]
+    ) -> tuple[float, int]:
+        return self._session.get((agent_id, str(session_id)), (0.0, 0))
+
+    async def get_agent_daily_usage(self, agent_id: str) -> tuple[float, int]:
+        return self._daily.get(agent_id, (0.0, 0))
+
+    async def get_session_and_daily_usage(
+        self, agent_id: str, session_id: "uuid4",  # type: ignore[valid-type]
+    ) -> tuple[float, int, float, int]:
+        self.combined_called = True
+        s_usd, s_tok = await self.get_session_usage(agent_id, session_id)
+        d_usd, d_tok = await self.get_agent_daily_usage(agent_id)
+        return (s_usd, s_tok, d_usd, d_tok)
+
+    async def get_session_start_time(self, *_args: object) -> None:
+        return None
+
+    async def get_session_elapsed_seconds(self, *_args: object) -> float | None:
+        return None
+
+    async def close(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_combined_query_used_when_available(audit: "AuditModule") -> None:
+    """CostModule.check_or_raise should use get_session_and_daily_usage
+    when the store supports it (PostgresCostStore), doing 1 round-trip.
+    """
+    from codeatelier_governance.audit import AuditModule
+
+    store = _CombinedQueryStore()
+    cost = CostModule(audit, store=store)  # type: ignore[arg-type]
+    cost.register(BudgetPolicy(agent_id="combo", per_session_usd=10.0, per_agent_usd_daily=20.0))
+
+    sid = uuid4()
+    await store.track("combo", sid, tokens=100, usd=0.50)
+
+    await cost.check_or_raise("combo", sid)
+
+    # Verify the combined method was called (not the two separate ones)
+    assert store.combined_called is True
+
+
+# ---------------------------------------------------------------------------
+# Exploit: concurrent track+check_or_raise at budget boundary
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_concurrent_check_or_raise_at_boundary(cost: CostModule) -> None:
+    """Adversarial race: concurrent track+check interleaving at the boundary.
+
+    Setup: $1.00 budget, $0.95 already spent.
+    Attack: 10 concurrent coroutines each track($0.10) then check_or_raise().
+    Expected:
+      - At LEAST some check_or_raise calls must raise BudgetExceeded
+        (since $0.95 + $0.10 = $1.05 > $1.00 after the very first track).
+      - The total tracked amount must never exceed $1.95
+        ($0.95 initial + 10 * $0.10) — counters are monotonic.
+    """
+    cost.register(BudgetPolicy(agent_id="racer", per_session_usd=1.00))
+    sid = uuid4()
+    await cost.track("racer", sid, usd=0.95)
+
+    async def track_then_check() -> None:
+        """Single attacker coroutine: spend $0.10 then check budget."""
+        await cost.track("racer", sid, usd=0.10)
+        await cost.check_or_raise("racer", sid)
+
+    results = await asyncio.gather(
+        *(track_then_check() for _ in range(10)),
+        return_exceptions=True,
+    )
+
+    exceptions = [r for r in results if isinstance(r, BudgetExceeded)]
+    # After the first track, total is $1.05 > $1.00 — at least some must fail
+    assert len(exceptions) >= 1, (
+        "Expected at least one BudgetExceeded but all 10 concurrent "
+        "track+check calls passed. The race condition was not detected."
+    )
+
+    # Counters are monotonic — total must be exactly $0.95 + 10 * $0.10 = $1.95
+    snap = await cost.snapshot("racer", sid)
+    assert snap.session_usd_used <= 1.95 + 1e-9, (
+        f"Counter exceeded theoretical max: {snap.session_usd_used}"
+    )
+    assert snap.session_usd_used >= 0.95, (
+        f"Counter lost updates: {snap.session_usd_used}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_combined_query_returns_correct_values() -> None:
+    """The combined query should return consistent session+daily values."""
+    store = _CombinedQueryStore()
+    sid = uuid4()
+
+    await store.track("agent-x", sid, tokens=500, usd=1.50)
+    await store.track("agent-x", sid, tokens=300, usd=0.75)
+
+    s_usd, s_tok, d_usd, d_tok = await store.get_session_and_daily_usage("agent-x", sid)
+    assert s_usd == pytest.approx(2.25)
+    assert s_tok == 800
+    assert d_usd == pytest.approx(2.25)
+    assert d_tok == 800

@@ -61,7 +61,7 @@ def _run_migrate_dry_run() -> None:
     """Print all DDL that would be executed, without touching the database."""
     for ddl_path in _DDL_FILES:
         if not ddl_path.exists():
-            sys.stderr.write(f"Warning: DDL file not found: {ddl_path}\n")
+            sys.stderr.write(f"Warning: DDL file not found: {ddl_path.name}\n")
             continue
         sys.stdout.write(f"-- {ddl_path.name}\n")
         sys.stdout.write(ddl_path.read_text())
@@ -122,7 +122,7 @@ async def _run_migrate(database_url: str) -> None:
     try:
         for ddl_path in _DDL_FILES:
             if not ddl_path.exists():
-                sys.stderr.write(f"Warning: DDL file not found: {ddl_path}\n")
+                sys.stderr.write(f"Warning: DDL file not found: {ddl_path.name}\n")
                 continue
             ddl_sql = ddl_path.read_text()
             from sqlalchemy import text
@@ -581,10 +581,16 @@ async def _run_console_add_user(
             )
         sys.stdout.write(f"Created user '{username}' with role '{role}'.\n")
     except Exception as exc:
-        if "unique" in str(exc).lower() or "duplicate" in str(exc).lower():
+        from sqlalchemy.exc import IntegrityError
+        if isinstance(exc, IntegrityError):
             sys.stderr.write(f"Error: username '{username}' already exists.\n")
             sys.exit(1)
-        raise
+        logger.error(
+            "cli.add_user_failed",
+            error_type=type(exc).__name__,
+        )
+        sys.stderr.write(f"Error: failed to create user ({type(exc).__name__}). Check database connectivity.\n")
+        sys.exit(1)
     finally:
         await engine.dispose()
 
