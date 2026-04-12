@@ -137,6 +137,16 @@ def _wrap_sync_create(
         model = kwargs.get("model", "unknown")
         is_streaming = kwargs.get("stream", False)
 
+        # Model selection policy — advisory, never raises
+        if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
+            _suggested = await sdk.routing.suggest(
+                agent_id, session_id, str(model),
+                max_tokens=int(kwargs.get("max_tokens", 1000)),
+            )
+            if _suggested != str(model):
+                kwargs["model"] = _suggested
+                model = _suggested
+
         await sdk.cost.check_or_raise(agent_id, session_id)
 
         # Background the pre-call audit (observation-only, not enforcement)
@@ -208,6 +218,16 @@ def _wrap_sync_create(
         model = kwargs.get("model", "unknown")
         is_streaming = kwargs.get("stream", False)
 
+        # Model selection policy — advisory, sync path
+        if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
+            _suggested = asyncio.run(sdk.routing.suggest(
+                agent_id, session_id, str(model),
+                max_tokens=int(kwargs.get("max_tokens", 1000)),
+            ))
+            if _suggested != str(model):
+                kwargs["model"] = _suggested
+                model = _suggested
+
         asyncio.run(sdk.cost.check_or_raise(agent_id, session_id))
 
         asyncio.run(_safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id))
@@ -276,6 +296,16 @@ def _wrap_async_create(
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
         is_streaming = kwargs.get("stream", False)
+
+        # Model selection policy — advisory, never raises
+        if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
+            _suggested = await sdk.routing.suggest(
+                agent_id, session_id, str(model),
+                max_tokens=int(kwargs.get("max_tokens", 1000)),
+            )
+            if _suggested != str(model):
+                kwargs["model"] = _suggested
+                model = _suggested
 
         # Enforcement: check budget BEFORE the call (must stay on critical path).
         await sdk.cost.check_or_raise(agent_id, session_id)

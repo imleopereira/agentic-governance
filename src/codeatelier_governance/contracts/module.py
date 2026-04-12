@@ -206,7 +206,16 @@ class ContractsModule:
         agent_id: str,
         session_id: UUID,
     ) -> bool:
-        """Check if there is a resolved gate with resolution='granted'."""
+        """Check if there is an unexpired granted HITL approval for ``agent_id``.
+
+        Delegates to :meth:`GatesStore.has_granted_approval`, which is
+        implemented by both ``InMemoryGatesStore`` and
+        ``PostgresGatesStore``.  Fixed in v0.5.1 — prior versions reached
+        into in-memory store private attributes and returned ``False``
+        unconditionally for Postgres, which silently broke every
+        HITL-gated contract deployed with a Postgres backend (legitimate
+        approved actions were blocked — over-blocking, not bypass).
+        """
         if self._gates is None:
             logger.warning(
                 "contracts.hitl_check_no_gates_module",
@@ -215,32 +224,8 @@ class ContractsModule:
             return False
         try:
             store = self._gates._store
-            # Scan all resolutions for a granted one matching this agent.
-            # The gates store exposes get_resolution by request_id, but we need
-            # to check if ANY request for this agent+session was granted.
-            # Use the store's internal state for in-memory, or query for Postgres.
-            if hasattr(store, "_resolutions"):
-                # InMemoryGatesStore: check if any granted resolution exists.
-                # After resolve(), the pending entry is popped, so we check
-                # both _pending (unresolved) and _resolutions (resolved).
-                # For resolved requests, agent_id filtering requires the
-                # request to still be in _pending — if it was popped, we
-                # accept any grant scoped to this SDK instance.
-                # TODO(v0.5): store agent_id alongside resolution for stricter filtering.
-                async with store._lock:
-                    for req_id, resolution in store._resolutions.items():
-                        if resolution == "granted":
-                            # Try to verify agent_id if pending entry still exists
-                            pending = store._pending.get(req_id) if hasattr(store, "_pending") else None
-                            if pending is not None:
-                                req_agent = getattr(pending, "agent_id", None)
-                                if req_agent != agent_id:
-                                    continue
-                            return True
-                return False
-            # Fallback: no way to query without request_id — fail closed
-            return False
-        except Exception as exc:
+            return await store.has_granted_approval(agent_id)
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "contracts.hitl_check_failed",
                 agent_id=agent_id,

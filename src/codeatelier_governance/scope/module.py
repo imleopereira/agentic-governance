@@ -51,6 +51,16 @@ class ScopeModule:
         self._database_url = database_url
         self._engine: Any = engine
         self._owns_engine = False
+        # Strong references to in-flight DB upsert tasks so they are not
+        # GC'd mid-execution.  Populated when register() is called with a
+        # running event loop.
+        self._pending_upsert_tasks: set[asyncio.Task[Any]] = set()
+        # Policies registered before any event loop was running.  Drained
+        # by ``flush_pending_upserts()`` at SDK start().  This replaces
+        # the v0.5.0 behaviour of calling ``asyncio.run()`` inline, which
+        # violated invariant #3 ("SDK MUST NOT hold long-running
+        # connections in the user's request path") during sync startup.
+        self._pending_upsert_policies: list[ScopePolicy] = []
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
 
@@ -81,26 +91,48 @@ class ScopeModule:
     def _persist_policy_best_effort(
         self, agent_id: str, policy_type: str, policy: ScopePolicy,
     ) -> None:
-        """Best-effort upsert of a policy to Postgres. Never raises."""
+        """Best-effort upsert of a policy to Postgres. Never raises.
+
+        Behaviour:
+          * If a running event loop is available, schedules the upsert as
+            a background task held in ``_pending_upsert_tasks`` (no
+            fire-and-forget, no GC loss).
+          * If NO event loop is running (the sync-startup path), queues
+            the policy in ``_pending_upsert_policies`` to be drained by
+            :meth:`flush_pending_upserts` at ``sdk.start()``.  This avoids
+            the v0.5.0 anti-pattern of calling ``asyncio.run()`` inline,
+            which violated invariant #3 and could deadlock in sync
+            codebases that already owned an outer loop.
+        """
         engine = self._get_engine()
         if engine is None:
             return
         try:
-            import asyncio as _asyncio
-
             loop: asyncio.AbstractEventLoop | None = None
             try:
-                loop = _asyncio.get_running_loop()
+                loop = asyncio.get_running_loop()
             except RuntimeError:
                 pass
 
             if loop is not None and loop.is_running():
-                loop.create_task(
+                task = loop.create_task(
                     self._upsert_policy(engine, agent_id, policy_type, policy)
                 )
+                self._pending_upsert_tasks.add(task)
+                task.add_done_callback(
+                    self._pending_upsert_tasks.discard
+                )
             else:
-                _asyncio.run(
-                    self._upsert_policy(engine, agent_id, policy_type, policy)
+                # Defer until sdk.start() drains the queue.
+                self._pending_upsert_policies.append(policy)
+                logger.info(
+                    "scope.persist_policy_deferred",
+                    agent_id=agent_id,
+                    policy_type=policy_type,
+                    detail=(
+                        "No event loop running at register() time; "
+                        "upsert deferred until sdk.start()."
+                    ),
                 )
         except Exception as exc:
             logger.warning(
@@ -109,6 +141,32 @@ class ScopeModule:
                 policy_type=policy_type,
                 exc_type=type(exc).__name__,
             )
+
+    async def flush_pending_upserts(self) -> None:
+        """Drain policies that were registered before the event loop started.
+
+        Called from ``GovernanceSDK.start()``.  Never raises — failures
+        are logged and the queue is cleared so retries do not pile up.
+        """
+        if not self._pending_upsert_policies:
+            return
+        engine = self._get_engine()
+        if engine is None:
+            self._pending_upsert_policies.clear()
+            return
+        pending = self._pending_upsert_policies
+        self._pending_upsert_policies = []
+        for policy in pending:
+            try:
+                await self._upsert_policy(
+                    engine, policy.agent_id, "scope", policy
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "scope.deferred_upsert_failed",
+                    agent_id=policy.agent_id,
+                    exc_type=type(exc).__name__,
+                )
 
     @staticmethod
     async def _upsert_policy(
@@ -168,11 +226,39 @@ class ScopeModule:
         """Remove hidden tools from a tool list.
 
         Used before passing tools to the LLM so the agent never even
-        knows the hidden tools exist. If no policy is registered for
-        the agent, the full list is returned unchanged.
+        knows the hidden tools exist.
+
+        **Fail-closed on unknown agent.** If no policy is registered for
+        ``agent_id``, this method raises :class:`PolicyNotRegistered` to
+        mirror :meth:`check`'s default-deny contract.  Prior to v0.5.1 the
+        method returned the full tool list unchanged when no policy was
+        registered — an unintentional bypass that let ``hidden_tools``
+        leak to unregistered agents.  Callers that previously relied on
+        the pass-through behaviour must now either register a policy
+        (possibly with ``allowed_tools=frozenset()`` for a no-op policy)
+        or catch ``PolicyNotRegistered`` at the call site and decide
+        explicitly whether to pass or drop the tool list.
+
+        Raises:
+            PolicyNotRegistered: no policy exists for ``agent_id``.
         """
         policy = self._policies.get(agent_id)
-        if policy is None or not policy.hidden_tools:
+        if policy is None:
+            raise PolicyNotRegistered(
+                f"scope.filter_tools: no policy registered for agent_id="
+                f"{agent_id!r}.  Fail-closed as of v0.5.1 — previous "
+                f"versions silently returned the full tool list, which "
+                f"bypassed hidden_tools for unregistered agents.\n"
+                f"Fix: call sdk.scope.register(ScopePolicy(agent_id=..., "
+                f"allowed_tools=..., hidden_tools=...)) at startup, or "
+                f"catch PolicyNotRegistered at the call site and decide "
+                f"explicitly whether to drop the tool list.",
+                recovery_hint=(
+                    "Register a ScopePolicy for this agent_id OR catch "
+                    "PolicyNotRegistered and handle it explicitly."
+                ),
+            )
+        if not policy.hidden_tools:
             return tools
         return [t for t in tools if t not in policy.hidden_tools]
 

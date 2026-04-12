@@ -23,7 +23,7 @@ import structlog
 
 from .audit.jsonl_store import JsonlFallbackStore
 from .audit.module import AuditModule
-from .audit.store import AuditStore, BatchingWriter, InMemoryAuditStore
+from .audit.store import AuditStore, BatchingWriter, InMemoryAuditStore  # noqa: F401
 from .contracts.module import ContractsModule
 from .cost.module import CostModule
 from .gates.module import GatesModule
@@ -52,11 +52,34 @@ class GovernanceConfig:
     database_url: str | None = None
     api_key: str | None = None
     audit_secret: bytes | None = None
+    # When False, the audit substrate uses an in-memory ring buffer and no
+    # persistence (no Postgres writes, no JSONL fallback).  ``sdk.audit``
+    # still exists because every other module needs it to log events, but
+    # those events are dropped on process exit.  Intended for test mode and
+    # privacy-sensitive isolated runs.  Production deployments MUST leave
+    # this True to preserve the HMAC-chained tamper-evident audit trail.
     enable_audit: bool = True
+    # When False, ``sdk.gates``, ``sdk.scope``, ``sdk.cost`` do not exist.
+    # Any code path that calls them raises AttributeError — loud rather
+    # than silent.  Modules that depend on a disabled module are cascaded:
+    # if ``enable_scope=False`` or ``enable_cost=False``, contracts is
+    # automatically disabled because it has no way to enforce scope- or
+    # budget-based pre-conditions.
     enable_gates: bool = True
     enable_scope: bool = True
     enable_cost: bool = True
+    # Reserved for a future PromptsModule (stub lives at
+    # codeatelier_governance.prompts).  Kept in the config for forward
+    # compatibility so callers that pre-emptively set the flag do not
+    # break when the real module lands.
     enable_prompts: bool = True
+    # Routing is an advisory feature that can mutate the model on an LLM
+    # call.  It is OFF by default — enable it explicitly at SDK construction
+    # time AND register at least one RoutingPolicy for it to take effect on
+    # the request path.  Keeping this off-by-default matches the "every
+    # module is opt-in via config, not code changes" invariant from
+    # CLAUDE.md and prevents silent model substitution.
+    enable_routing: bool = False
 
 
 class GovernanceSDK:
@@ -132,31 +155,101 @@ class GovernanceSDK:
                 connect_args={"command_timeout": 5},
             )
 
-        store = self._build_audit_store(database_url, self._shared_engine)
-        # Durable fallback: when the primary is down, audit events spill to
-        # this on-disk JSONL so they survive process restarts and crashes.
-        fallback = JsonlFallbackStore(fallback_path or DEFAULT_FALLBACK_PATH)
-        writer = BatchingWriter(primary=store, fallback=fallback)
-        self.audit = AuditModule(store, secret=resolved_secret, writer=writer)
+        # ------------------------------------------------------------------
+        # Audit substrate (always constructed because every other module
+        # needs it to log events).  When ``enable_audit=False`` the audit
+        # module is backed by an in-memory ring buffer with no persistence,
+        # no BatchingWriter, no JSONL fallback — events are accepted and
+        # dropped.  ``sdk.audit`` still exists so dependent modules keep
+        # working, but a loud warning is logged at init so operators know
+        # audit persistence is off.
+        # ------------------------------------------------------------------
+        if self.config.enable_audit:
+            store = self._build_audit_store(database_url, self._shared_engine)
+            # Durable fallback: when the primary is down, audit events spill
+            # to this on-disk JSONL so they survive process restarts.
+            fallback = JsonlFallbackStore(
+                fallback_path or DEFAULT_FALLBACK_PATH
+            )
+            writer = BatchingWriter(primary=store, fallback=fallback)
+            self.audit = AuditModule(store, secret=resolved_secret, writer=writer)
+        else:
+            logger.warning(
+                "sdk.audit_disabled",
+                detail=(
+                    "enable_audit=False — audit events are accepted by the "
+                    "API but NOT persisted.  No HMAC chain, no Postgres "
+                    "write, no JSONL fallback.  Intended for test mode and "
+                    "privacy-sensitive isolated runs only.  Set "
+                    "enable_audit=True for any production deployment."
+                ),
+            )
+            self.audit = AuditModule(
+                InMemoryAuditStore(max_events=64),
+                secret=resolved_secret,
+            )
 
-        # All enforcement modules share the audit substrate; the gates module
-        # reuses the same secret for HMAC-signed approval tokens.
-        cost_store = self._build_cost_store(database_url, self._shared_engine)
-        gates_store = self._build_gates_store(database_url, self._shared_engine)
-        self.scope = ScopeModule(
-            self.audit, database_url=database_url, engine=self._shared_engine,
-        )
-        self.cost = CostModule(
-            self.audit,
-            store=cost_store,
-            fail_open=cost_fail_open,
-            database_url=database_url,
-            engine=self._shared_engine,
-        )
-        self.gates = GatesModule(
-            self.audit, secret=resolved_secret, store=gates_store
-        )
-        # v0.3 modules
+        # ------------------------------------------------------------------
+        # Enforcement modules — each honors its own ``enable_X`` flag.  A
+        # disabled module is NOT constructed; ``sdk.scope`` / ``sdk.cost`` /
+        # ``sdk.gates`` simply do not exist when their flag is False, and
+        # any code calling them gets a loud AttributeError instead of a
+        # silent no-op.
+        # ------------------------------------------------------------------
+        if self.config.enable_scope:
+            self.scope = ScopeModule(
+                self.audit,
+                database_url=database_url,
+                engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.scope_disabled",
+                detail=(
+                    "enable_scope=False — sdk.scope is not constructed.  "
+                    "Any call to sdk.scope.* will raise AttributeError."
+                ),
+            )
+
+        if self.config.enable_cost:
+            cost_store = self._build_cost_store(
+                database_url, self._shared_engine
+            )
+            self.cost = CostModule(
+                self.audit,
+                store=cost_store,
+                fail_open=cost_fail_open,
+                database_url=database_url,
+                engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.cost_disabled",
+                detail=(
+                    "enable_cost=False — sdk.cost is not constructed.  "
+                    "Budget enforcement and cost tracking are off."
+                ),
+            )
+
+        if self.config.enable_gates:
+            gates_store = self._build_gates_store(
+                database_url, self._shared_engine
+            )
+            self.gates = GatesModule(
+                self.audit, secret=resolved_secret, store=gates_store,
+            )
+        else:
+            logger.warning(
+                "sdk.gates_disabled",
+                detail=(
+                    "enable_gates=False — sdk.gates is not constructed.  "
+                    "HITL approval tokens cannot be minted or resolved."
+                ),
+            )
+
+        # v0.3 modules — not gated behind config flags at this time (loop
+        # and presence have no dedicated enable_* flag yet).  Added as a
+        # v0.5.1 followup if there is customer demand.
         self.loop = LoopModule(
             self.audit,
             policies=loop_policies,
@@ -166,9 +259,65 @@ class GovernanceSDK:
         self.presence = PresenceModule(
             database_url=database_url, engine=self._shared_engine,
         )
-        self.contracts = ContractsModule(
-            self.audit, self.scope, self.cost, gates=self.gates,
+
+        # Contracts depends on scope + cost (+ gates for HITL).  Cascade
+        # disable: if any hard dependency is off, contracts is also off and
+        # sdk.contracts does not exist.  Log the cascade reason so operators
+        # see exactly which flag triggered it.
+        contracts_deps_ok = (
+            self.config.enable_scope and self.config.enable_cost
         )
+        if contracts_deps_ok:
+            self.contracts = ContractsModule(
+                self.audit,
+                self.scope,
+                self.cost,
+                gates=self.gates if self.config.enable_gates else None,
+            )
+        else:
+            missing = [
+                name
+                for name, enabled in (
+                    ("scope", self.config.enable_scope),
+                    ("cost", self.config.enable_cost),
+                )
+                if not enabled
+            ]
+            logger.warning(
+                "sdk.contracts_disabled_cascade",
+                detail=(
+                    f"contracts module disabled because its dependencies "
+                    f"are off: {', '.join(missing)}.  Re-enable these "
+                    f"flags to use sdk.contracts.*."
+                ),
+            )
+
+        # Routing is opt-in via ``enable_routing``.  When disabled, the
+        # attribute does not exist on the SDK at all — wrappers use
+        # ``getattr(sdk, "routing", None)`` to detect activation, and
+        # ``sdk.routing.register(...)`` raises AttributeError to make
+        # misconfiguration loud rather than silent.  Routing also requires
+        # cost to be enabled (it calls cost.snapshot() to make budget-aware
+        # decisions) — cascade disable if cost is off.
+        if self.config.enable_routing:
+            if not self.config.enable_cost:
+                logger.warning(
+                    "sdk.routing_disabled_cascade",
+                    detail=(
+                        "enable_routing=True but enable_cost=False.  "
+                        "Routing requires the cost module for budget-aware "
+                        "decisions.  sdk.routing is NOT constructed."
+                    ),
+                )
+            else:
+                from .routing.module import RoutingModule
+                self.routing = RoutingModule(
+                    self.audit,
+                    self.cost,
+                    scope=self.scope if self.config.enable_scope else None,
+                    database_url=database_url,
+                    engine=self._shared_engine,
+                )
 
     # ------------------------------------------------------------------
     # Audit secret resolution
@@ -311,21 +460,40 @@ class GovernanceSDK:
         from .cost.models import BudgetPolicy as _BudgetPolicy
         from .scope.models import ScopePolicy as _ScopePolicy
 
-        scope_policies = await self.scope.get_stored_policies()
-        cost_policies = await self.cost.get_stored_policies()
+        scope_count = 0
+        cost_count = 0
+        routing_count = 0
 
-        new_scope: dict[str, _ScopePolicy] = {p.agent_id: p for p in scope_policies}
-        new_cost: dict[str, _BudgetPolicy] = {p.agent_id: p for p in cost_policies}
+        if hasattr(self, "scope"):
+            scope_policies = await self.scope.get_stored_policies()
+            new_scope: dict[str, _ScopePolicy] = {
+                p.agent_id: p for p in scope_policies
+            }
+            self.scope._policies = new_scope  # atomic dict replace under GIL
+            scope_count = len(new_scope)
 
-        # Dict assignment is atomic under the GIL
-        self.scope._policies = new_scope
-        self.cost._policies = new_cost
+        if hasattr(self, "cost"):
+            cost_policies = await self.cost.get_stored_policies()
+            new_cost: dict[str, _BudgetPolicy] = {
+                p.agent_id: p for p in cost_policies
+            }
+            self.cost._policies = new_cost
+            cost_count = len(new_cost)
+
+        if self.config.enable_routing and hasattr(self, "routing"):
+            routing_policies = await self.routing.get_stored_policies()
+            self.routing._policies = {
+                p.agent_id: p for p in routing_policies
+            }
+            routing_count = len(self.routing._policies)
+
         self._last_policy_updated_at = max_updated
 
         logger.info(
             "hot_reload.policies_reloaded",
-            scope_count=len(new_scope),
-            cost_count=len(new_cost),
+            scope_count=scope_count,
+            cost_count=cost_count,
+            routing_count=routing_count,
         )
 
     # ------------------------------------------------------------------
@@ -341,8 +509,22 @@ class GovernanceSDK:
         deployments like AWS Lambda).
         """
         self._started = True
-        if self.config.enable_audit:
-            await self.audit.start()
+        # self.audit always exists — either wired to a real persistent
+        # substrate (enable_audit=True) or an in-memory ring buffer
+        # (enable_audit=False).  Either way the writer lifecycle must run
+        # so .log() calls from dependent modules handle their own buffer
+        # state correctly.
+        await self.audit.start()
+        # Drain policies that were registered synchronously (before any
+        # event loop was running).  This replaces the v0.5.0 behaviour of
+        # calling ``asyncio.run()`` inside ``register()``, which violated
+        # invariant #3 and could deadlock sync startup.
+        if hasattr(self, "scope"):
+            await self.scope.flush_pending_upserts()
+        if hasattr(self, "cost"):
+            await self.cost.flush_pending_upserts()
+        if hasattr(self, "routing"):
+            await self.routing.flush_pending_upserts()
         if self._hot_reload_enabled:
             # Load policies immediately so the first request has them.
             # Without this, there is a 30-second gap where _policies is empty.
@@ -365,8 +547,7 @@ class GovernanceSDK:
             except asyncio.CancelledError:
                 pass
             self._hot_reload_task = None
-        if self.config.enable_audit:
-            await self.audit.close()
+        await self.audit.close()
         await self.loop.close()
         await self.presence.close()
         # Dispose the shared engine last, after all modules have released

@@ -55,6 +55,25 @@ class GatesStore(ABC):
     ) -> Resolution | None:
         """Return ``'granted'`` / ``'denied'`` / None (still pending)."""
 
+    @abstractmethod
+    async def has_granted_approval(
+        self,
+        agent_id: str,
+    ) -> bool:
+        """Return True if at least one unexpired granted approval exists for ``agent_id``.
+
+        Used by ``ContractsModule._check_hitl_approved`` to answer
+        "can this agent proceed with an HITL-gated action?".  The check
+        is scoped to the agent_id and must exclude expired approvals.
+
+        Added in v0.5.1.  Prior to v0.5.1 the check was implemented by
+        reaching into ``InMemoryGatesStore`` private attributes, and
+        returned ``False`` unconditionally for ``PostgresGatesStore`` —
+        which broke HITL-gated contracts in every production deployment
+        using a Postgres backend (over-blocking: legitimate approved
+        actions were denied).
+        """
+
     async def close(self) -> None:
         return None
 
@@ -65,6 +84,11 @@ class InMemoryGatesStore(GatesStore):
     def __init__(self) -> None:
         self._pending: dict[UUID, ApprovalRequest] = {}
         self._resolutions: dict[UUID, Resolution] = {}
+        # v0.5.1: retain the resolved request record (not just the
+        # resolution literal) so ``has_granted_approval`` can filter by
+        # agent_id and expires_at.  Prior to v0.5.1 the resolve() path
+        # popped the pending entry, losing agent_id.
+        self._resolved_requests: dict[UUID, ApprovalRequest] = {}
         self._lock = asyncio.Lock()
 
     async def insert_pending(self, request: ApprovalRequest) -> None:
@@ -94,6 +118,7 @@ class InMemoryGatesStore(GatesStore):
                     "approval token: unknown request_id"
                 )
             self._resolutions[request_id] = resolution
+            self._resolved_requests[request_id] = req
             self._pending.pop(request_id, None)
             return req
 
@@ -103,3 +128,30 @@ class InMemoryGatesStore(GatesStore):
     ) -> Resolution | None:
         async with self._lock:
             return self._resolutions.get(request_id)
+
+    async def has_granted_approval(
+        self,
+        agent_id: str,
+    ) -> bool:
+        """Return True if an unexpired granted approval exists for ``agent_id``."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        async with self._lock:
+            for req_id, resolution in self._resolutions.items():
+                if resolution != "granted":
+                    continue
+                req = self._resolved_requests.get(req_id)
+                if req is None:
+                    continue
+                if req.agent_id != agent_id:
+                    continue
+                expires_at = req.expires_at
+                # Normalise tz-naive expires_at to UTC so comparison does
+                # not raise TypeError.
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if expires_at <= now:
+                    continue
+                return True
+        return False
