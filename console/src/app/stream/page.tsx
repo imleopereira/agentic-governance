@@ -330,16 +330,58 @@ export default function StreamPage() {
         <h1 style={{ fontSize: "1.375rem", fontWeight: 700 }}>Live Event Stream</h1>
         <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
           <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.8125rem" }}>
-            <span aria-hidden="true" style={{
-              width: 8, height: 8, borderRadius: "50%",
-              background: connectionStatus === "connected" ? "var(--status-live)" :
-                          connectionStatus === "connecting" ? "var(--status-idle)" : "var(--danger)",
-              animation: connectionStatus === "connected" ? "live-pulse 2s ease-in-out infinite" : undefined,
-            }} />
-            <span aria-label={`Stream status: ${connectionStatus}`} style={{ color: "var(--text-secondary)" }}>
-              {connectionStatus === "connected" ? "Streaming" :
-               connectionStatus === "connecting" ? "Connecting…" : "Disconnected"}
-            </span>
+            {/* Indicator precedence (critical → informational):
+                  1. Disconnected → red, no pulse — connection loss trumps even
+                     user-initiated pause, so an operator who paused and then
+                     lost the connection still sees the red indicator at a glance.
+                  2. Connecting   → blue, no pulse.
+                  3. Paused       → amber, no pulse — user froze the feed themselves.
+                  4. Connected / polling → green + pulse (default happy state). */}
+            {(() => {
+              const isDisconnected = connectionStatus === "disconnected";
+              const isConnecting = connectionStatus === "connecting";
+              const isLive =
+                connectionStatus === "connected" || connectionStatus === "polling";
+              const dotColor = isDisconnected
+                ? "var(--danger)"
+                : isConnecting
+                ? "var(--status-idle)"
+                : paused
+                ? "var(--warn)"
+                : "var(--status-live)";
+              const dotAnim = isLive && !paused
+                ? "live-pulse 2s ease-in-out infinite"
+                : undefined;
+              const labelText = isDisconnected
+                ? paused ? "Disconnected — paused" : "Disconnected"
+                : isConnecting
+                ? "Connecting…"
+                : paused
+                ? "Paused"
+                : "Streaming";
+              const labelColor = isDisconnected
+                ? "var(--danger)"
+                : paused
+                ? "var(--warn)"
+                : "var(--text-secondary)";
+              const ariaStatus = isDisconnected
+                ? paused ? "disconnected and paused" : "disconnected"
+                : paused
+                ? "paused"
+                : connectionStatus;
+              return (
+                <>
+                  <span aria-hidden="true" style={{
+                    width: 8, height: 8, borderRadius: "50%",
+                    background: dotColor,
+                    animation: dotAnim,
+                  }} />
+                  <span aria-label={`Stream status: ${ariaStatus}`} style={{ color: labelColor }}>
+                    {labelText}
+                  </span>
+                </>
+              );
+            })()}
           </span>
           <button
             onClick={() => setPaused((v) => !v)}
