@@ -9,7 +9,6 @@ Postgres, so we test the health endpoint (unauthenticated), the SSE endpoint
 """
 from __future__ import annotations
 
-import os
 from typing import Any
 from unittest.mock import patch
 
@@ -32,8 +31,7 @@ class TestHealthEndpoint:
     """Gap #6: /api/health is unauthenticated and always returns ok."""
 
     def test_health_returns_ok(self) -> None:
-        from starlette.testclient import TestClient
-        from codeatelier_governance.console.app import app, health
+        from codeatelier_governance.console.app import health
 
         # Health endpoint bypasses auth (checked in authenticate dependency)
         # We call the endpoint function directly to avoid lifespan issues

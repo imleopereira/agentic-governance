@@ -18,7 +18,7 @@ Coverage:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -422,11 +422,14 @@ async def test_max_tokens_affects_cost_estimate(
         )
     )
 
-    # Trigger routing with two different max_tokens values
-    result_small = await routing.suggest(
+    # Trigger routing with two different max_tokens values.
+    # Return values are intentionally discarded — the assertion below
+    # inspects the emitted routing.suggestion audit events, not the
+    # returned model strings.
+    await routing.suggest(
         agent_id, session_id, "claude-opus-4-6", max_tokens=100
     )
-    result_large = await routing.suggest(
+    await routing.suggest(
         agent_id, session_id, "claude-opus-4-6", max_tokens=10000
     )
 

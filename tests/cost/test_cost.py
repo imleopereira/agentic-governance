@@ -289,7 +289,6 @@ async def test_combined_query_used_when_available(audit: "AuditModule") -> None:
     """CostModule.check_or_raise should use get_session_and_daily_usage
     when the store supports it (PostgresCostStore), doing 1 round-trip.
     """
-    from codeatelier_governance.audit import AuditModule
 
     store = _CombinedQueryStore()
     cost = CostModule(audit, store=store)  # type: ignore[arg-type]
