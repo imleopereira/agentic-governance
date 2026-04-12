@@ -119,3 +119,56 @@ async def test_jsonl_fallback_drain_to_primary(tmp_path: Path) -> None:
 async def test_jsonl_fallback_count_when_empty(tmp_path: Path) -> None:
     fallback = JsonlFallbackStore(tmp_path / "missing.jsonl")
     assert await fallback.count() == 0
+
+
+# -- Gap #2: Read-only filesystem fallback to in-memory buffer -----------------
+
+
+@pytest.mark.asyncio
+async def test_jsonl_readonly_fs_falls_back_to_memory(tmp_path: Path) -> None:
+    """When mkdir raises OSError, the store falls back to in-memory buffer.
+
+    Events should still be written and drainable, they just won't survive
+    a process restart.
+    """
+    # Use a path inside a non-existent read-only parent
+    impossible_path = tmp_path / "readonly" / "nested" / "audit.jsonl"
+    # Make the parent read-only so mkdir fails
+    readonly_dir = tmp_path / "readonly"
+    readonly_dir.mkdir()
+    readonly_dir.chmod(0o444)
+
+    try:
+        store = JsonlFallbackStore(impossible_path)
+        # The store should have detected the OS error and set _fs_available=False
+        assert store._fs_available is False
+
+        # Events should go to the in-memory buffer
+        sid = uuid4()
+        from codeatelier_governance.audit.models import AuditEventRecord
+        from datetime import datetime
+
+        record = AuditEventRecord(
+            event_id=uuid4(),
+            session_id=sid,
+            agent_id="test",
+            parent_event_id=None,
+            kind="test.event",
+            input_hash=None,
+            output_hash=None,
+            metadata={},
+            prev_hash=None,
+            hmac="a" * 64,
+            created_at=datetime.now(),
+        )
+        await store.write_batch([record])
+        assert len(store._memory_buffer) == 1
+
+        # Drain to a target should move the memory events
+        target = InMemoryAuditStore()
+        drained = await store.drain_to(target)
+        assert drained == 1
+        assert len(store._memory_buffer) == 0
+    finally:
+        # Restore permissions for cleanup
+        readonly_dir.chmod(0o755)

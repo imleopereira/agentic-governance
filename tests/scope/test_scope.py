@@ -266,3 +266,44 @@ def test_policy_with_both_allowed_and_hidden(scope: ScopeModule) -> None:
     assert "write" not in result
     assert "read" in result
     assert "list" in result
+
+
+# ---------------------------------------------------------------------------
+# Exploit: case-sensitivity bypass
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_case_sensitive_tool_check(scope: ScopeModule) -> None:
+    """Register policy with 'read_file', check 'READ_FILE' — must be denied.
+
+    This proves an attacker cannot bypass the whitelist by changing case.
+    Tool matching is case-sensitive by design (frozenset membership test).
+    """
+    scope.register(
+        ScopePolicy(agent_id="case-test", allowed_tools=frozenset({"read_file"}))
+    )
+    # Exact match works
+    await scope.check(agent_id="case-test", tool="read_file")
+    # Case variations must all be denied
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="READ_FILE")
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="Read_File")
+    with pytest.raises(ScopeViolation):
+        await scope.check(agent_id="case-test", tool="READ_file")
+
+
+# ---------------------------------------------------------------------------
+# Exploit: SQL injection in tool name
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_sql_injection_in_tool_name(scope: ScopeModule) -> None:
+    """SQL injection payload as tool name must raise ScopeViolation, not
+    execute the SQL."""
+    scope.register(
+        ScopePolicy(agent_id="sqli", allowed_tools=frozenset({"safe_tool"}))
+    )
+    with pytest.raises(ScopeViolation):
+        await scope.check(
+            agent_id="sqli",
+            tool="'; DROP TABLE governance_audit_events; --",
+        )

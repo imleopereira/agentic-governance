@@ -201,7 +201,9 @@ export const api = {
       `/api/gates/${requestId}/deny`,
       rationale ? { rationale } : undefined
     ),
-  /** Kill switch - sets agent status to killed. Admin only. */
-  killAgent: (agentId: string) =>
-    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/kill`),
+  /** Halt agent — blocks all enforcement gates. The agent process keeps running
+   *  but cannot pass any scope check, budget check, or contract enforcement.
+   *  Process termination is the host application's responsibility. Admin only. */
+  haltAgent: (agentId: string, reason: string) =>
+    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/halt`, { reason }),
 };

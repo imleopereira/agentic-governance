@@ -156,20 +156,21 @@ function DetailPanel({ agent, onClose }: { agent: PostureAgent; onClose: () => v
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const { color, label } = STATUS_CONFIG[deriveStatus(agent)];
-  const [killing, setKilling] = useState(false);
-  const [killError, setKillError] = useState<string | null>(null);
-  const [killDone, setKillDone] = useState(false);
-  const [confirmKill, setConfirmKill] = useState(false);
+  const [halting, setHalting] = useState(false);
+  const [haltError, setHaltError] = useState<string | null>(null);
+  const [haltDone, setHaltDone] = useState(false);
+  const [confirmHalt, setConfirmHalt] = useState(false);
+  const [haltReason, setHaltReason] = useState("");
 
-  async function handleKill() {
-    setKilling(true); setKillError(null);
+  async function handleHalt() {
+    setHalting(true); setHaltError(null);
     try {
-      await api.killAgent(agent.agent_id);
-      setKillDone(true);
+      await api.haltAgent(agent.agent_id, haltReason || "Halted from console");
+      setHaltDone(true);
       await queryClient.invalidateQueries({ queryKey: ["posture"] });
     } catch (err) {
-      setKillError(err instanceof Error ? err.message : "Kill failed");
-    } finally { setKilling(false); setConfirmKill(false); }
+      setHaltError(err instanceof Error ? err.message : "Halt failed");
+    } finally { setHalting(false); setConfirmHalt(false); }
   }
 
   return (
@@ -199,32 +200,43 @@ function DetailPanel({ agent, onClose }: { agent: PostureAgent; onClose: () => v
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
         <a href={`/events?agent_id=${encodeURIComponent(agent.agent_id)}`} className="btn-ghost"
           style={{ fontSize: "0.8125rem", padding: "0.375rem 0.75rem" }}>View Audit Trail</a>
-        {user?.role === "admin" && !killDone && (
-          confirmKill ? (
-            <div role="alertdialog" aria-modal="true" aria-label="Confirm kill"
-              style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontSize: "0.8125rem", color: "var(--danger)" }}>Kill {agent.agent_id}?</span>
-              <button onClick={handleKill} disabled={killing} aria-label={`Confirm kill ${agent.agent_id}`}
-                style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "var(--deny-bg)",
-                  border: "1px solid var(--deny-border)", color: "var(--danger)",
-                  borderRadius: "var(--radius-sm)", cursor: "pointer" }}>
-                {killing ? "Killing…" : "Confirm"}
-              </button>
-              <button onClick={() => setConfirmKill(false)}
-                style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "none",
-                  border: "1px solid var(--border)", color: "var(--text-secondary)",
-                  borderRadius: "var(--radius-sm)", cursor: "pointer" }}>Cancel</button>
+        {user?.role === "admin" && !haltDone && (
+          confirmHalt ? (
+            <div role="alertdialog" aria-modal="true" aria-label="Confirm halt agent"
+              style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: "0.8125rem", color: "var(--danger)" }}>
+                Halt {agent.agent_id}? All enforcement gates will reject.
+              </span>
+              <span style={{ fontSize: "0.75rem", color: "var(--text-tertiary)" }}>
+                The agent process keeps running but cannot pass any scope check, budget check, or contract enforcement. To terminate the process, use your orchestrator (K8s, systemd, etc.)
+              </span>
+              <input type="text" placeholder="Reason for halting..."
+                value={haltReason} onChange={e => setHaltReason(e.target.value)}
+                style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "var(--bg)",
+                  border: "1px solid var(--border)", color: "var(--text-primary)",
+                  borderRadius: "var(--radius-sm)", width: "100%" }} />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={handleHalt} disabled={halting} aria-label={`Confirm halt ${agent.agent_id}`}
+                  style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "var(--deny-bg)",
+                    border: "1px solid var(--deny-border)", color: "var(--danger)",
+                    borderRadius: "var(--radius-sm)", cursor: "pointer" }}>
+                  {halting ? "Halting\u2026" : "Confirm Halt"}
+                </button>
+                <button onClick={() => setConfirmHalt(false)}
+                  style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "none",
+                    border: "1px solid var(--border)", color: "var(--text-secondary)",
+                    borderRadius: "var(--radius-sm)", cursor: "pointer" }}>Cancel</button>
+              </div>
             </div>
           ) : (
-            <button onClick={() => setConfirmKill(true)} aria-label={`Kill agent ${agent.agent_id}`}
-              aria-keyshortcuts="Cmd+Shift+K"
+            <button onClick={() => setConfirmHalt(true)} aria-label={`Halt agent ${agent.agent_id}`}
               style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem", background: "var(--deny-bg)",
                 border: "1px solid var(--deny-border)", color: "var(--danger)",
-                borderRadius: "var(--radius-sm)", cursor: "pointer" }}>Kill Agent</button>
+                borderRadius: "var(--radius-sm)", cursor: "pointer" }}>Halt Agent</button>
           )
         )}
-        {killDone && <span style={{ fontSize: "0.8125rem", color: "var(--success)" }}>Agent killed</span>}
-        {killError && <span style={{ fontSize: "0.8125rem", color: "var(--danger)" }}>{killError}</span>}
+        {haltDone && <span style={{ fontSize: "0.8125rem", color: "var(--success)" }}>Agent halted — all gates blocked</span>}
+        {haltError && <span style={{ fontSize: "0.8125rem", color: "var(--danger)" }}>{haltError}</span>}
       </div>
     </section>
   );

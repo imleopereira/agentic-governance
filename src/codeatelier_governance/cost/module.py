@@ -60,6 +60,7 @@ class CostModule:
         self._store: CostStore = store or InMemoryCostStore()
         self._fail_open = fail_open
         self._policies: dict[str, BudgetPolicy] = {}
+        self._no_policy_warned: set[str] = set()
         self._database_url = database_url
         self._engine: Any = engine
         self._owns_engine = False
@@ -285,6 +286,18 @@ class CostModule:
         """
         policy = self._policies.get(agent_id)
         if policy is None:
+            if agent_id not in self._no_policy_warned:
+                self._no_policy_warned.add(agent_id)
+                logger.warning(
+                    "cost.no_policy_registered",
+                    agent_id=agent_id,
+                    detail=(
+                        f"No BudgetPolicy registered for agent {agent_id!r} "
+                        f"-- budget enforcement is inactive. All calls will "
+                        f"be allowed. Register a policy with "
+                        f"sdk.cost.register(BudgetPolicy(agent_id=...))."
+                    ),
+                )
             return
         try:
             # Use the combined query when available (PostgresCostStore)
@@ -387,21 +400,32 @@ class CostModule:
             )
 
         if policy.per_session_seconds is not None:
+            elapsed: int | None = None
             try:
-                started = await self._store.get_session_start_time(
-                    agent_id, session_id
-                )
+                # Prefer Postgres-side elapsed computation to avoid
+                # mixed-clock skew between Python and database servers.
+                if hasattr(self._store, "get_session_elapsed_seconds"):
+                    elapsed_f = await self._store.get_session_elapsed_seconds(
+                        agent_id, session_id
+                    )
+                    if elapsed_f is not None:
+                        elapsed = int(elapsed_f)
+                else:
+                    started = await self._store.get_session_start_time(
+                        agent_id, session_id
+                    )
+                    if started is not None:
+                        elapsed = int(
+                            (datetime.now(timezone.utc) - started).total_seconds()
+                        )
             except Exception as exc:
                 logger.error(
                     "cost.session_time_check_failed",
                     error_type=type(exc).__name__,
                     agent_id=agent_id,
                 )
-                started = None
-            if started is not None:
-                elapsed = int(
-                    (datetime.now(timezone.utc) - started).total_seconds()
-                )
+                elapsed = None
+            if elapsed is not None:
                 if elapsed > policy.per_session_seconds:
                     await self._audit.log(
                         AuditEvent(

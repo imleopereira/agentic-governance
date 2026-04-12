@@ -312,6 +312,164 @@ async def health() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# SSE: real-time event stream
+# ---------------------------------------------------------------------------
+@app.get("/api/stream/events")
+async def stream_events(
+    request: Request,
+    last_event_id: str | None = Query(None),
+) -> Any:
+    """Server-Sent Events endpoint for real-time audit events, gate changes,
+    and presence updates.
+
+    Polls the database every 2 seconds for new events. The client sends
+    ``last_event_id`` (chain_seq) on reconnect for replay.
+
+    Auth: same session cookie as all other endpoints.
+    """
+    from starlette.responses import StreamingResponse
+
+    # Validate session (reuse the authenticate dependency logic)
+    session_cookie = request.cookies.get("governance_session")
+    token_header = request.headers.get("x-governance-token")
+    if not session_cookie and not token_header:
+        raise HTTPException(401, "Authentication required for SSE stream.")
+
+    if session_cookie and engine is not None:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT user_id FROM governance_console_sessions "
+                    "WHERE session_id = :sid AND expires_at > NOW() "
+                    "AND revoked = FALSE"
+                ),
+                {"sid": session_cookie},
+            )
+            if res.first() is None:
+                raise HTTPException(401, "Session expired.")
+
+    async def event_generator() -> Any:
+        """Yield SSE events by polling governance tables."""
+        import asyncio
+        import json
+
+        last_seq: int | None = None
+        if last_event_id:
+            try:
+                last_seq = int(last_event_id)
+            except ValueError:
+                last_seq = None
+
+        revalidate_counter = 0
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            # Re-validate session every 15 iterations (~30s at 2s interval)
+            revalidate_counter += 1
+            if revalidate_counter >= 15 and session_cookie and engine is not None:
+                revalidate_counter = 0
+                async with engine.connect() as conn:
+                    res = await conn.execute(
+                        text(
+                            "SELECT 1 FROM governance_console_sessions "
+                            "WHERE session_id = :sid AND expires_at > NOW() "
+                            "AND revoked = FALSE"
+                        ),
+                        {"sid": session_cookie},
+                    )
+                    if res.first() is None:
+                        break
+
+            if engine is None:
+                await asyncio.sleep(2)
+                continue
+
+            try:
+                async with engine.connect() as conn:
+                    # Fetch new audit events
+                    if last_seq is not None:
+                        q = text(
+                            "SELECT event_id, agent_id, session_id, kind, "
+                            "model, metadata_json AS metadata, created_at, chain_seq "
+                            "FROM governance_audit_events "
+                            "WHERE chain_seq > :seq "
+                            "ORDER BY chain_seq ASC LIMIT 100"
+                        )
+                        res = await conn.execute(q, {"seq": last_seq})
+                    else:
+                        q = text(
+                            "SELECT event_id, agent_id, session_id, kind, "
+                            "model, metadata_json AS metadata, created_at, chain_seq "
+                            "FROM governance_audit_events "
+                            "ORDER BY chain_seq DESC LIMIT 20"
+                        )
+                        res = await conn.execute(q)
+
+                    rows = res.mappings().all()
+                    if not last_seq:
+                        rows = list(reversed(rows))
+
+                    for row in rows:
+                        meta = row["metadata"]
+                        if isinstance(meta, str):
+                            try:
+                                meta = json.loads(meta)
+                            except (json.JSONDecodeError, TypeError):
+                                meta = {}
+                        safe_meta = _redact_metadata(meta) if meta else {}
+                        evt = {
+                            "event_id": str(row["event_id"]),
+                            "agent_id": row["agent_id"],
+                            "session_id": str(row["session_id"]) if row["session_id"] else None,
+                            "kind": row["kind"],
+                            "model": row.get("model"),
+                            "metadata": safe_meta,
+                            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                            "chain_seq": row["chain_seq"],
+                        }
+                        seq = row["chain_seq"]
+                        data = json.dumps(evt)
+                        yield f"id: {seq}\nevent: audit\ndata: {data}\n\n"
+                        last_seq = seq
+
+                    # Fetch presence changes
+                    async with engine.connect() as conn2:
+                        pres_res = await conn2.execute(
+                            text(
+                                "SELECT agent_id, status, last_heartbeat "
+                                "FROM governance_agent_presence "
+                                "ORDER BY last_heartbeat DESC LIMIT 10"
+                            )
+                        )
+                        for prow in pres_res.mappings().all():
+                            pevt = {
+                                "agent_id": prow["agent_id"],
+                                "status": prow["status"],
+                                "last_heartbeat": prow["last_heartbeat"].isoformat() if prow["last_heartbeat"] else None,
+                            }
+                            yield f"event: presence\ndata: {json.dumps(pevt)}\n\n"
+
+            except Exception:
+                _logger.warning("sse.poll_error", exc_info=False)
+
+            # Keepalive
+            yield ": keepalive\n\n"
+            await asyncio.sleep(2)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Auth endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/auth/login")

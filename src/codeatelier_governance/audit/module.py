@@ -108,6 +108,8 @@ class AuditModule:
         _check_secret_strength(secret, "audit secret")
         self._store = store
         self._secret = secret
+        self._started = False
+        self._start_warned = False
         # Writer is kept for the BatchingWriter test path and degraded-mode
         # fallback. The chain construction itself goes through the store's
         # insert_with_chain_lock method, which serializes across processes.
@@ -138,6 +140,7 @@ class AuditModule:
 
     # --- lifecycle ----------------------------------------------------------
     async def start(self) -> None:
+        self._started = True
         await self._writer.start()
 
     async def close(self) -> None:
@@ -176,6 +179,16 @@ class AuditModule:
         marker on the next successful primary log so auditors can find
         every gap.
         """
+        if not self._started and not self._start_warned:
+            self._start_warned = True
+            logger.warning(
+                "audit.sdk_not_started",
+                detail=(
+                    "GovernanceSDK.start() was not called. "
+                    "Use 'async with GovernanceSDK(...) as sdk:' or call "
+                    "'await sdk.start()' first. Audit events may not flush."
+                ),
+            )
         try:
             return await self._log_unsafe(event)
         except Exception as exc:  # noqa: BLE001 - non-breaking guarantee

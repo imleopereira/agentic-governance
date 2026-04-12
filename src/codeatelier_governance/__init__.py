@@ -10,6 +10,7 @@ from .loop.models import LoopPolicy
 from .presence.models import AgentStatus
 from .scope.models import ScopePolicy
 from .sdk import GovernanceConfig, GovernanceSDK
+from .sync import GovernanceSDKSync
 
 try:
     __version__ = _pkg_version("code-atelier-governance")
@@ -25,6 +26,7 @@ __all__ = [
     "ContractViolation",
     "GovernanceConfig",
     "GovernanceSDK",
+    "GovernanceSDKSync",
     "LoopDetected",
     "LoopPolicy",
     "PostCondition",

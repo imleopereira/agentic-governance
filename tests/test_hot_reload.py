@@ -88,3 +88,72 @@ async def test_hot_reload_error_does_not_crash() -> None:
     await sdk.close()
     # Should have been called at least twice (first errored, second succeeded)
     assert call_count >= 2
+
+
+# -- Gap #3: Cold-start policy loading -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cold_start_loads_policies_before_background_task() -> None:
+    """sdk.start() must call _poll_policies() synchronously before spawning
+    the hot-reload background task. This eliminates the cold-start window
+    where policies dict is empty.
+    """
+    sdk = GovernanceSDK(
+        database_url="postgresql://fake:fake@localhost/fake",
+        hot_reload=True,
+        hot_reload_interval=60,  # Long interval so the background task can't sneak in
+    )
+    call_order: list[str] = []
+
+    async def mock_poll() -> None:
+        call_order.append("poll")
+
+    original_start_hot_reload = sdk.start_hot_reload
+
+    async def mock_start_hot_reload(interval_seconds: int = 30) -> None:
+        call_order.append("hot_reload_start")
+        await original_start_hot_reload(interval_seconds)
+
+    sdk._poll_policies = mock_poll  # type: ignore[assignment]
+    sdk.start_hot_reload = mock_start_hot_reload  # type: ignore[method-assign]
+    sdk.audit.start = AsyncMock()  # type: ignore[method-assign]
+    sdk.audit.close = AsyncMock()  # type: ignore[method-assign]
+    sdk.loop.close = AsyncMock()  # type: ignore[method-assign]
+    sdk.presence.close = AsyncMock()  # type: ignore[method-assign]
+
+    await sdk.start()
+
+    # poll must happen BEFORE the hot_reload_start
+    assert call_order[0] == "poll"
+    assert call_order[1] == "hot_reload_start"
+
+    await sdk.close()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_failure_does_not_block_start() -> None:
+    """If the initial _poll_policies() fails during start(), the SDK should
+    still start successfully (policies will load on the first background poll).
+    """
+    sdk = GovernanceSDK(
+        database_url="postgresql://fake:fake@localhost/fake",
+        hot_reload=True,
+        hot_reload_interval=60,
+    )
+
+    async def failing_poll() -> None:
+        raise RuntimeError("DB unreachable on cold start")
+
+    sdk._poll_policies = failing_poll  # type: ignore[assignment]
+    sdk.audit.start = AsyncMock()  # type: ignore[method-assign]
+    sdk.audit.close = AsyncMock()  # type: ignore[method-assign]
+    sdk.loop.close = AsyncMock()  # type: ignore[method-assign]
+    sdk.presence.close = AsyncMock()  # type: ignore[method-assign]
+
+    # Should NOT raise despite the poll failure
+    await sdk.start()
+    assert sdk._started is True
+    assert sdk._hot_reload_task is not None
+
+    await sdk.close()

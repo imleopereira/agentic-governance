@@ -113,6 +113,12 @@ async def _safe_cost_track(sdk: GovernanceSDK, agent_id: str, session_id: UUID, 
         )
 
 
+def _is_streaming_response(response: Any) -> bool:
+    """Detect Anthropic streaming response objects (MessageStream / AsyncStream)."""
+    type_name = type(response).__name__
+    return type_name in ("MessageStream", "AsyncMessageStream", "Stream", "AsyncStream")
+
+
 def _wrap_sync_create(
     original: Any,
     sdk: GovernanceSDK,
@@ -122,13 +128,14 @@ def _wrap_sync_create(
     """Wrap a sync messages.create method.
 
     If called from within an existing async event loop (e.g. from a test
-    or a framework that nests sync in async), the wrapper returns a
-    coroutine instead so callers can await it. When there is no running
-    loop, it uses ``asyncio.run`` for each governance call.
+    or a framework that nests sync in async), the wrapper raises a clear
+    error directing the developer to use the async API. When there is no
+    running loop, it uses ``asyncio.run`` for each governance call.
     """
 
     async def _async_impl(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
+        is_streaming = kwargs.get("stream", False)
 
         await sdk.cost.check_or_raise(agent_id, session_id)
 
@@ -149,6 +156,24 @@ def _wrap_sync_create(
             raise
 
         await pre_audit_task
+
+        if is_streaming or _is_streaming_response(response):
+            logger.warning(
+                "governance.anthropic_wrap.streaming_bypass",
+                agent_id=agent_id,
+                model=model,
+                detail=(
+                    "stream=True bypasses cost tracking. Token usage is not "
+                    "available until the stream is fully consumed. Call "
+                    "sdk.cost.track() manually after consuming the stream."
+                ),
+            )
+            await _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": model, "streaming": True, "cost_tracked": False},
+                model=str(model), session_id=session_id,
+            )
+            return response
 
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
@@ -174,10 +199,14 @@ def _wrap_sync_create(
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         if _has_running_loop():
-            # Inside an event loop: return a coroutine for the caller to await.
-            return _async_impl(*args, **kwargs)
+            raise RuntimeError(
+                "GovernanceSDK: sync Anthropic wrapper called inside a running "
+                "event loop. Use the async Anthropic client (AsyncAnthropic) "
+                "with wrap_anthropic() instead, or call from outside the event loop."
+            )
 
         model = kwargs.get("model", "unknown")
+        is_streaming = kwargs.get("stream", False)
 
         asyncio.run(sdk.cost.check_or_raise(agent_id, session_id))
 
@@ -194,6 +223,26 @@ def _wrap_sync_create(
                 )
             )
             raise
+
+        if is_streaming or _is_streaming_response(response):
+            logger.warning(
+                "governance.anthropic_wrap.streaming_bypass",
+                agent_id=agent_id,
+                model=model,
+                detail=(
+                    "stream=True bypasses cost tracking. Token usage is not "
+                    "available until the stream is fully consumed. Call "
+                    "sdk.cost.track() manually after consuming the stream."
+                ),
+            )
+            asyncio.run(
+                _safe_audit_log(
+                    sdk, agent_id, "llm.result",
+                    {"model": model, "streaming": True, "cost_tracked": False},
+                    model=str(model), session_id=session_id,
+                )
+            )
+            return response
 
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
@@ -226,6 +275,7 @@ def _wrap_async_create(
     @functools.wraps(original)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
+        is_streaming = kwargs.get("stream", False)
 
         # Enforcement: check budget BEFORE the call (must stay on critical path).
         await sdk.cost.check_or_raise(agent_id, session_id)
@@ -252,6 +302,24 @@ def _wrap_async_create(
 
         # Ensure pre-call audit completed before post-call work
         await pre_audit_task
+
+        if is_streaming or _is_streaming_response(response):
+            logger.warning(
+                "governance.anthropic_wrap.streaming_bypass",
+                agent_id=agent_id,
+                model=model,
+                detail=(
+                    "stream=True bypasses cost tracking. Token usage is not "
+                    "available until the stream is fully consumed. Call "
+                    "sdk.cost.track() manually after consuming the stream."
+                ),
+            )
+            await _safe_audit_log(
+                sdk, agent_id, "llm.result",
+                {"model": model, "streaming": True, "cost_tracked": False},
+                model=str(model), session_id=session_id,
+            )
+            return response
 
         # Observation: audit log + cost track post-call — run concurrently.
         # cost.track must complete before the next check_or_raise to avoid

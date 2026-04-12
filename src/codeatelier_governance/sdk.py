@@ -104,6 +104,7 @@ class GovernanceSDK:
             **kwargs,
         )
 
+        self._started = False
         self._hot_reload_enabled = hot_reload
         self._hot_reload_interval = hot_reload_interval
         self._hot_reload_task: asyncio.Task[None] | None = None
@@ -127,6 +128,7 @@ class GovernanceSDK:
                 pool_pre_ping=True,
                 pool_size=5,
                 max_overflow=10,
+                pool_timeout=3,
                 connect_args={"command_timeout": 5},
             )
 
@@ -331,10 +333,27 @@ class GovernanceSDK:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start background tasks (audit batch flusher, hot-reload, etc.)."""
+        """Start background tasks (audit batch flusher, hot-reload, etc.).
+
+        When hot-reload is enabled, policies are loaded synchronously from
+        Postgres BEFORE the background task starts. This eliminates the
+        cold-start window where policies are empty (critical for serverless
+        deployments like AWS Lambda).
+        """
+        self._started = True
         if self.config.enable_audit:
             await self.audit.start()
         if self._hot_reload_enabled:
+            # Load policies immediately so the first request has them.
+            # Without this, there is a 30-second gap where _policies is empty.
+            try:
+                await self._poll_policies()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "hot_reload.initial_load_failed",
+                    error_type=type(exc).__name__,
+                    detail="Policies will load on first background poll cycle.",
+                )
             await self.start_hot_reload(self._hot_reload_interval)
 
     async def close(self) -> None:

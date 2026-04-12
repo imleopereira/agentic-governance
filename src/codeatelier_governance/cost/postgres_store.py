@@ -222,8 +222,13 @@ class PostgresCostStore(CostStore):
         Returns ``(session_usd, session_tokens, daily_usd, daily_tokens)``.
         This combines ``get_session_usage`` and ``get_agent_daily_usage``
         into one query to halve the pre-call enforcement latency.
+
+        The race condition (two concurrent checks both read $0 and both
+        pass) is mitigated by the atomic UPSERT in track() — counters
+        never go backward. FOR UPDATE is not used here because Postgres
+        does not support FOR UPDATE on the nullable side of an outer join.
         """
-        async with self._engine.connect() as conn:
+        async with self._engine.begin() as conn:
             res = await conn.execute(
                 text(
                     """
@@ -246,6 +251,30 @@ class PostgresCostStore(CostStore):
         if row is None:
             return (0.0, 0, 0.0, 0)
         return (float(row[0]), int(row[1]), float(row[2]), int(row[3]))
+
+    async def get_session_elapsed_seconds(
+        self,
+        agent_id: str,
+        session_id: UUID,
+    ) -> float | None:
+        """Return elapsed seconds since session start, computed in Postgres.
+
+        Uses Postgres NOW() for both timestamps to avoid mixed-clock skew
+        between Python and database servers.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT EXTRACT(EPOCH FROM NOW() - started_at) "
+                    "FROM governance_cost_session_usage "
+                    "WHERE agent_id = :agent_id AND session_id = :sid"
+                ),
+                {"agent_id": agent_id, "sid": str(session_id)},
+            )
+            row = res.first()
+        if row is None or row[0] is None:
+            return None
+        return float(row[0])
 
     async def close(self) -> None:
         """Dispose the engine only if this store owns it."""
