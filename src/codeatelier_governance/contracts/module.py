@@ -23,6 +23,7 @@ from ..audit.models import AuditEvent
 from ..audit.module import AuditModule
 from ..cost.errors import BudgetExceeded
 from ..cost.module import CostModule
+from ..gates.store import GatesStore
 from ..scope.errors import ScopeViolation, PolicyNotRegistered
 from ..scope.module import ScopeModule
 from .errors import ContractViolation
@@ -223,7 +224,11 @@ class ContractsModule:
             )
             return False
         try:
-            store = self._gates._store
+            # Annotate locally so mypy resolves has_granted_approval to
+            # GatesStore's bool-typed method.  self._gates itself is
+            # ``Any | None`` (legacy), so without this hint the call
+            # would return Any and trip --strict's no-any-return rule.
+            store: GatesStore = self._gates._store
             return await store.has_granted_approval(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
