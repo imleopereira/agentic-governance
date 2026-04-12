@@ -1,5 +1,77 @@
 # Changelog
 
+## v0.5.0 (2026-04-12)
+
+### Security
+
+- **Self-approval prevention (fail-closed)** — HITL gates now compare the
+  granting `operator_id` against the session's `user_id`; an agent cannot
+  approve its own action. Requests with no `operator_id` return HTTP 403
+  with an actionable error. DDL adds `operator_id` column to the gates
+  table.
+- **Chain fork detection** — `audit.trace_session_chain` raises
+  `ChainIntegrityError` when two events share the same `prev_hash`,
+  surfacing tamper attempts or concurrent-write corruption that would
+  otherwise go unnoticed.
+- **Additional security-critical coverage** — tests for budget race at
+  the cap boundary, SQL injection payloads on every user-controllable
+  field, case-sensitivity scope bypass, production error leakage
+  through `sanitize_db_error`, weak-secret entropy rejection, account
+  enumeration parity.
+
+### New
+
+- **`GovernanceSDKSync`** — sync facade for Flask/Django and any
+  non-async host application. Runs an asyncio event loop on a
+  background thread and dispatches via `run_coroutine_threadsafe`.
+  Matches the async SDK surface one-to-one.
+- **SSE endpoint** — `GET /api/stream/events` delivers live audit
+  events to the console via Server-Sent Events (polling-based, session
+  auth, keepalive frames).
+- **Halt agent UI** — renamed from "kill" because the SDK blocks gates,
+  it does not terminate the host process.
+- **Multi-agent OpenAI integration test script** exercising
+  delegation-style workloads end to end.
+
+### Performance
+
+- **Shared engine pool** — consolidated seven separate `AsyncEngine`
+  instances into one shared pool per SDK instance. Dropped
+  Postgres max connections per SDK from ~74 to ~15.
+- **Concurrent audit writes** — pre-call audit log is backgrounded
+  and post-call audit + cost tracking run under `asyncio.gather`,
+  saving 4–12 ms per LLM call on the critical path.
+- **Combined budget query** — session + daily counter reads merged
+  into a single round-trip in `PostgresCostStore`, halving pre-call
+  enforcement latency.
+
+### Fixes
+
+- Streaming cost-tracking bypass now detected and logged (users must
+  call `sdk.cost.track()` manually after consuming the stream).
+- Serverless cold-start policy preload in `sdk.start()` eliminates
+  the 30-second gap where `_policies` was empty on first request
+  (critical for AWS Lambda).
+- JSONL audit fallback tolerates read-only filesystems and rotates
+  at 50 MB.
+- Session time budget uses Postgres-side elapsed computation to avoid
+  mixed-clock skew between app and DB servers.
+- Sync wrapper coroutine-leak fix in the Anthropic/OpenAI integrations.
+- Policy upsert SQL cast corrected (`::jsonb` → `CAST AS jsonb`) so
+  scope and budget policies persist across restarts.
+- Top-level `__init__.py` exports `ScopePolicy`, `BudgetPolicy`,
+  `AuditEvent` — no more deep-import friction for callers.
+- `command_timeout=5` on the shared engine prevents pool exhaustion
+  under slow-query storms.
+
+### Tests
+
+- 258 → 322 tests (+64). New suites: streaming detection, JSONL
+  fallback, cold start, sync wrapper, console endpoints, SSE, error
+  handling, normalize_db_url, sanitize_db_error, SQL injection,
+  case-sensitivity bypass, chain fork detection, end-to-end
+  enforcement. Test suite runs in ~5 s (was ~12 s).
+
 ## v0.4.0 (2026-04-10)
 
 ### New modules
