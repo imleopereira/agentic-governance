@@ -380,6 +380,11 @@ export default function UsersPage() {
   const { data: users, isLoading, error } = useQuery({
     queryKey: ["admin-users"],
     queryFn: fetchUsers,
+    // The shared queryClient singleton (console/src/lib/queryClient.ts) sets
+    // staleTime: Infinity for v4's cached-data-on-disconnect posture.  This
+    // page's admin user list needs to refresh on every navigation back, so
+    // we override with staleTime: 0 to preserve the pre-v4 default behavior.
+    staleTime: 0,
   });
 
   function refresh() {

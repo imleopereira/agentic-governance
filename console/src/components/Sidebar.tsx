@@ -14,14 +14,29 @@ interface NavItem {
   exact?: boolean; adminOnly?: boolean; showBadge?: boolean;
 }
 
-const NAV_ITEMS: NavItem[] = [
-  { label: "Topology", href: "/", icon: LayoutGrid, exact: true },
-  { label: "Event Stream", href: "/stream", icon: Activity },
-  { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
-  { label: "Audit Log", href: "/events", icon: ScrollText },
-  { label: "Cost", href: "/cost", icon: DollarSign },
-  { label: "Users", href: "/admin/users", icon: Users, adminOnly: true },
-];
+// FIX 5: when `NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4"`, the middleware
+// rewrites `/` to `/agents`, so a Topology link at `href: "/"` never
+// highlights. Replace it with a proper "Agents" entry in v4; leave the
+// v3 nav untouched.
+const IS_V4 = process.env.NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4";
+
+const NAV_ITEMS: NavItem[] = IS_V4
+  ? [
+      { label: "Agents", href: "/agents", icon: LayoutGrid },
+      { label: "Event Stream", href: "/stream", icon: Activity },
+      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
+      { label: "Audit Log", href: "/events", icon: ScrollText },
+      { label: "Cost", href: "/cost", icon: DollarSign },
+      { label: "Users", href: "/admin/users", icon: Users, adminOnly: true },
+    ]
+  : [
+      { label: "Topology", href: "/", icon: LayoutGrid, exact: true },
+      { label: "Event Stream", href: "/stream", icon: Activity },
+      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
+      { label: "Audit Log", href: "/events", icon: ScrollText },
+      { label: "Cost", href: "/cost", icon: DollarSign },
+      { label: "Users", href: "/admin/users", icon: Users, adminOnly: true },
+    ];
 
 function isActive(href: string, pathname: string, exact?: boolean): boolean {
   if (exact) return pathname === href;

@@ -33,7 +33,7 @@
   /* -- Typography -- */
   --font-heading: var(--font-inter), "Inter", system-ui, sans-serif;
   --font-sans: var(--font-inter), "Inter", system-ui, sans-serif;
-  --font-mono: var(--font-jetbrains-mono), "JetBrains Mono", "Fira Code", ui-monospace, monospace;
+  --font-mono: var(--font-ibm-plex-mono), "IBM Plex Mono", "Fira Code", ui-monospace, monospace;
 
   /* -- Radius (brand uses sharp corners) -- */
   --radius-sm: 4px;
@@ -364,6 +364,16 @@ textarea {
 
 .animate-verify-glow {
   animation: verify-glow 2s ease-in-out infinite;
+}
+
+/* -- StatusDot animations (v5 overlay) -- */
+@keyframes v4-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--v4-glow, transparent); }
+  50% { box-shadow: 0 0 0 5px transparent; }
+}
+@keyframes v4-breathe {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }
 
 /* ============================================

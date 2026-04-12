@@ -9,6 +9,8 @@ import {
   type ReactNode,
 } from "react";
 
+import { queryClient } from "@/lib/queryClient";
+
 export interface AuthUser {
   user_id: string;
   username: string;
@@ -98,6 +100,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 
   const logout = useCallback(async () => {
+    // SECURITY (H1): clear all cached query data FIRST so data fetched
+    // while user A was logged in cannot leak into user B's session if
+    // they log in on the same browser tab.
+    queryClient.clear();
     localStorage.removeItem("governance_token");
     try {
       await fetch(`${BASE}/api/auth/logout`, {
