@@ -1,1 +1,1 @@
-"""Stub for prompts module — implemented in a later v0.1 milestone."""
+"""Prompt versioning — coming in v0.6. Not yet implemented."""

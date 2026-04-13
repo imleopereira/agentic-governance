@@ -1,8 +1,8 @@
-"""Pydantic models for compliance reports.
+"""Pydantic models for Article 12 evidence reports.
 
 Two models:
-    ReportSection     - a single section mapping to an EU AI Act requirement
-    ComplianceReport  - the top-level report containing all sections
+    ReportSection     - a single section mapping to an EU AI Act Article 12 requirement
+    ComplianceReport  - the top-level evidence report containing all sections
 """
 from __future__ import annotations
 
@@ -17,10 +17,11 @@ SectionStatus = Literal["compliant", "partial", "non_compliant"]
 
 
 class ReportSection(BaseModel):
-    """A single section of a compliance report.
+    """A single section of an Article 12 evidence report.
 
     Each section maps to a specific EU AI Act Article 12 requirement.
-    ``status`` indicates whether the requirement is met based on available data.
+    ``status`` reflects the state of the SDK-observed data for that requirement,
+    not an assertion of compliance for the overall deployment.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
@@ -32,10 +33,11 @@ class ReportSection(BaseModel):
 
 
 class ComplianceReport(BaseModel):
-    """Top-level compliance report generated from audit trail data.
+    """Top-level Article 12 evidence report generated from audit trail data.
 
     Reports are immutable once generated. They can be serialized to JSON
-    for archival or submission to regulators.
+    for archival or submission as evidence to regulators. The report does not
+    assert compliance — it provides evidence for actions the SDK observed.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
