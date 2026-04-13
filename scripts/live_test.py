@@ -38,7 +38,7 @@ def log_result(test: str, passed: bool, detail: str = "") -> None:
 
 
 async def run_all_tests() -> None:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
     from codeatelier_governance import (
         GovernanceSDK,
@@ -75,7 +75,7 @@ async def run_all_tests() -> None:
     # Register policies
     sdk.scope.register(ScopePolicy(
         agent_id=agent_id,
-        allowed_tools=frozenset({"read_data", "summarize"}),
+        allowed_tools=frozenset({"read_data", "summarize", "chat.completions.create"}),
         hidden_tools=frozenset({"delete_all"}),
     ))
     sdk.cost.register(BudgetPolicy(
@@ -170,7 +170,7 @@ async def run_all_tests() -> None:
     # -------------------------------------------------------------------------
     print(f"{BOLD}Test 4: Real OpenAI Call (wrapped){RESET}")
     try:
-        client = OpenAI()
+        client = AsyncOpenAI()
         wrapped = wrap_openai(client, sdk=sdk, agent_id=agent_id, session_id=session_id)
         log_result("OpenAI client wrapped", True)
 

@@ -312,11 +312,19 @@ class CostModule:
         self,
         agent_id: str,
         session_id: UUID,
+        *,
+        projected_tokens: int | None = None,
     ) -> None:
         """Raise BudgetExceeded if any registered cap has been exceeded.
 
         This is an ENFORCEMENT gate: it raises by contract. The host call
         is expected to catch it and surface a 429 / quota error to the user.
+
+        When ``projected_tokens`` is provided, the check is forward-looking:
+        it evaluates ``current_balance + projected_tokens > limit`` instead
+        of just ``current_balance > limit``. This ensures the LAST call
+        before a hard limit is also blocked, eliminating the one-call-behind
+        gap in the previous implementation.
 
         **Fail-closed semantics on storage failure.** If we cannot read the
         counter (DB unreachable, query timeout, etc.) we cannot verify the
@@ -328,6 +336,13 @@ class CostModule:
         ``CostModule(..., fail_open=True)`` and accept the risk.
 
         No-op for agents without a registered policy.
+
+        Args:
+            agent_id: The agent identifier to check.
+            session_id: The current session UUID.
+            projected_tokens: Optional token count for the upcoming call.
+                When provided, the check projects current + projected against
+                all token caps before allowing the call.
         """
         policy = self._policies.get(agent_id)
         if policy is None:
@@ -392,16 +407,22 @@ class CostModule:
                 recovery_hint="Check database connectivity. Set fail_open=True only for non-production.",
             )
 
+        # When projected_tokens is provided, project current + projected against
+        # token caps.  USD caps are not projected (we don't know the USD cost
+        # until after the call) — they remain backward-looking as before.
+        s_tok_projected = s_tok + projected_tokens if projected_tokens is not None else s_tok
+        d_tok_projected = d_tok + projected_tokens if projected_tokens is not None else d_tok
+
         breach: tuple[str, float, float] | None = None
         if policy.per_session_usd is not None and s_usd > policy.per_session_usd:
             breach = ("per_session_usd", s_usd, policy.per_session_usd)
         elif (
             policy.per_session_tokens is not None
-            and s_tok > policy.per_session_tokens
+            and s_tok_projected > policy.per_session_tokens
         ):
             breach = (
                 "per_session_tokens",
-                float(s_tok),
+                float(s_tok_projected),
                 float(policy.per_session_tokens),
             )
         elif (
@@ -415,11 +436,11 @@ class CostModule:
             )
         elif (
             policy.per_agent_tokens_daily is not None
-            and d_tok > policy.per_agent_tokens_daily
+            and d_tok_projected > policy.per_agent_tokens_daily
         ):
             breach = (
                 "per_agent_tokens_daily",
-                float(d_tok),
+                float(d_tok_projected),
                 float(policy.per_agent_tokens_daily),
             )
 

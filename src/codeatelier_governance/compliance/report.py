@@ -1,8 +1,8 @@
-"""Compliance report generator.
+"""Article 12 evidence report generator.
 
 Queries audit events, cost data, gate resolutions, and scope policies
 from Postgres (or in-memory stores for testing) to produce structured
-compliance reports.
+evidence reports for actions the SDK observed.
 
 All SQL is parameterized. No string interpolation in queries.
 """
@@ -14,17 +14,22 @@ from uuid import UUID, uuid4
 
 import structlog
 
+from codeatelier_governance.audit.errors import ChainIntegrityError
 from codeatelier_governance.audit.models import AuditEventRecord
 from codeatelier_governance.audit.store import AuditStore, InMemoryAuditStore
 
 from . import article12
-from .models import ComplianceReport, ReportSection
+from .models import COVERAGE_CAVEAT, ChainIntegrityStatus, ComplianceReport, ReportSection
 
 logger = structlog.get_logger(__name__)
 
 
 class ReportGenerator:
-    """Generates EU AI Act Article 12 compliance reports from audit data.
+    """Generates EU AI Act Article 12 evidence reports from audit data.
+
+    Reports cover actions the SDK observed. They do not assert compliance —
+    Article 12 compliance for a deployment depends on routing all relevant
+    AI actions through the SDK.
 
     Can operate against either a Postgres database URL (for CLI usage)
     or an in-memory AuditStore (for tests and programmatic use).
@@ -35,15 +40,22 @@ class ReportGenerator:
         database_url: str | None = None,
         *,
         audit_store: AuditStore | None = None,
+        audit_module: Any | None = None,
     ) -> None:
         """Initialize the report generator.
 
         Provide either ``database_url`` for Postgres queries or
         ``audit_store`` for in-memory/test usage. If both are provided,
         ``audit_store`` takes precedence.
+
+        ``audit_module`` is an optional :class:`AuditModule` instance used
+        when ``verify_chain=True`` is passed to ``generate_article12()`` or
+        ``generate_summary()``. Without it, chain verification is unavailable
+        and those methods will log a warning.
         """
         self._database_url = database_url
         self._audit_store = audit_store
+        self._audit_module = audit_module
 
     async def _query_events_postgres(
         self,
@@ -272,6 +284,36 @@ class ReportGenerator:
             "date_end": date_end,
         }
 
+    async def _run_chain_verification(self) -> ChainIntegrityStatus:
+        """Run HMAC chain verification via the audit module and return the status string.
+
+        Returns one of the :class:`ChainIntegrityStatus` literals:
+        ``"verified"`` — chain checked and passed.
+        ``"failed"`` — chain checked and found a broken or missing link.
+
+        Never raises — errors are logged and mapped to ``"unverified"``.
+        Callers must ensure ``self._audit_module`` is not None before calling;
+        both ``generate_article12`` and ``generate_summary`` enforce this via
+        an early ``ValueError`` guard.
+        """
+        assert self._audit_module is not None  # enforced by callers
+        try:
+            await self._audit_module.verify_chain()
+            return "verified"
+        except ChainIntegrityError as exc:
+            logger.warning(
+                "compliance.report.chain_integrity_failed",
+                error=str(exc),
+            )
+            return "failed"
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "compliance.report.chain_verify_error",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return "unverified"
+
     def _build_article12_sections(
         self, data: dict[str, Any],
     ) -> list[ReportSection]:
@@ -310,7 +352,11 @@ class ReportGenerator:
                 scope_violations=data["scope_violations"],
                 budget_violations=data["budget_violations"],
                 loop_violations=data["loop_violations"],
-                chain_integrity_verified=data["total_events"] > 0,
+                # chain_integrity_verified is always False here: the report
+                # generator does not perform HMAC verification. Callers who need
+                # a verified status should call sdk.audit.verify_chain() and pass
+                # the result via generate_article12(verify_chain=True).
+                chain_integrity_verified=False,
             ),
         ]
 
@@ -320,12 +366,36 @@ class ReportGenerator:
         agent_id: str | None = None,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        *,
+        verify_chain: bool = False,
     ) -> ComplianceReport:
-        """Generate an EU AI Act Article 12 compliance report.
+        """Generate an EU AI Act Article 12 evidence report.
 
         Queries audit events with the given filters and maps them to the
-        seven Article 12 automatic logging requirements.
+        seven Article 12 automatic logging requirements. The report provides
+        evidence for actions the SDK observed; it does not assert compliance
+        for the overall deployment.
+
+        Args:
+            session_ids: Optional list of session UUIDs to filter events.
+            agent_id: Optional agent identifier to filter events.
+            date_from: Optional start of the date range filter.
+            date_to: Optional end of the date range filter.
+            verify_chain: When ``True``, runs HMAC chain verification via the
+                ``audit_module`` provided at construction time and sets
+                ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
+                Requires ``audit_module`` to be set. Default ``False``.
+
+        Raises:
+            ValueError: If ``verify_chain=True`` is requested but no
+                ``audit_module`` was provided at construction time.
         """
+        if verify_chain and self._audit_module is None:
+            raise ValueError(
+                "verify_chain=True requires an audit_module to be passed to "
+                "ReportGenerator at construction time. "
+                "Pass audit_module=sdk.audit when constructing ReportGenerator."
+            )
         events = await self._get_events(
             session_ids=session_ids,
             agent_id=agent_id,
@@ -335,6 +405,10 @@ class ReportGenerator:
 
         data = self._extract_report_data(events)
         sections = self._build_article12_sections(data)
+
+        chain_integrity_status: ChainIntegrityStatus = (
+            await self._run_chain_verification() if verify_chain else "unverified"
+        )
 
         now = datetime.now(timezone.utc)
         session_id_list: list[UUID] = []
@@ -351,6 +425,20 @@ class ReportGenerator:
         if date_from and date_to:
             date_range = (date_from, date_to)
 
+        # Parse time_range_start / time_range_end from extracted data
+        time_range_start: datetime | None = None
+        time_range_end: datetime | None = None
+        if data["date_start"]:
+            try:
+                time_range_start = datetime.fromisoformat(data["date_start"])
+            except (ValueError, TypeError):
+                pass
+        if data["date_end"]:
+            try:
+                time_range_end = datetime.fromisoformat(data["date_end"])
+            except (ValueError, TypeError):
+                pass
+
         return ComplianceReport(
             report_id=uuid4(),
             generated_at=now,
@@ -359,6 +447,12 @@ class ReportGenerator:
             session_ids=session_id_list,
             date_range=date_range,
             sections=sections,
+            event_count=data["total_events"],
+            time_range_start=time_range_start,
+            time_range_end=time_range_end,
+            chain_integrity_status=chain_integrity_status,
+            coverage_caveat=COVERAGE_CAVEAT,
+            coverage_pct=None,
         )
 
     async def generate_summary(
@@ -366,12 +460,33 @@ class ReportGenerator:
         agent_id: str,
         date_from: datetime | None = None,
         date_to: datetime | None = None,
+        *,
+        verify_chain: bool = False,
     ) -> ComplianceReport:
-        """Generate a summary compliance report for an agent.
+        """Generate a summary evidence report for an agent.
 
         Provides a high-level overview including event counts, violation
-        counts, and compliance status per section.
+        counts, and status per section based on SDK-observed data.
+
+        Args:
+            agent_id: The agent identifier whose events to summarize.
+            date_from: Optional start of the date range filter.
+            date_to: Optional end of the date range filter.
+            verify_chain: When ``True``, runs HMAC chain verification via the
+                ``audit_module`` provided at construction time and sets
+                ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
+                Requires ``audit_module`` to be set. Default ``False``.
+
+        Raises:
+            ValueError: If ``verify_chain=True`` is requested but no
+                ``audit_module`` was provided at construction time.
         """
+        if verify_chain and self._audit_module is None:
+            raise ValueError(
+                "verify_chain=True requires an audit_module to be passed to "
+                "ReportGenerator at construction time. "
+                "Pass audit_module=sdk.audit when constructing ReportGenerator."
+            )
         events = await self._get_events(
             agent_id=agent_id,
             date_from=date_from,
@@ -380,6 +495,9 @@ class ReportGenerator:
 
         data = self._extract_report_data(events)
         total = data["total_events"]
+        chain_integrity_status: ChainIntegrityStatus = (
+            await self._run_chain_verification() if verify_chain else "unverified"
+        )
         total_violations = (
             data["scope_violations"]
             + data["budget_violations"]
@@ -443,6 +561,20 @@ class ReportGenerator:
         if date_from and date_to:
             date_range = (date_from, date_to)
 
+        # Parse time_range_start / time_range_end from extracted data
+        summary_time_start: datetime | None = None
+        summary_time_end: datetime | None = None
+        if data["date_start"]:
+            try:
+                summary_time_start = datetime.fromisoformat(data["date_start"])
+            except (ValueError, TypeError):
+                pass
+        if data["date_end"]:
+            try:
+                summary_time_end = datetime.fromisoformat(data["date_end"])
+            except (ValueError, TypeError):
+                pass
+
         return ComplianceReport(
             report_id=uuid4(),
             generated_at=now,
@@ -451,4 +583,10 @@ class ReportGenerator:
             session_ids=session_id_list,
             date_range=date_range,
             sections=sections,
+            event_count=data["total_events"],
+            time_range_start=summary_time_start,
+            time_range_end=summary_time_end,
+            chain_integrity_status=chain_integrity_status,
+            coverage_caveat=COVERAGE_CAVEAT,
+            coverage_pct=None,
         )

@@ -104,12 +104,14 @@ class AuditModule:
         *,
         secret: bytes,
         writer: BatchingWriter | None = None,
+        verify_chain_on_read: bool = False,
     ) -> None:
         _check_secret_strength(secret, "audit secret")
         self._store = store
         self._secret = secret
         self._started = False
         self._start_warned = False
+        self._verify_chain_on_read = verify_chain_on_read
         # Writer is kept for the BatchingWriter test path and degraded-mode
         # fallback. The chain construction itself goes through the store's
         # insert_with_chain_lock method, which serializes across processes.
@@ -437,6 +439,146 @@ class AuditModule:
             seen_prev[key] = record.event_id
 
         return events
+
+    # --- public chain verification API --------------------------------------
+
+    async def get_events(self, session_id: UUID) -> list[AuditEventRecord]:
+        """Return every event in a session, in chain (insertion) order.
+
+        If ``verify_chain_on_read`` was enabled at construction time, the
+        full HMAC chain for the returned window is verified before the
+        events are returned. If any link fails, :class:`ChainIntegrityError`
+        is raised with the sequence index of the first bad link, and no
+        potentially tampered events are returned to the caller.
+        """
+        events = await self._store.get_session_events(session_id)
+        if self._verify_chain_on_read:
+            await self.verify_chain_records(events)
+        return events
+
+    async def verify_chain_records(
+        self,
+        records: list[AuditEventRecord],
+    ) -> bool:
+        """Verify HMAC integrity for an ordered list of AuditEventRecord objects.
+
+        Performs two passes:
+        1. Per-event HMAC check — detects in-place row tampering.
+        2. Linkage check — verifies that ``records[i].prev_hash == records[i-1].hmac``
+           for every consecutive pair, detecting event deletion (a gap in the chain
+           that leaves no broken HMAC on any remaining row).
+
+        Used internally by ``verify_chain`` and ``get_events`` when
+        ``verify_chain_on_read=True``. Raises :class:`ChainIntegrityError`
+        at the first failing link. Returns ``True`` if all links are clean.
+        """
+        # Pass 1: per-event HMAC check
+        for idx, record in enumerate(records):
+            if not verify_event(record, self._secret):
+                raise ChainIntegrityError(
+                    f"audit chain integrity violation at sequence index {idx} "
+                    f"(event_id={record.event_id})"
+                )
+
+        # Pass 2: linkage check — detects deleted events (chain gaps)
+        for i in range(1, len(records)):
+            if records[i].prev_hash != records[i - 1].hmac:
+                raise ChainIntegrityError(
+                    f"chain gap at position {i}: prev_hash of event "
+                    f"{records[i].event_id} does not match hmac of preceding event "
+                    f"{records[i - 1].event_id}"
+                )
+
+        return True
+
+    async def verify_chain(
+        self,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+        session_id: UUID | None = None,
+    ) -> bool:
+        """Verify the HMAC chain for a session or a slice of its events.
+
+        Fetches events in insertion order and verifies each link sequentially.
+        If any link fails, raises :class:`ChainIntegrityError` with the
+        sequence number (0-based) of the first bad link.
+
+        Parameters
+        ----------
+        from_seq:
+            0-based index of the first event to verify (inclusive).
+            ``None`` means start from the beginning.
+        to_seq:
+            0-based index of the last event to verify (inclusive).
+            ``None`` means verify through the end.
+        session_id:
+            The session whose chain to verify. When ``None`` and both
+            ``from_seq`` / ``to_seq`` are ``None``, the entire in-memory
+            store is verified event by event (intended for tests and
+            in-memory mode only — for large Postgres deployments, pass
+            an explicit ``session_id``).
+
+        Returns
+        -------
+        True
+            All checked links are intact.
+
+        Raises
+        ------
+        ChainIntegrityError
+            Raised immediately at the first failing link, carrying the
+            0-based sequence number of the bad event.
+        """
+        # Validate sequence range before fetching events.
+        if from_seq is not None and to_seq is not None and from_seq > to_seq:
+            raise ValueError(
+                f"verify_chain: from_seq ({from_seq}) must be <= to_seq ({to_seq})"
+            )
+
+        if session_id is not None:
+            events = await self._store.get_session_events(session_id)
+        else:
+            # Fall back to the store's full event list for in-memory stores.
+            if hasattr(self._store, "_events"):
+                from .store import InMemoryAuditStore
+
+                mem: InMemoryAuditStore = self._store  # type: ignore[assignment]
+                # Flatten all sessions in insertion order.
+                all_ids: list[UUID] = []
+                for sid_key in mem._by_session:
+                    all_ids.extend(mem._by_session[sid_key])
+                events = [mem._events[eid] for eid in all_ids if eid in mem._events]
+            else:
+                events = []
+
+        # Apply the sequence slice.
+        start = from_seq if from_seq is not None else 0
+        end = (to_seq + 1) if to_seq is not None else len(events)
+        window = events[start:end]
+
+        # Pass 1: per-event HMAC check
+        for idx, record in enumerate(window):
+            if not verify_event(record, self._secret):
+                absolute_seq = start + idx
+                raise ChainIntegrityError(
+                    f"audit chain integrity violation at sequence {absolute_seq} "
+                    f"(event_id={record.event_id})"
+                )
+
+        # Pass 2: linkage check — detects deleted events (chain gaps).
+        # Only valid within the window (records[i].prev_hash must match
+        # records[i-1].hmac for consecutive records in the slice).
+        for i in range(1, len(window)):
+            if window[i].prev_hash != window[i - 1].hmac:
+                absolute_seq = start + i
+                raise ChainIntegrityError(
+                    f"chain gap at position {absolute_seq}: prev_hash of event "
+                    f"{window[i].event_id} does not match hmac of preceding event "
+                    f"{window[i - 1].event_id}"
+                )
+
+        return True
 
     # --- decorator ----------------------------------------------------------
     def track(

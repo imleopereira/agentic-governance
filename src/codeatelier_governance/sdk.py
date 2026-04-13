@@ -73,6 +73,14 @@ class GovernanceConfig:
     # compatibility so callers that pre-emptively set the flag do not
     # break when the real module lands.
     enable_prompts: bool = True
+    # Loop detection: sliding-window repeated-tool-call detection + auto-halt.
+    # Enabled by default.  Set to False to skip LoopModule construction;
+    # sdk.loop will not exist and any call to it raises AttributeError.
+    enable_loop: bool = True
+    # Presence: agent heartbeat / live-idle-unresponsive tracking.
+    # Enabled by default.  Set to False to skip PresenceModule construction;
+    # sdk.presence will not exist and any call to it raises AttributeError.
+    enable_presence: bool = True
     # Routing is an advisory feature that can mutate the model on an LLM
     # call.  It is OFF by default — enable it explicitly at SDK construction
     # time AND register at least one RoutingPolicy for it to take effect on
@@ -80,6 +88,29 @@ class GovernanceConfig:
     # module is opt-in via config, not code changes" invariant from
     # CLAUDE.md and prevents silent model substitution.
     enable_routing: bool = False
+    # When True, any call to sdk.audit.get_events() verifies the HMAC chain
+    # for the returned window before returning. Raises ChainIntegrityError if
+    # any link fails. Default False: opt-in because verification cost is
+    # O(n) in the number of events returned.
+    verify_chain_on_read: bool = False
+    # When True (the default), sdk.start() emits a structlog warning when no
+    # LLM wrappers (wrap_anthropic / wrap_openai) have been registered.  Set
+    # to False in test suites to suppress the warning.
+    warn_on_no_wrappers: bool = True
+    # Optional default max_tokens used by budget projection in wrappers when
+    # the caller does not declare max_tokens explicitly.  Suppresses the
+    # "max_tokens_not_declared" warning for projects that always use the same cap.
+    # Must be >= 1 when provided; negative values would corrupt budget gate projection.
+    default_max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate field constraints that cannot be expressed as dataclass defaults."""
+        if self.default_max_tokens is not None and self.default_max_tokens < 1:
+            raise ValueError(
+                f"GovernanceConfig.default_max_tokens must be >= 1 "
+                f"(got {self.default_max_tokens}). "
+                f"Negative or zero values would corrupt forward budget projection."
+            )
 
 
 class GovernanceSDK:
@@ -132,6 +163,9 @@ class GovernanceSDK:
         self._hot_reload_interval = hot_reload_interval
         self._hot_reload_task: asyncio.Task[None] | None = None
         self._last_policy_updated_at: datetime | None = None
+        # Registry of wrapper labels recorded by wrap_anthropic() / wrap_openai().
+        # Used at start() to warn operators when zero enforcement wrappers are active.
+        self._registered_wrappers: list[str] = []
 
         resolved_secret_str = audit_secret or self._resolve_audit_secret()
         resolved_secret = (
@@ -172,7 +206,12 @@ class GovernanceSDK:
                 fallback_path or DEFAULT_FALLBACK_PATH
             )
             writer = BatchingWriter(primary=store, fallback=fallback)
-            self.audit = AuditModule(store, secret=resolved_secret, writer=writer)
+            self.audit = AuditModule(
+                store,
+                secret=resolved_secret,
+                writer=writer,
+                verify_chain_on_read=self.config.verify_chain_on_read,
+            )
         else:
             logger.warning(
                 "sdk.audit_disabled",
@@ -247,18 +286,34 @@ class GovernanceSDK:
                 ),
             )
 
-        # v0.3 modules — not gated behind config flags at this time (loop
-        # and presence have no dedicated enable_* flag yet).  Added as a
-        # v0.5.1 followup if there is customer demand.
-        self.loop = LoopModule(
-            self.audit,
-            policies=loop_policies,
-            database_url=database_url,
-            engine=self._shared_engine,
-        )
-        self.presence = PresenceModule(
-            database_url=database_url, engine=self._shared_engine,
-        )
+        if self.config.enable_loop:
+            self.loop = LoopModule(
+                self.audit,
+                policies=loop_policies,
+                database_url=database_url,
+                engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.loop_disabled",
+                detail=(
+                    "enable_loop=False — sdk.loop is not constructed.  "
+                    "Loop detection and auto-halt are off."
+                ),
+            )
+
+        if self.config.enable_presence:
+            self.presence = PresenceModule(
+                database_url=database_url, engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.presence_disabled",
+                detail=(
+                    "enable_presence=False — sdk.presence is not constructed.  "
+                    "Agent heartbeat tracking is off."
+                ),
+            )
 
         # Contracts depends on scope + cost (+ gates for HITL).  Cascade
         # disable: if any hard dependency is off, contracts is also off and
@@ -507,6 +562,10 @@ class GovernanceSDK:
         Postgres BEFORE the background task starts. This eliminates the
         cold-start window where policies are empty (critical for serverless
         deployments like AWS Lambda).
+
+        Emits a structlog warning when no LLM wrappers have been registered
+        (i.e. wrap_anthropic() or wrap_openai() was never called), unless
+        ``warn_on_no_wrappers=False`` was passed at construction time.
         """
         self._started = True
         # self.audit always exists — either wired to a real persistent
@@ -515,6 +574,16 @@ class GovernanceSDK:
         # so .log() calls from dependent modules handle their own buffer
         # state correctly.
         await self.audit.start()
+
+        if self.config.warn_on_no_wrappers and not self._registered_wrappers:
+            logger.warning(
+                "no_wrappers_registered",
+                message=(
+                    "GovernanceSDK started with no wrappers registered. "
+                    "Budget and scope enforcement are inactive. "
+                    "Call wrap_anthropic() or wrap_openai() to activate enforcement."
+                ),
+            )
         # Drain policies that were registered synchronously (before any
         # event loop was running).  This replaces the v0.5.0 behaviour of
         # calling ``asyncio.run()`` inside ``register()``, which violated
@@ -548,13 +617,60 @@ class GovernanceSDK:
                 pass
             self._hot_reload_task = None
         await self.audit.close()
-        await self.loop.close()
-        await self.presence.close()
+        if hasattr(self, "loop"):
+            await self.loop.close()
+        if hasattr(self, "presence"):
+            await self.presence.close()
         # Dispose the shared engine last, after all modules have released
         # their references to it.
         if self._shared_engine is not None:
             await self._shared_engine.dispose()
             self._shared_engine = None
+
+    # ------------------------------------------------------------------
+    # Stable public API: audit chain verification
+    # ------------------------------------------------------------------
+
+    async def verify_chain(
+        self,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+        session_id: Any | None = None,
+    ) -> bool:
+        """Verify the HMAC audit chain for integrity.
+
+        Delegates to :meth:`codeatelier_governance.audit.module.AuditModule.verify_chain`.
+
+        Parameters
+        ----------
+        from_seq:
+            0-based index of the first event to check (inclusive). ``None``
+            starts from the beginning of the session's event list.
+        to_seq:
+            0-based index of the last event to check (inclusive). ``None``
+            checks through the end.
+        session_id:
+            UUID of the session to verify. When ``None``, verifies all
+            events known to the in-memory store (suited for tests; for
+            production Postgres use, always pass an explicit session_id).
+
+        Returns
+        -------
+        True
+            Every checked link is intact.
+
+        Raises
+        ------
+        codeatelier_governance.audit.errors.ChainIntegrityError
+            Raised at the first failing link, carrying the 0-based sequence
+            number of the tampered event.
+        """
+        return await self.audit.verify_chain(
+            from_seq=from_seq,
+            to_seq=to_seq,
+            session_id=session_id,
+        )
 
     async def __aenter__(self) -> "GovernanceSDK":
         await self.start()
