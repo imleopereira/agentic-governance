@@ -22,9 +22,9 @@ export function middleware(req: NextRequest) {
   const version: "v3" | "v4" =
     override === "v4" ? "v4" : override === "v3" ? "v3" : envVersion;
 
-  if (url.pathname === "/") {
+  if (url.pathname === "/" && version === "v4") {
     const target = url.clone();
-    target.pathname = version === "v4" ? "/agents" : "/events";
+    target.pathname = "/agents";
     return NextResponse.rewrite(target);
   }
 

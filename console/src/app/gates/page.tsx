@@ -73,6 +73,8 @@ function ApprovalCard({ gate, onResolved }: { gate: GatePending; onResolved: () 
 
   return (
     <li
+      data-gate-item=""
+      tabIndex={0}
       role="listitem"
       aria-label={`${urgLabel} priority: ${gate.kind} from ${gate.agent_id}`}
       style={{ background: "var(--card)", border: `1px solid ${color}25`,

@@ -13,6 +13,52 @@ import { VirtualList } from "@/components/VirtualList";
 import { TimeAgo } from "@/components/TimeAgo";
 import { Activity, Pause, Play, ChevronDown, CheckCircle } from "lucide-react";
 
+// ─── Smart-batching types ─────────────────────────────────────────────────────
+
+interface BatchGroup {
+  _type: "batch";
+  id: string;
+  events: StreamEvent[];
+  count: number;
+}
+
+type DisplayItem = StreamEvent | BatchGroup;
+
+function isBatch(item: DisplayItem): item is BatchGroup {
+  return "_type" in item;
+}
+
+const BATCH_WINDOW_MS = 200;
+const BATCH_THRESHOLD = 10;
+
+/** Collapse rapid-fire bursts of SSE events into a single summary row. */
+function applySmartBatching(
+  events: StreamEvent[],
+  expandedBatchIds: ReadonlySet<string>
+): DisplayItem[] {
+  const result: DisplayItem[] = [];
+  let i = 0;
+  while (i < events.length) {
+    const current = events[i];
+    if (current._received_at <= 0) { result.push(current); i++; continue; }
+    let j = i + 1;
+    while (
+      j < events.length &&
+      events[j]._received_at > 0 &&
+      events[i]._received_at - events[j]._received_at < BATCH_WINDOW_MS
+    ) { j++; }
+    const batchSize = j - i;
+    const batchId = `batch-${current._local_id}`;
+    if (batchSize > BATCH_THRESHOLD && !expandedBatchIds.has(batchId)) {
+      result.push({ _type: "batch", id: batchId, events: events.slice(i, j), count: batchSize });
+    } else {
+      for (let k = i; k < j; k++) result.push(events[k]);
+    }
+    i = j;
+  }
+  return result;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const KIND_COLOR: Record<string, string> = {
@@ -32,6 +78,15 @@ function kindColor(kind: string): string {
 
 function kindLabel(kind: string): string {
   return kind.toUpperCase().slice(0, 6).padEnd(6);
+}
+
+type Severity = "high" | "medium" | "low";
+
+function getSeverity(kind: string): Severity {
+  const k = kind.toLowerCase();
+  if (k === "scope" || k === "hitl" || k === "gate") return "high";
+  if (k === "budget") return "medium";
+  return "low";
 }
 
 function formatTimestamp(iso: string): string {
@@ -242,6 +297,42 @@ function WaitingForEvents() {
   );
 }
 
+// ─── Batch summary row ────────────────────────────────────────────────────────
+
+function BatchSummaryRow({ count, onExpand }: { count: number; onExpand: () => void }) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onExpand}
+      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onExpand(); } }}
+      aria-label={`${count} events in rapid succession. Activate to expand.`}
+      style={{
+        display: "flex", alignItems: "center", justifyContent: "center",
+        height: 72, borderBottom: "1px solid var(--border)", cursor: "pointer",
+        gap: "0.5rem", background: "rgba(130,40,245,0.03)",
+        transition: "background var(--transition-fast)", outline: "none",
+      }}
+      onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(130,40,245,0.07)"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(130,40,245,0.03)"; }}
+    >
+      <span style={{ fontSize: "0.8125rem", color: "var(--text-tertiary)" }}>—</span>
+      <span style={{ fontSize: "0.8125rem", fontWeight: 500, color: "var(--accent-light)" }}>
+        {count} events
+      </span>
+      <span style={{ fontSize: "0.8125rem", color: "var(--text-tertiary)" }}>in 200ms</span>
+      <span style={{
+        fontSize: "0.75rem", padding: "2px 7px", borderRadius: "var(--radius-sm)",
+        background: "rgba(130,40,245,0.1)", border: "1px solid rgba(130,40,245,0.2)",
+        color: "var(--accent-light)",
+      }}>
+        click to expand
+      </span>
+      <span style={{ fontSize: "0.8125rem", color: "var(--text-tertiary)" }}>—</span>
+    </div>
+  );
+}
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function StreamPage() {
@@ -252,6 +343,7 @@ export default function StreamPage() {
   const [newEventCount, setNewEventCount] = useState(0);
   const [isAtTop, setIsAtTop] = useState(true);
   const [scrollToTopTrigger, setScrollToTopTrigger] = useState(0);
+  const [expandedBatchIds, setExpandedBatchIds] = useState<ReadonlySet<string>>(new Set());
   const pauseBufferRef = useRef<typeof sseEvents>([]);
   const prevSseLen = useRef(sseEvents.length);
 
@@ -259,6 +351,7 @@ export default function StreamPage() {
   const [filterAgent, setFilterAgent] = useState("");
   const [filterKind, setFilterKind] = useState("");
   const [filterSession, setFilterSession] = useState("");
+  const [filterSeverity, setFilterSeverity] = useState<"" | Severity>("");
 
   // REST history
   const qc = useQueryClient();
@@ -294,9 +387,10 @@ export default function StreamPage() {
       if (filterAgent && !e.agent_id.toLowerCase().includes(filterAgent.toLowerCase())) return false;
       if (filterKind && e.kind !== filterKind) return false;
       if (filterSession && e.session_id !== filterSession) return false;
+      if (filterSeverity && getSeverity(e.kind) !== filterSeverity) return false;
       return true;
     });
-  }, [sseEvents, filterAgent, filterKind, filterSession]);
+  }, [sseEvents, filterAgent, filterKind, filterSession, filterSeverity]);
 
   // Convert hist events to StreamEvent format for unified display
   const histAsStream = useMemo((): typeof sseEvents => {
@@ -316,12 +410,21 @@ export default function StreamPage() {
   }, [filteredSse, histAsStream]);
 
   function resetFilters() {
-    setFilterAgent(""); setFilterKind(""); setFilterSession("");
+    setFilterAgent(""); setFilterKind(""); setFilterSession(""); setFilterSeverity("");
     setHistEvents([]); setHistOffset(null);
   }
 
   const isConnecting = connectionStatus === "connecting";
   const showWaiting = (isConnecting || connectionStatus === "connected") && allEvents.length === 0;
+
+  // Apply pause filter then smart batching for the virtual list
+  const displayItems: DisplayItem[] = applySmartBatching(
+    paused
+      ? allEvents.filter((e) => e._received_at <= (pauseBufferRef.current[0]?._received_at ?? Infinity))
+      : allEvents,
+    expandedBatchIds
+  );
+  const hasActiveFilters = filterAgent || filterKind || filterSession || filterSeverity;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", gap: "0.75rem" }}>
@@ -415,7 +518,15 @@ export default function StreamPage() {
         <input value={filterSession} onChange={(e) => setFilterSession(e.target.value)}
           placeholder="Session ID…" className="filter-input" style={{ minWidth: 140, flex: 1 }}
           aria-label="Filter by session ID" />
-        {(filterAgent || filterKind || filterSession) && (
+        <select value={filterSeverity} onChange={(e) => setFilterSeverity(e.target.value as "" | Severity)}
+          className="filter-input" aria-label="Filter by severity"
+          style={{ minWidth: 120 }}>
+          <option value="">All severity</option>
+          <option value="high">HIGH — scope / HITL</option>
+          <option value="medium">MEDIUM — budget</option>
+          <option value="low">LOW — audit / system</option>
+        </select>
+        {hasActiveFilters && (
           <button onClick={resetFilters} className="btn-ghost"
             style={{ padding: "0.375rem 0.75rem", fontSize: "0.8125rem" }}>Reset</button>
         )}
@@ -447,23 +558,36 @@ export default function StreamPage() {
             <p style={{ fontSize: "0.875rem", color: "var(--text-tertiary)" }}>No events match the current filters.</p>
           </div>
         ) : (
-          <VirtualList
-            items={paused ? allEvents.filter((e) => e._received_at <= (pauseBufferRef.current[0]?._received_at ?? Infinity)) : allEvents}
+          <VirtualList<DisplayItem>
+            items={displayItems}
             itemHeight={72}
             scrollToTopTrigger={scrollToTopTrigger}
             onScrolledToTop={() => { setIsAtTop(true); setNewEventCount(0); }}
             onScrolledToBottom={() => setIsAtTop(false)}
-            renderItem={(event) => (
-              <EventRow
-                key={event._local_id}
-                event={event}
-                expanded={expandedId === event._local_id}
-                onToggle={() => setExpandedId((id) => id === event._local_id ? null : event._local_id)}
-                onVerify={setVerifySessionId}
-                onFilterAgent={(id) => setFilterAgent(id)}
-                onFilterKind={(k) => setFilterKind(k)}
-              />
-            )}
+            renderItem={(item) => {
+              if (isBatch(item)) {
+                return (
+                  <BatchSummaryRow
+                    key={item.id}
+                    count={item.count}
+                    onExpand={() =>
+                      setExpandedBatchIds((prev) => new Set([...prev, item.id]))
+                    }
+                  />
+                );
+              }
+              return (
+                <EventRow
+                  key={item._local_id}
+                  event={item}
+                  expanded={expandedId === item._local_id}
+                  onToggle={() => setExpandedId((id) => id === item._local_id ? null : item._local_id)}
+                  onVerify={setVerifySessionId}
+                  onFilterAgent={(id) => setFilterAgent(id)}
+                  onFilterKind={(k) => setFilterKind(k)}
+                />
+              );
+            }}
           />
         )}
       </div>
