@@ -617,8 +617,10 @@ class GovernanceSDK:
                 pass
             self._hot_reload_task = None
         await self.audit.close()
-        await self.loop.close()
-        await self.presence.close()
+        if hasattr(self, "loop"):
+            await self.loop.close()
+        if hasattr(self, "presence"):
+            await self.presence.close()
         # Dispose the shared engine last, after all modules have released
         # their references to it.
         if self._shared_engine is not None:

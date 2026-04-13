@@ -234,3 +234,66 @@ async def test_full_enforcement_wrap_anthropic_budget_and_audit() -> None:
         assert len(agent_events) >= 1, (
             "Expected at least one audit event for e2e-agent"
         )
+
+
+# ---------------------------------------------------------------------------
+# close() must not crash when loop/presence are disabled
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_crash_when_loop_disabled() -> None:
+    """SDK context manager must exit cleanly when enable_loop=False."""
+    from codeatelier_governance.sdk import GovernanceSDK
+
+    async with GovernanceSDK(api_key="test-key", enable_loop=False, warn_on_no_wrappers=False):
+        pass  # __aexit__ calls close(); must not raise AttributeError
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_crash_when_presence_disabled() -> None:
+    """SDK context manager must exit cleanly when enable_presence=False."""
+    from codeatelier_governance.sdk import GovernanceSDK
+
+    async with GovernanceSDK(api_key="test-key", enable_presence=False, warn_on_no_wrappers=False):
+        pass  # __aexit__ calls close(); must not raise AttributeError
+
+
+@pytest.mark.asyncio
+async def test_close_does_not_crash_when_both_disabled() -> None:
+    """SDK context manager must exit cleanly when both loop and presence are disabled."""
+    from codeatelier_governance.sdk import GovernanceSDK
+
+    async with GovernanceSDK(
+        api_key="test-key",
+        enable_loop=False,
+        enable_presence=False,
+        warn_on_no_wrappers=False,
+    ):
+        pass
+
+
+# ---------------------------------------------------------------------------
+# ReportGenerator.generate_article12 / generate_summary: verify_chain=True
+# without audit_module must raise ValueError
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_article12_verify_chain_without_audit_module_raises() -> None:
+    """generate_article12(verify_chain=True) must raise when no audit_module given."""
+    from codeatelier_governance.compliance.report import ReportGenerator
+
+    gen = ReportGenerator()  # no audit_module
+    with pytest.raises(ValueError, match="audit_module"):
+        await gen.generate_article12(verify_chain=True)
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_verify_chain_without_audit_module_raises() -> None:
+    """generate_summary(verify_chain=True) must raise when no audit_module given."""
+    from codeatelier_governance.compliance.report import ReportGenerator
+
+    gen = ReportGenerator()  # no audit_module
+    with pytest.raises(ValueError, match="audit_module"):
+        await gen.generate_summary(agent_id="test-agent", verify_chain=True)

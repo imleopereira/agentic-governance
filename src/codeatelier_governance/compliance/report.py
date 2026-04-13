@@ -290,20 +290,13 @@ class ReportGenerator:
         Returns one of the :class:`ChainIntegrityStatus` literals:
         ``"verified"`` — chain checked and passed.
         ``"failed"`` — chain checked and found a broken or missing link.
-        ``"unverified"`` — no audit_module was provided; verification was skipped.
 
         Never raises — errors are logged and mapped to ``"unverified"``.
+        Callers must ensure ``self._audit_module`` is not None before calling;
+        both ``generate_article12`` and ``generate_summary`` enforce this via
+        an early ``ValueError`` guard.
         """
-        if self._audit_module is None:
-            logger.warning(
-                "compliance.report.chain_verify_skipped",
-                detail=(
-                    "verify_chain=True was requested but no audit_module was provided "
-                    "to ReportGenerator. Pass audit_module=sdk.audit to enable chain "
-                    "verification in reports."
-                ),
-            )
-            return "unverified"
+        assert self._audit_module is not None  # enforced by callers
         try:
             await self._audit_module.verify_chain()
             return "verified"
@@ -392,7 +385,17 @@ class ReportGenerator:
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
                 Requires ``audit_module`` to be set. Default ``False``.
+
+        Raises:
+            ValueError: If ``verify_chain=True`` is requested but no
+                ``audit_module`` was provided at construction time.
         """
+        if verify_chain and self._audit_module is None:
+            raise ValueError(
+                "verify_chain=True requires an audit_module to be passed to "
+                "ReportGenerator at construction time. "
+                "Pass audit_module=sdk.audit when constructing ReportGenerator."
+            )
         events = await self._get_events(
             session_ids=session_ids,
             agent_id=agent_id,
@@ -473,7 +476,17 @@ class ReportGenerator:
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
                 Requires ``audit_module`` to be set. Default ``False``.
+
+        Raises:
+            ValueError: If ``verify_chain=True`` is requested but no
+                ``audit_module`` was provided at construction time.
         """
+        if verify_chain and self._audit_module is None:
+            raise ValueError(
+                "verify_chain=True requires an audit_module to be passed to "
+                "ReportGenerator at construction time. "
+                "Pass audit_module=sdk.audit when constructing ReportGenerator."
+            )
         events = await self._get_events(
             agent_id=agent_id,
             date_from=date_from,
