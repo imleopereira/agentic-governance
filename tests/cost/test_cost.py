@@ -363,3 +363,58 @@ async def test_combined_query_returns_correct_values() -> None:
     assert s_tok == 800
     assert d_usd == pytest.approx(2.25)
     assert d_tok == 800
+
+
+# ---------------------------------------------------------------------------
+# Item 3: projected_tokens parameter on check_or_raise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_check_or_raise_projected_tokens_blocks_call(cost: CostModule) -> None:
+    """check_or_raise with projected_tokens blocks when current + projected > limit."""
+    cost.register(BudgetPolicy(agent_id="p", per_session_tokens=1000))
+    sid = uuid4()
+    await cost.track("p", sid, tokens=800)
+
+    # 800 current + 300 projected = 1100 > 1000 → should raise
+    with pytest.raises(BudgetExceeded, match="per_session_tokens"):
+        await cost.check_or_raise("p", sid, projected_tokens=300)
+
+
+@pytest.mark.asyncio
+async def test_check_or_raise_projected_tokens_under_limit_passes(cost: CostModule) -> None:
+    """check_or_raise with projected_tokens passes when current + projected <= limit."""
+    cost.register(BudgetPolicy(agent_id="p2", per_session_tokens=1000))
+    sid = uuid4()
+    await cost.track("p2", sid, tokens=800)
+
+    # 800 current + 100 projected = 900 <= 1000 → should pass
+    await cost.check_or_raise("p2", sid, projected_tokens=100)
+
+
+@pytest.mark.asyncio
+async def test_check_or_raise_projected_tokens_none_uses_old_behavior(cost: CostModule) -> None:
+    """check_or_raise without projected_tokens still checks balance vs limit."""
+    cost.register(BudgetPolicy(agent_id="p3", per_session_tokens=1000))
+    sid = uuid4()
+    await cost.track("p3", sid, tokens=900)
+
+    # 900 < 1000 → passes without projected_tokens
+    await cost.check_or_raise("p3", sid)
+
+    await cost.track("p3", sid, tokens=200)  # now 1100
+    with pytest.raises(BudgetExceeded, match="per_session_tokens"):
+        await cost.check_or_raise("p3", sid)
+
+
+@pytest.mark.asyncio
+async def test_check_or_raise_projected_tokens_daily_cap(cost: CostModule) -> None:
+    """check_or_raise projects tokens against daily cap too."""
+    cost.register(BudgetPolicy(agent_id="p4", per_agent_tokens_daily=1000))
+    s1 = uuid4()
+    await cost.track("p4", s1, tokens=800)
+
+    # 800 daily + 300 projected = 1100 > 1000 → blocks
+    with pytest.raises(BudgetExceeded, match="per_agent_tokens_daily"):
+        await cost.check_or_raise("p4", s1, projected_tokens=300)

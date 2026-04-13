@@ -15,6 +15,8 @@ from codeatelier_governance.audit import AuditModule, BatchingWriter, InMemoryAu
 from codeatelier_governance.cost.errors import BudgetExceeded
 from codeatelier_governance.cost.models import BudgetPolicy
 from codeatelier_governance.cost.module import CostModule
+from codeatelier_governance.scope.errors import ScopeViolation
+from codeatelier_governance.scope.models import ScopePolicy
 from codeatelier_governance.scope.module import ScopeModule
 from codeatelier_governance.integrations.openai_wrap import wrap_openai
 
@@ -315,3 +317,310 @@ class TestIsStreamingResponse:
         from codeatelier_governance.integrations.openai_wrap import _is_streaming_response
 
         assert _is_streaming_response(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Item 1: scope.check() integration for OpenAI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_scope_violation_blocks_llm_call(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """wrap_openai with scope policy denying the action raises ScopeViolation.
+
+    The LLM client must never be called when scope check fails.
+    """
+    sdk.scope.register(
+        ScopePolicy(agent_id="scope-agent-oai", allowed_tools=frozenset({"read_file"}))
+    )
+    call_count = 0
+
+    class CountingCompletions:
+        async def create(self, **kwargs: Any) -> FakeResponse:
+            nonlocal call_count
+            call_count += 1
+            return FakeResponse(usage=FakeUsage(10, 20, 30))
+
+    class CountingChat:
+        completions = CountingCompletions()
+
+    class CountingClient:
+        chat = CountingChat()
+
+    client = CountingClient()
+    wrap_openai(client, sdk=sdk, agent_id="scope-agent-oai")  # type: ignore[arg-type]
+
+    with pytest.raises(ScopeViolation):
+        await client.chat.completions.create(model="gpt-4o")
+
+    assert call_count == 0, "LLM client must not be called when scope check fails"
+
+
+@pytest.mark.asyncio
+async def test_openai_no_scope_policy_passes_through(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """wrap_openai with no scope policy registered proceeds normally."""
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+
+    wrap_openai(client, sdk=sdk, agent_id="unreg-oai")  # type: ignore[arg-type]
+
+    result = await client.chat.completions.create(model="gpt-4o")
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_openai_scope_check_fires_before_cost_check(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI scope violation fires BEFORE cost check."""
+    sdk.scope.register(
+        ScopePolicy(agent_id="order-agent-oai", allowed_tools=frozenset({"read_file"}))
+    )
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="order-agent-oai", per_session_usd=0.001))
+    await sdk.cost.track("order-agent-oai", sid, tokens=0, usd=999.0)
+
+    cost_check_called = False
+    original_check = sdk.cost.check_or_raise
+
+    async def tracking_check(*args: Any, **kwargs: Any) -> None:
+        nonlocal cost_check_called
+        cost_check_called = True
+        return await original_check(*args, **kwargs)
+
+    sdk.cost.check_or_raise = tracking_check  # type: ignore[method-assign]
+
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+    wrap_openai(client, sdk=sdk, agent_id="order-agent-oai", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(ScopeViolation):
+        await client.chat.completions.create(model="gpt-4o")
+
+    assert not cost_check_called, "cost.check_or_raise must not be called when scope denies"
+
+
+# ---------------------------------------------------------------------------
+# Item 2: wrapper registry for OpenAI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wrap_openai_registers_on_sdk(sdk: FakeSDK) -> None:
+    """wrap_openai should append itself to sdk._registered_wrappers."""
+    sdk._registered_wrappers = []  # type: ignore[attr-defined]
+    sdk._started = False  # type: ignore[attr-defined]
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+    wrap_openai(client, sdk=sdk, agent_id="reg-oai")  # type: ignore[arg-type]
+    assert "openai:reg-oai" in sdk._registered_wrappers  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Item 3: projected tokens for OpenAI
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_projected_tokens_blocks_call(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI budget gate: balance 800 tokens, limit 1000, max_tokens 300 → blocked."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="proj-oai", per_session_tokens=1000))
+    await sdk.cost.track("proj-oai", sid, tokens=800)
+
+    call_count = 0
+
+    class CountingCompletions:
+        async def create(self, **kwargs: Any) -> FakeResponse:
+            nonlocal call_count
+            call_count += 1
+            return FakeResponse(usage=FakeUsage(10, 20, 30))
+
+    class CountingChat:
+        completions = CountingCompletions()
+
+    class CountingClient:
+        chat = CountingChat()
+
+    client = CountingClient()
+    wrap_openai(client, sdk=sdk, agent_id="proj-oai", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.chat.completions.create(model="gpt-4o", max_tokens=300)
+
+    assert call_count == 0, "LLM must not be called when projected usage would breach limit"
+
+
+@pytest.mark.asyncio
+async def test_openai_projected_tokens_under_limit_proceeds(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI budget gate: balance 800, limit 1000, max_tokens 100 → proceeds."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="proj-oai2", per_session_tokens=1000))
+    await sdk.cost.track("proj-oai2", sid, tokens=800)
+
+    response = FakeResponse(usage=FakeUsage(50, 50, 100))
+    client = FakeAsyncClient(response)
+    wrap_openai(client, sdk=sdk, agent_id="proj-oai2", session_id=sid)  # type: ignore[arg-type]
+
+    result = await client.chat.completions.create(model="gpt-4o", max_tokens=100)
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_openai_no_max_tokens_emits_warning(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI: no max_tokens and no default → warning emitted, call proceeds."""
+    import structlog.testing
+
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+    wrap_openai(client, sdk=sdk, agent_id="warn-oai")  # type: ignore[arg-type]
+
+    with structlog.testing.capture_logs() as cap_logs:
+        result = await client.chat.completions.create(model="gpt-4o")
+
+    warning_events = [
+        e for e in cap_logs
+        if e.get("event") == "governance.wrap.max_tokens_not_declared"
+    ]
+    assert len(warning_events) >= 1, "Expected max_tokens_not_declared warning"
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_openai_default_max_tokens_used_when_not_declared(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI SDK default_max_tokens used as projection when call omits max_tokens."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="default-proj-oai", per_session_tokens=1000))
+    await sdk.cost.track("default-proj-oai", sid, tokens=800)
+
+    class FakeConfig:
+        default_max_tokens = 500
+        warn_on_no_wrappers = False
+
+    sdk.config = FakeConfig()  # type: ignore[attr-defined]
+
+    response = FakeResponse(usage=FakeUsage(10, 20, 30))
+    client = FakeAsyncClient(response)
+    wrap_openai(client, sdk=sdk, agent_id="default-proj-oai", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.chat.completions.create(model="gpt-4o")  # no explicit max_tokens
+
+
+# ---------------------------------------------------------------------------
+# Item 4: OpenAI streaming tracking
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_streaming_budget_gate_blocks_before_stream(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI streaming: max_tokens would breach limit → BudgetExceeded, stream never opened."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-gate-oai", per_session_tokens=1000))
+    await sdk.cost.track("stream-gate-oai", sid, tokens=800)
+
+    stream_opened = False
+
+    class FakeStream:
+        def __init__(self) -> None:
+            nonlocal stream_opened
+            stream_opened = True
+
+    class StreamingCompletions:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingChat:
+        completions = StreamingCompletions()
+
+    class StreamingClient:
+        chat = StreamingChat()
+
+    client = StreamingClient()
+    wrap_openai(client, sdk=sdk, agent_id="stream-gate-oai", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.chat.completions.create(model="gpt-4o", stream=True, max_tokens=300)
+
+    assert not stream_opened, "Stream must not be opened when budget gate fires"
+
+
+@pytest.mark.asyncio
+async def test_openai_streaming_call_tracks_cost(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI streaming call → track() called with projected tokens."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-track-oai", per_session_tokens=5000))
+
+    class FakeStream:
+        pass
+
+    class StreamingCompletions:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingChat:
+        completions = StreamingCompletions()
+
+    class StreamingClient:
+        chat = StreamingChat()
+
+    client = StreamingClient()
+    wrap_openai(client, sdk=sdk, agent_id="stream-track-oai", session_id=sid)  # type: ignore[arg-type]
+
+    await client.chat.completions.create(model="gpt-4o", stream=True, max_tokens=200)
+
+    snap = await sdk.cost.snapshot("stream-track-oai", sid)
+    assert snap.session_tokens_used == 200
+
+
+@pytest.mark.asyncio
+async def test_openai_streaming_audit_event_cost_tracked_true(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """OpenAI streaming with max_tokens → llm.result must not have cost_tracked=False."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-audit-oai", per_session_tokens=5000))
+
+    class FakeStream:
+        pass
+
+    class StreamingCompletions:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingChat:
+        completions = StreamingCompletions()
+
+    class StreamingClient:
+        chat = StreamingChat()
+
+    client = StreamingClient()
+    wrap_openai(client, sdk=sdk, agent_id="stream-audit-oai", session_id=sid)  # type: ignore[arg-type]
+
+    await client.chat.completions.create(model="gpt-4o", stream=True, max_tokens=150)
+    await sdk.audit._writer.flush()
+
+    all_events = list(store._events.values())
+    result_events = [e for e in all_events if e.kind == "llm.result"]
+    assert len(result_events) >= 1
+
+    for event in result_events:
+        assert event.metadata.get("cost_tracked") is not False, (
+            f"Streaming audit event must not have cost_tracked=False, got: {event.metadata}"
+        )

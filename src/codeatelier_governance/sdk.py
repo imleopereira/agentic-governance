@@ -85,6 +85,14 @@ class GovernanceConfig:
     # any link fails. Default False: opt-in because verification cost is
     # O(n) in the number of events returned.
     verify_chain_on_read: bool = False
+    # When True (the default), sdk.start() emits a structlog warning when no
+    # LLM wrappers (wrap_anthropic / wrap_openai) have been registered.  Set
+    # to False in test suites to suppress the warning.
+    warn_on_no_wrappers: bool = True
+    # Optional default max_tokens used by budget projection in wrappers when
+    # the caller does not declare max_tokens explicitly.  Suppresses the
+    # "max_tokens_not_declared" warning for projects that always use the same cap.
+    default_max_tokens: int | None = None
 
 
 class GovernanceSDK:
@@ -137,6 +145,9 @@ class GovernanceSDK:
         self._hot_reload_interval = hot_reload_interval
         self._hot_reload_task: asyncio.Task[None] | None = None
         self._last_policy_updated_at: datetime | None = None
+        # Registry of wrapper labels recorded by wrap_anthropic() / wrap_openai().
+        # Used at start() to warn operators when zero enforcement wrappers are active.
+        self._registered_wrappers: list[str] = []
 
         resolved_secret_str = audit_secret or self._resolve_audit_secret()
         resolved_secret = (
@@ -517,6 +528,10 @@ class GovernanceSDK:
         Postgres BEFORE the background task starts. This eliminates the
         cold-start window where policies are empty (critical for serverless
         deployments like AWS Lambda).
+
+        Emits a structlog warning when no LLM wrappers have been registered
+        (i.e. wrap_anthropic() or wrap_openai() was never called), unless
+        ``warn_on_no_wrappers=False`` was passed at construction time.
         """
         self._started = True
         # self.audit always exists — either wired to a real persistent
@@ -525,6 +540,16 @@ class GovernanceSDK:
         # so .log() calls from dependent modules handle their own buffer
         # state correctly.
         await self.audit.start()
+
+        if self.config.warn_on_no_wrappers and not self._registered_wrappers:
+            logger.warning(
+                "no_wrappers_registered",
+                message=(
+                    "GovernanceSDK started with no wrappers registered. "
+                    "Budget and scope enforcement are inactive. "
+                    "Call wrap_anthropic() or wrap_openai() to activate enforcement."
+                ),
+            )
         # Drain policies that were registered synchronously (before any
         # event loop was running).  This replaces the v0.5.0 behaviour of
         # calling ``asyncio.run()`` inside ``register()``, which violated
