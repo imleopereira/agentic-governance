@@ -350,5 +350,8 @@ async def test_article12_compliant_with_rich_data(
     # Human oversight should be compliant (1 request, 1 grant)
     assert report.sections[5].status == "compliant"
 
-    # Post-market monitoring: no violations, chain verified
-    assert report.sections[6].status == "compliant"
+    # Post-market monitoring: no violations, but chain NOT verified by the report
+    # generator (chain_integrity_verified=False by default — call verify_chain=True
+    # to get "verified" status). Status is "non_compliant" because the chain was
+    # not checked — not because violations exist.
+    assert report.sections[6].status == "non_compliant"

@@ -73,6 +73,14 @@ class GovernanceConfig:
     # compatibility so callers that pre-emptively set the flag do not
     # break when the real module lands.
     enable_prompts: bool = True
+    # Loop detection: sliding-window repeated-tool-call detection + auto-halt.
+    # Enabled by default.  Set to False to skip LoopModule construction;
+    # sdk.loop will not exist and any call to it raises AttributeError.
+    enable_loop: bool = True
+    # Presence: agent heartbeat / live-idle-unresponsive tracking.
+    # Enabled by default.  Set to False to skip PresenceModule construction;
+    # sdk.presence will not exist and any call to it raises AttributeError.
+    enable_presence: bool = True
     # Routing is an advisory feature that can mutate the model on an LLM
     # call.  It is OFF by default — enable it explicitly at SDK construction
     # time AND register at least one RoutingPolicy for it to take effect on
@@ -92,7 +100,17 @@ class GovernanceConfig:
     # Optional default max_tokens used by budget projection in wrappers when
     # the caller does not declare max_tokens explicitly.  Suppresses the
     # "max_tokens_not_declared" warning for projects that always use the same cap.
+    # Must be >= 1 when provided; negative values would corrupt budget gate projection.
     default_max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate field constraints that cannot be expressed as dataclass defaults."""
+        if self.default_max_tokens is not None and self.default_max_tokens < 1:
+            raise ValueError(
+                f"GovernanceConfig.default_max_tokens must be >= 1 "
+                f"(got {self.default_max_tokens}). "
+                f"Negative or zero values would corrupt forward budget projection."
+            )
 
 
 class GovernanceSDK:
@@ -268,18 +286,34 @@ class GovernanceSDK:
                 ),
             )
 
-        # v0.3 modules — not gated behind config flags at this time (loop
-        # and presence have no dedicated enable_* flag yet).  Added as a
-        # v0.5.1 followup if there is customer demand.
-        self.loop = LoopModule(
-            self.audit,
-            policies=loop_policies,
-            database_url=database_url,
-            engine=self._shared_engine,
-        )
-        self.presence = PresenceModule(
-            database_url=database_url, engine=self._shared_engine,
-        )
+        if self.config.enable_loop:
+            self.loop = LoopModule(
+                self.audit,
+                policies=loop_policies,
+                database_url=database_url,
+                engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.loop_disabled",
+                detail=(
+                    "enable_loop=False — sdk.loop is not constructed.  "
+                    "Loop detection and auto-halt are off."
+                ),
+            )
+
+        if self.config.enable_presence:
+            self.presence = PresenceModule(
+                database_url=database_url, engine=self._shared_engine,
+            )
+        else:
+            logger.warning(
+                "sdk.presence_disabled",
+                detail=(
+                    "enable_presence=False — sdk.presence is not constructed.  "
+                    "Agent heartbeat tracking is off."
+                ),
+            )
 
         # Contracts depends on scope + cost (+ gates for HITL).  Cascade
         # disable: if any hard dependency is off, contracts is also off and

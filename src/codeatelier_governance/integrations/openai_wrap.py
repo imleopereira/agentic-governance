@@ -117,6 +117,10 @@ def _resolve_projected_tokens(sdk: Any, kwargs: dict[str, Any]) -> int | None:
     3. None — emit a structlog warning; the cost gate falls back to the
        backward-looking ``current_balance > limit`` check.
 
+    A ``max_tokens`` value of 0 or negative is meaningless for forward budget
+    projection and is treated as absent — the SDK falls through to
+    ``default_max_tokens`` or emits the "max_tokens not declared" warning.
+
     Args:
         sdk: The GovernanceSDK instance.
         kwargs: The keyword arguments passed to completions.create.
@@ -125,7 +129,12 @@ def _resolve_projected_tokens(sdk: Any, kwargs: dict[str, Any]) -> int | None:
         The projected token count, or None if unavailable.
     """
     if "max_tokens" in kwargs:
-        return int(kwargs["max_tokens"])
+        max_tokens: int | None = int(kwargs["max_tokens"])
+        if max_tokens is not None and max_tokens <= 0:
+            # max_tokens=0 or negative is meaningless for projection; treat as absent.
+            max_tokens = None
+        if max_tokens is not None:
+            return max_tokens
     default = getattr(getattr(sdk, "config", None), "default_max_tokens", None)
     if default is not None:
         return int(default)
@@ -251,71 +260,6 @@ def _wrap_sync_create(
     error directing the developer to use the async API. When there is no
     running loop, it uses ``asyncio.run`` for each governance call.
     """
-
-    async def _async_impl(*args: Any, **kwargs: Any) -> Any:
-        model = kwargs.get("model", "unknown")
-        is_streaming = kwargs.get("stream", False)
-
-        # Model selection policy — advisory, never raises
-        if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
-            _suggested = await sdk.routing.suggest(
-                agent_id, session_id, str(model),
-                max_tokens=int(kwargs.get("max_tokens", 1000)),
-            )
-            if _suggested != str(model):
-                kwargs["model"] = _suggested
-                model = _suggested
-
-        # Enforcement gate 1: scope — raises ScopeViolation if denied.
-        await _scope_check_if_registered(sdk, agent_id, _CHAT_COMPLETIONS_SENTINEL)
-
-        # Enforcement gate 2: budget — raises BudgetExceeded if over cap.
-        _projected = _resolve_projected_tokens(sdk, kwargs)
-        await sdk.cost.check_or_raise(agent_id, session_id, projected_tokens=_projected)
-
-        # Background the pre-call audit (observation-only, not enforcement)
-        pre_audit_task = asyncio.create_task(
-            _safe_audit_log(sdk, agent_id, "llm.call", {"model": model}, model=str(model), session_id=session_id)
-        )
-
-        try:
-            response = original(*args, **kwargs)
-        except Exception as exc:
-            await pre_audit_task
-            await _safe_audit_log(
-                sdk, agent_id, "llm.error",
-                {"model": model, "error_type": type(exc).__name__},
-                model=str(model), session_id=session_id,
-            )
-            raise
-
-        await pre_audit_task
-
-        if is_streaming or _is_streaming_response(response):
-            await _handle_streaming_response(
-                sdk, agent_id, session_id, response, model, _projected
-            )
-            return response
-
-        usage = _extract_token_usage(response)
-        total_tokens = usage.get("total_tokens", 0)
-        usd = _estimate_usd(str(model), usage)
-
-        # Run post-call audit + cost track concurrently
-        post_coros: list[Any] = [
-            _safe_audit_log(
-                sdk, agent_id, "llm.result",
-                {"model": model, "token_usage": usage},
-                model=str(model), session_id=session_id,
-            ),
-        ]
-        if total_tokens > 0:
-            post_coros.append(
-                _safe_cost_track(sdk, agent_id, session_id, total_tokens, usd)
-            )
-        await asyncio.gather(*post_coros)
-
-        return response
 
     @functools.wraps(original)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -451,9 +395,12 @@ def _wrap_async_create(
 
         try:
             response = await original(*args, **kwargs)
-        except Exception as exc:
+        except BaseException as exc:
             # Await the pre-call audit before propagating the error so it
             # completes before we log the error event.
+            # BaseException is used (not Exception) so that asyncio.CancelledError
+            # (which inherits from BaseException in Python 3.8+) is also audited.
+            # CancelledError is always re-raised by the final `raise`.
             await pre_audit_task
             await _safe_audit_log(
                 sdk, agent_id, "llm.error",
@@ -523,7 +470,15 @@ def wrap_openai(
 
     Returns:
         The same client object, patched in-place.
+
+    Raises:
+        ValueError: If ``agent_id`` is empty or whitespace-only.
     """
+    if not agent_id or not agent_id.strip():
+        raise ValueError(
+            f"agent_id must be a non-empty string, got {agent_id!r}"
+        )
+
     if getattr(client, "_governance_wrapped", False):
         logger.warning(
             "governance.openai_wrap.already_wrapped",

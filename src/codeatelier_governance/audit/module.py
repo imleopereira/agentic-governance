@@ -462,16 +462,33 @@ class AuditModule:
     ) -> bool:
         """Verify HMAC integrity for an ordered list of AuditEventRecord objects.
 
+        Performs two passes:
+        1. Per-event HMAC check — detects in-place row tampering.
+        2. Linkage check — verifies that ``records[i].prev_hash == records[i-1].hmac``
+           for every consecutive pair, detecting event deletion (a gap in the chain
+           that leaves no broken HMAC on any remaining row).
+
         Used internally by ``verify_chain`` and ``get_events`` when
         ``verify_chain_on_read=True``. Raises :class:`ChainIntegrityError`
         at the first failing link. Returns ``True`` if all links are clean.
         """
+        # Pass 1: per-event HMAC check
         for idx, record in enumerate(records):
             if not verify_event(record, self._secret):
                 raise ChainIntegrityError(
                     f"audit chain integrity violation at sequence index {idx} "
                     f"(event_id={record.event_id})"
                 )
+
+        # Pass 2: linkage check — detects deleted events (chain gaps)
+        for i in range(1, len(records)):
+            if records[i].prev_hash != records[i - 1].hmac:
+                raise ChainIntegrityError(
+                    f"chain gap at position {i}: prev_hash of event "
+                    f"{records[i].event_id} does not match hmac of preceding event "
+                    f"{records[i - 1].event_id}"
+                )
+
         return True
 
     async def verify_chain(
@@ -513,6 +530,12 @@ class AuditModule:
             Raised immediately at the first failing link, carrying the
             0-based sequence number of the bad event.
         """
+        # Validate sequence range before fetching events.
+        if from_seq is not None and to_seq is not None and from_seq > to_seq:
+            raise ValueError(
+                f"verify_chain: from_seq ({from_seq}) must be <= to_seq ({to_seq})"
+            )
+
         if session_id is not None:
             events = await self._store.get_session_events(session_id)
         else:
@@ -534,6 +557,7 @@ class AuditModule:
         end = (to_seq + 1) if to_seq is not None else len(events)
         window = events[start:end]
 
+        # Pass 1: per-event HMAC check
         for idx, record in enumerate(window):
             if not verify_event(record, self._secret):
                 absolute_seq = start + idx
@@ -541,6 +565,19 @@ class AuditModule:
                     f"audit chain integrity violation at sequence {absolute_seq} "
                     f"(event_id={record.event_id})"
                 )
+
+        # Pass 2: linkage check — detects deleted events (chain gaps).
+        # Only valid within the window (records[i].prev_hash must match
+        # records[i-1].hmac for consecutive records in the slice).
+        for i in range(1, len(window)):
+            if window[i].prev_hash != window[i - 1].hmac:
+                absolute_seq = start + i
+                raise ChainIntegrityError(
+                    f"chain gap at position {absolute_seq}: prev_hash of event "
+                    f"{window[i].event_id} does not match hmac of preceding event "
+                    f"{window[i - 1].event_id}"
+                )
+
         return True
 
     # --- decorator ----------------------------------------------------------

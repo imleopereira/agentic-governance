@@ -182,6 +182,7 @@ The following are blocked in-process, before the LLM call fires:
 - **Streaming cost precision.** Streaming calls are budget-gated using the declared `max_tokens` value before the stream opens. Actual token usage is recorded from the stream's final usage object. If the LLM API does not return a usage object in the stream, the SDK falls back to `max_tokens` as the tracked value — actual usage may differ.
 - **On-demand tampering detection only.** The HMAC audit chain detects tampering when verification is explicitly run (`sdk.audit.verify_chain()`) or on each read (`verify_chain_on_read=True`). It does not alert on tampering as it occurs, and does not prevent deletion of the entire chain by a privileged database administrator who can restart the process with a new HMAC key.
 - **HITL non-blocking mode.** When a HITL gate is configured with `blocking=False`, the gate raises `ApprovalPending` and the caller is responsible for not proceeding. The SDK cannot prevent a caller who ignores `ApprovalPending` from proceeding anyway.
+- **Tool invocations inside LLM responses:** Scope enforcement gates the LLM API call itself (using a sentinel action name). It does not inspect tool calls returned inside the LLM's response. An agent that receives a tool call instruction from the LLM can execute it regardless of scope policy — scope enforcement must be applied at the tool execution layer separately.
 
 ### Deployment guidance
 
@@ -189,11 +190,68 @@ The following are blocked in-process, before the LLM call fires:
 - For network-level enforcement that blocks all outbound LLM calls regardless of SDK usage, use an API gateway or proxy in front of your LLM providers.
 - For Article 12 compliance evidence, the SDK logs all actions it observes. A deployment where some LLM calls bypass the wrapper will produce an incomplete evidence record.
 
+## Configuration Reference
+
+All options are passed as keyword arguments to `GovernanceSDK(...)` and stored on `sdk.config`.
+
+### Module toggles
+
+| Flag | Default | What it controls |
+|------|---------|-----------------|
+| `enable_audit` | `True` | **Do not disable in production.** When `False`, the HMAC chain is not persisted — the tamper-evident audit record disappears on process restart and the EU Article 12 log is silently empty. |
+| `enable_scope` | `True` | Scope enforcement. When `False`, `sdk.scope` is not constructed — any call raises `AttributeError`. |
+| `enable_cost` | `True` | Budget enforcement. When `False`, `sdk.cost` is not constructed. |
+| `enable_gates` | `True` | HITL approval gates. When `False`, `sdk.gates` is not constructed. |
+| `enable_loop` | `True` | Loop detection. When `False`, `sdk.loop` is not constructed. |
+| `enable_presence` | `True` | Agent heartbeat tracking. When `False`, `sdk.presence` is not constructed. |
+| `enable_prompts` | `True` | Reserved for Prompt Versioning (not yet fully implemented). Forward-compatibility flag — set to `False` only if the stub module causes issues. |
+| `enable_routing` | `False` | Advisory model routing — substitutes a different model based on registered policies. Off by default to prevent silent model substitution. Requires `enable_cost=True`. |
+
+### Audit options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `verify_chain_on_read` | `False` | When `False` (the default), tampered audit events are returned by `sdk.audit.get_events()` without raising an error — tampering is not detected until you run `sdk.audit.verify_chain()` explicitly. Set to `True` to verify the full HMAC chain on every read; raises `ChainIntegrityError` at the first broken link. Off by default because verification is O(n) in returned events — enable for compliance reporting or post-incident review. |
+
+### Wrapper options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `warn_on_no_wrappers` | `True` | Emit a structlog warning at `sdk.start()` when no LLM wrappers (`wrap_openai`, `wrap_anthropic`) have been registered. This warning is the only startup signal that enforcement is not covering your LLM calls — silencing it in a production deployment that expects wrappers will hide a misconfiguration. Set to `False` only in intentionally wrapper-free deployments (audit-only, gate-only) or test suites. |
+| `default_max_tokens` | `None` | Default `max_tokens` used by budget projection when the caller does not declare it on the API call. Suppresses the `max_tokens_not_declared` warning for projects that always use the same cap. Must be `>= 1`. |
+
+```python
+# Audit-only deployment — no wrapper, no warning
+GovernanceSDK(
+    database_url="postgresql://...",
+    warn_on_no_wrappers=False,
+)
+
+# Disable loop detection and presence for a lightweight deployment
+GovernanceSDK(
+    database_url="postgresql://...",
+    enable_loop=False,
+    enable_presence=False,
+)
+
+# Enable forward budget projection with a default cap
+GovernanceSDK(
+    database_url="postgresql://...",
+    default_max_tokens=4096,
+)
+
+# Verify HMAC chain on every read (for compliance reporting)
+GovernanceSDK(
+    database_url="postgresql://...",
+    verify_chain_on_read=True,
+)
+```
+
 ## Documentation
 
 Full documentation, quickstart guide, API reference, and concepts:
 
-**[codeatelier.tech/governance](https://www.codeatelier.tech/governance)**
+**[www.codeatelier.tech](https://www.codeatelier.tech/governance?utm_source=github&utm_medium=readme&utm_campaign=sdk_repo)**
 
 ## License
 

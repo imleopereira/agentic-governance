@@ -686,8 +686,8 @@ async def test_streaming_audit_event_cost_tracked_true(
     assert len(result_events) >= 1
 
     for event in result_events:
-        assert event.metadata.get("cost_tracked") is not False, (
-            f"Streaming audit event must not have cost_tracked=False, got: {event.metadata}"
+        assert event.metadata.get("cost_tracked") is True, (
+            f"Streaming audit event must have cost_tracked=True, got: {event.metadata}"
         )
 
 

@@ -221,4 +221,15 @@ async def test_verify_chain_partial_range(
         )
     assert "4" in str(exc_info.value)
 
+    # Boundary: tamper at index 3 must be caught when to_seq=3 (the window
+    # boundary includes the tampered event — not silently skipped).
+    target_idx3 = event_ids[3]
+    store._events[target_idx3] = _tamper(store._events[target_idx3])
+    with pytest.raises(ChainIntegrityError):
+        await module.verify_chain(
+            session_id=session_id,
+            from_seq=0,
+            to_seq=3,
+        )
+
     await module.close()

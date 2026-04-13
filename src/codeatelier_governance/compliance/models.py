@@ -98,7 +98,8 @@ class ComplianceReport(BaseModel):
     #: a total-call counter is not available.  Will be ``None`` in v0.5.x;
     #: populated in v0.6 when a wrapper registry is implemented.  The field
     #: must always be present — its absence would imply 100 % coverage.
-    coverage_pct: float | None = None
+    #: Must be in the range [0.0, 1.0] when provided.
+    coverage_pct: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @field_validator("coverage_caveat")
     @classmethod
