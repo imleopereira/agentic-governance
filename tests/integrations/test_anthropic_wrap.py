@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import secrets
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -550,7 +549,6 @@ async def test_no_max_tokens_emits_warning_and_proceeds(
     sdk: FakeSDK, store: InMemoryAuditStore, caplog: Any
 ) -> None:
     """No max_tokens and no default → warning emitted, call proceeds."""
-    import logging
     import structlog.testing
 
     response = FakeResponse(usage=FakeUsage(10, 20))

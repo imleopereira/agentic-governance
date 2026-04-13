@@ -14,15 +14,12 @@ Item 5 requirements:
 from __future__ import annotations
 
 import secrets
-from datetime import datetime, timezone
-from typing import AsyncIterator
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
 
 from codeatelier_governance.audit import AuditEvent, AuditModule
-from codeatelier_governance.audit.chain import compute_event_hmac
 from codeatelier_governance.audit.errors import ChainIntegrityError
 from codeatelier_governance.audit.models import AuditEventRecord
 from codeatelier_governance.audit.store import BatchingWriter, InMemoryAuditStore

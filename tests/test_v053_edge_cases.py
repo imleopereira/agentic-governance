@@ -33,7 +33,6 @@ from codeatelier_governance.integrations.anthropic_wrap import (
     wrap_anthropic,
     _resolve_projected_tokens,
 )
-from codeatelier_governance.scope.errors import ScopeViolation
 from codeatelier_governance.scope.models import ScopePolicy
 from codeatelier_governance.scope.module import ScopeModule
 from codeatelier_governance.sdk import GovernanceConfig

@@ -17,7 +17,6 @@ from codeatelier_governance.audit import AuditEvent, AuditModule, InMemoryAuditS
 from codeatelier_governance.compliance.models import (
     COVERAGE_CAVEAT,
     ComplianceReport,
-    ReportSection,
 )
 from codeatelier_governance.compliance.report import ReportGenerator
 
