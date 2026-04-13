@@ -19,7 +19,7 @@ from codeatelier_governance.audit.models import AuditEventRecord
 from codeatelier_governance.audit.store import AuditStore, InMemoryAuditStore
 
 from . import article12
-from .models import COVERAGE_CAVEAT, ComplianceReport, ReportSection
+from .models import COVERAGE_CAVEAT, ChainIntegrityStatus, ComplianceReport, ReportSection
 
 logger = structlog.get_logger(__name__)
 
@@ -284,7 +284,7 @@ class ReportGenerator:
             "date_end": date_end,
         }
 
-    async def _run_chain_verification(self) -> str:
+    async def _run_chain_verification(self) -> ChainIntegrityStatus:
         """Run HMAC chain verification via the audit module and return the status string.
 
         Returns one of the :class:`ChainIntegrityStatus` literals:
@@ -403,7 +403,7 @@ class ReportGenerator:
         data = self._extract_report_data(events)
         sections = self._build_article12_sections(data)
 
-        chain_integrity_status = (
+        chain_integrity_status: ChainIntegrityStatus = (
             await self._run_chain_verification() if verify_chain else "unverified"
         )
 
@@ -482,7 +482,7 @@ class ReportGenerator:
 
         data = self._extract_report_data(events)
         total = data["total_events"]
-        chain_integrity_status = (
+        chain_integrity_status: ChainIntegrityStatus = (
             await self._run_chain_verification() if verify_chain else "unverified"
         )
         total_violations = (
