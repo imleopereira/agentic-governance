@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import secrets
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -15,6 +16,8 @@ from codeatelier_governance.audit import AuditModule, BatchingWriter, InMemoryAu
 from codeatelier_governance.cost.errors import BudgetExceeded
 from codeatelier_governance.cost.models import BudgetPolicy
 from codeatelier_governance.cost.module import CostModule
+from codeatelier_governance.scope.errors import ScopeViolation
+from codeatelier_governance.scope.models import ScopePolicy
 from codeatelier_governance.scope.module import ScopeModule
 from codeatelier_governance.integrations.anthropic_wrap import wrap_anthropic
 
@@ -368,3 +371,358 @@ class TestIsStreamingResponseAnthropic:
         from codeatelier_governance.integrations.anthropic_wrap import _is_streaming_response
 
         assert _is_streaming_response(None) is False
+
+
+# ---------------------------------------------------------------------------
+# Item 1: scope.check() integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scope_violation_blocks_llm_call(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """wrap_anthropic with scope policy denying the action raises ScopeViolation.
+
+    The LLM client must never be called when scope check fails.
+    """
+    sdk.scope.register(
+        ScopePolicy(agent_id="scope-agent", allowed_tools=frozenset({"read_file"}))
+    )
+    # messages.create sentinel is "messages.create" — not in allowed_tools
+    call_count = 0
+
+    class CountingMessages:
+        async def create(self, **kwargs: Any) -> FakeResponse:
+            nonlocal call_count
+            call_count += 1
+            return FakeResponse(usage=FakeUsage(10, 20))
+
+    class CountingClient:
+        messages = CountingMessages()
+
+    client = CountingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="scope-agent")  # type: ignore[arg-type]
+
+    with pytest.raises(ScopeViolation):
+        await client.messages.create(model="claude-sonnet-4-6")
+
+    assert call_count == 0, "LLM client must not be called when scope check fails"
+
+
+@pytest.mark.asyncio
+async def test_no_scope_policy_passes_through(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """wrap_anthropic with no scope policy registered proceeds normally."""
+    # No scope.register() call — open scope, pass-through
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+
+    wrap_anthropic(client, sdk=sdk, agent_id="unregistered-agent")  # type: ignore[arg-type]
+
+    result = await client.messages.create(model="claude-sonnet-4-6")
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_scope_check_fires_before_cost_check(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Scope violation must fire BEFORE cost check — cost mock never called."""
+    sdk.scope.register(
+        ScopePolicy(agent_id="order-agent", allowed_tools=frozenset({"read_file"}))
+    )
+    # Pre-fill budget to also exceed it — but scope should fire first
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="order-agent", per_session_usd=0.001))
+    await sdk.cost.track("order-agent", sid, tokens=0, usd=999.0)
+
+    cost_check_called = False
+    original_check = sdk.cost.check_or_raise
+
+    async def tracking_check(*args: Any, **kwargs: Any) -> None:
+        nonlocal cost_check_called
+        cost_check_called = True
+        return await original_check(*args, **kwargs)
+
+    sdk.cost.check_or_raise = tracking_check  # type: ignore[method-assign]
+
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+    wrap_anthropic(client, sdk=sdk, agent_id="order-agent", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(ScopeViolation):
+        await client.messages.create(model="claude-sonnet-4-6")
+
+    assert not cost_check_called, "cost.check_or_raise must not be called when scope denies"
+
+
+@pytest.mark.asyncio
+async def test_scope_allowed_tool_passes(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """wrap_anthropic with a policy that allows messages.create sentinel passes."""
+    sdk.scope.register(
+        ScopePolicy(
+            agent_id="allowed-agent",
+            allowed_tools=frozenset({"messages.create"}),
+        )
+    )
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+
+    wrap_anthropic(client, sdk=sdk, agent_id="allowed-agent")  # type: ignore[arg-type]
+    result = await client.messages.create(model="claude-sonnet-4-6", max_tokens=100)
+    assert result is response
+
+
+# ---------------------------------------------------------------------------
+# Item 2: wrapper registry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wrap_anthropic_registers_on_sdk(sdk: FakeSDK) -> None:
+    """wrap_anthropic should append itself to sdk._registered_wrappers."""
+    # FakeSDK does not have _registered_wrappers — add it to simulate real SDK
+    sdk._registered_wrappers = []  # type: ignore[attr-defined]
+    sdk._started = False  # type: ignore[attr-defined]
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+    wrap_anthropic(client, sdk=sdk, agent_id="reg-agent")  # type: ignore[arg-type]
+    assert "anthropic:reg-agent" in sdk._registered_wrappers  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# Item 3: projected tokens budget gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_projected_tokens_blocks_call_before_llm(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Budget gate with projected tokens: balance 800, limit 1000, max_tokens 300 → blocked."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="proj-agent", per_session_tokens=1000))
+    await sdk.cost.track("proj-agent", sid, tokens=800)
+
+    call_count = 0
+
+    class CountingMessages:
+        async def create(self, **kwargs: Any) -> FakeResponse:
+            nonlocal call_count
+            call_count += 1
+            return FakeResponse(usage=FakeUsage(10, 20))
+
+    class CountingClient:
+        messages = CountingMessages()
+
+    client = CountingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="proj-agent", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.messages.create(model="claude-sonnet-4-6", max_tokens=300)
+
+    assert call_count == 0, "LLM must not be called when projected usage would breach limit"
+
+
+@pytest.mark.asyncio
+async def test_projected_tokens_under_limit_proceeds(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Budget gate: balance 800, limit 1000, max_tokens 100 → call proceeds."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="proj-agent2", per_session_tokens=1000))
+    await sdk.cost.track("proj-agent2", sid, tokens=800)
+
+    response = FakeResponse(usage=FakeUsage(50, 50))
+    client = FakeAsyncClient(response)
+    wrap_anthropic(client, sdk=sdk, agent_id="proj-agent2", session_id=sid)  # type: ignore[arg-type]
+
+    result = await client.messages.create(model="claude-sonnet-4-6", max_tokens=100)
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_no_max_tokens_emits_warning_and_proceeds(
+    sdk: FakeSDK, store: InMemoryAuditStore, caplog: Any
+) -> None:
+    """No max_tokens and no default → warning emitted, call proceeds."""
+    import logging
+    import structlog.testing
+
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+    wrap_anthropic(client, sdk=sdk, agent_id="warn-agent")  # type: ignore[arg-type]
+
+    with structlog.testing.capture_logs() as cap_logs:
+        result = await client.messages.create(model="claude-sonnet-4-6")  # no max_tokens
+
+    warning_events = [
+        e for e in cap_logs
+        if e.get("event") == "governance.wrap.max_tokens_not_declared"
+    ]
+    assert len(warning_events) >= 1, "Expected max_tokens_not_declared warning"
+    assert result is response
+
+
+@pytest.mark.asyncio
+async def test_default_max_tokens_used_when_not_declared(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """SDK default_max_tokens used as projection when call omits max_tokens."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="default-proj", per_session_tokens=1000))
+    await sdk.cost.track("default-proj", sid, tokens=800)
+
+    # Attach a config with default_max_tokens=500 (would project to 1300 > 1000)
+    class FakeConfig:
+        default_max_tokens = 500
+        warn_on_no_wrappers = False
+
+    sdk.config = FakeConfig()  # type: ignore[attr-defined]
+
+    response = FakeResponse(usage=FakeUsage(10, 20))
+    client = FakeAsyncClient(response)
+    wrap_anthropic(client, sdk=sdk, agent_id="default-proj", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.messages.create(model="claude-sonnet-4-6")  # no explicit max_tokens
+
+
+# ---------------------------------------------------------------------------
+# Item 4: Streaming — no cost_tracked: False after this patch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_streaming_budget_gate_blocks_before_stream_opened(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Streaming call where max_tokens would breach limit → BudgetExceeded, stream never opened."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-gate", per_session_tokens=1000))
+    await sdk.cost.track("stream-gate", sid, tokens=800)
+
+    stream_opened = False
+
+    class FakeStream:
+        def __init__(self) -> None:
+            nonlocal stream_opened
+            stream_opened = True
+
+    class StreamingMessages:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingClient:
+        messages = StreamingMessages()
+
+    client = StreamingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="stream-gate", session_id=sid)  # type: ignore[arg-type]
+
+    with pytest.raises(BudgetExceeded):
+        await client.messages.create(model="claude-sonnet-4-6", stream=True, max_tokens=300)
+
+    assert not stream_opened, "Stream must not be opened when budget gate fires"
+
+
+@pytest.mark.asyncio
+async def test_streaming_call_tracks_cost(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Streaming call that completes → track() called with projected tokens."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-track", per_session_tokens=5000))
+
+    class FakeStream:
+        pass
+
+    class StreamingMessages:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingClient:
+        messages = StreamingMessages()
+
+    client = StreamingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="stream-track", session_id=sid)  # type: ignore[arg-type]
+
+    await client.messages.create(model="claude-sonnet-4-6", stream=True, max_tokens=200)
+
+    # The wrapper should have tracked 200 projected tokens
+    snap = await sdk.cost.snapshot("stream-track", sid)
+    assert snap.session_tokens_used == 200
+
+
+@pytest.mark.asyncio
+async def test_streaming_audit_event_cost_tracked_true(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Streaming call with max_tokens → llm.result audit event has cost_tracked=True, not False."""
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-audit", per_session_tokens=5000))
+
+    class FakeStream:
+        pass
+
+    class StreamingMessages:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingClient:
+        messages = StreamingMessages()
+
+    client = StreamingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="stream-audit", session_id=sid)  # type: ignore[arg-type]
+
+    await client.messages.create(model="claude-sonnet-4-6", stream=True, max_tokens=150)
+    await sdk.audit._writer.flush()
+
+    all_events = list(store._events.values())
+    result_events = [e for e in all_events if e.kind == "llm.result"]
+    assert len(result_events) >= 1
+
+    for event in result_events:
+        assert event.metadata.get("cost_tracked") is not False, (
+            f"Streaming audit event must not have cost_tracked=False, got: {event.metadata}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_streaming_no_max_tokens_emits_warning(
+    sdk: FakeSDK, store: InMemoryAuditStore
+) -> None:
+    """Streaming with no max_tokens → structlog warning emitted."""
+    import structlog.testing
+
+    sid = uuid4()
+    sdk.cost.register(BudgetPolicy(agent_id="stream-warn", per_session_tokens=5000))
+
+    class FakeStream:
+        pass
+
+    class StreamingMessages:
+        async def create(self, **kwargs: Any) -> FakeStream:
+            return FakeStream()
+
+    class StreamingClient:
+        messages = StreamingMessages()
+
+    client = StreamingClient()
+    wrap_anthropic(client, sdk=sdk, agent_id="stream-warn", session_id=sid)  # type: ignore[arg-type]
+
+    with structlog.testing.capture_logs() as cap_logs:
+        await client.messages.create(model="claude-sonnet-4-6", stream=True)
+        # No max_tokens passed
+
+    warning_events = [
+        e for e in cap_logs
+        if e.get("event") in (
+            "governance.wrap.max_tokens_not_declared",
+            "governance.anthropic_wrap.streaming_no_usage",
+        )
+    ]
+    assert len(warning_events) >= 1, "Expected a warning when no max_tokens for streaming"
