@@ -1,8 +1,8 @@
-"""Compliance report generator.
+"""Article 12 evidence report generator.
 
 Queries audit events, cost data, gate resolutions, and scope policies
 from Postgres (or in-memory stores for testing) to produce structured
-compliance reports.
+evidence reports for actions the SDK observed.
 
 All SQL is parameterized. No string interpolation in queries.
 """
@@ -24,7 +24,11 @@ logger = structlog.get_logger(__name__)
 
 
 class ReportGenerator:
-    """Generates EU AI Act Article 12 compliance reports from audit data.
+    """Generates EU AI Act Article 12 evidence reports from audit data.
+
+    Reports cover actions the SDK observed. They do not assert compliance —
+    Article 12 compliance for a deployment depends on routing all relevant
+    AI actions through the SDK.
 
     Can operate against either a Postgres database URL (for CLI usage)
     or an in-memory AuditStore (for tests and programmatic use).
@@ -321,10 +325,12 @@ class ReportGenerator:
         date_from: datetime | None = None,
         date_to: datetime | None = None,
     ) -> ComplianceReport:
-        """Generate an EU AI Act Article 12 compliance report.
+        """Generate an EU AI Act Article 12 evidence report.
 
         Queries audit events with the given filters and maps them to the
-        seven Article 12 automatic logging requirements.
+        seven Article 12 automatic logging requirements. The report provides
+        evidence for actions the SDK observed; it does not assert compliance
+        for the overall deployment.
         """
         events = await self._get_events(
             session_ids=session_ids,
@@ -367,10 +373,10 @@ class ReportGenerator:
         date_from: datetime | None = None,
         date_to: datetime | None = None,
     ) -> ComplianceReport:
-        """Generate a summary compliance report for an agent.
+        """Generate a summary evidence report for an agent.
 
         Provides a high-level overview including event counts, violation
-        counts, and compliance status per section.
+        counts, and status per section based on SDK-observed data.
         """
         events = await self._get_events(
             agent_id=agent_id,

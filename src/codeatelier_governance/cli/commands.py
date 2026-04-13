@@ -386,7 +386,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # report
     report_parser = subparsers.add_parser(
-        "report", help="Generate compliance reports from audit trail data"
+        "report", help="Generate Article 12 evidence reports from audit trail data"
     )
     report_parser.add_argument(
         "--database-url", type=str, default=None,
@@ -495,7 +495,7 @@ async def _run_report(
     date_to_str: str | None,
     output_path: str | None,
 ) -> None:
-    """Generate a compliance report and write JSON to output."""
+    """Generate an Article 12 evidence report and write JSON to output."""
     from datetime import datetime as dt
     from datetime import timezone
 
