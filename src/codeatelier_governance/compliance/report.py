@@ -18,7 +18,7 @@ from codeatelier_governance.audit.models import AuditEventRecord
 from codeatelier_governance.audit.store import AuditStore, InMemoryAuditStore
 
 from . import article12
-from .models import ComplianceReport, ReportSection
+from .models import COVERAGE_CAVEAT, ComplianceReport, ReportSection
 
 logger = structlog.get_logger(__name__)
 
@@ -351,6 +351,20 @@ class ReportGenerator:
         if date_from and date_to:
             date_range = (date_from, date_to)
 
+        # Parse time_range_start / time_range_end from extracted data
+        time_range_start: datetime | None = None
+        time_range_end: datetime | None = None
+        if data["date_start"]:
+            try:
+                time_range_start = datetime.fromisoformat(data["date_start"])
+            except (ValueError, TypeError):
+                pass
+        if data["date_end"]:
+            try:
+                time_range_end = datetime.fromisoformat(data["date_end"])
+            except (ValueError, TypeError):
+                pass
+
         return ComplianceReport(
             report_id=uuid4(),
             generated_at=now,
@@ -359,6 +373,12 @@ class ReportGenerator:
             session_ids=session_id_list,
             date_range=date_range,
             sections=sections,
+            event_count=data["total_events"],
+            time_range_start=time_range_start,
+            time_range_end=time_range_end,
+            chain_integrity_status="unverified",
+            coverage_caveat=COVERAGE_CAVEAT,
+            coverage_pct=None,
         )
 
     async def generate_summary(
@@ -443,6 +463,20 @@ class ReportGenerator:
         if date_from and date_to:
             date_range = (date_from, date_to)
 
+        # Parse time_range_start / time_range_end from extracted data
+        summary_time_start: datetime | None = None
+        summary_time_end: datetime | None = None
+        if data["date_start"]:
+            try:
+                summary_time_start = datetime.fromisoformat(data["date_start"])
+            except (ValueError, TypeError):
+                pass
+        if data["date_end"]:
+            try:
+                summary_time_end = datetime.fromisoformat(data["date_end"])
+            except (ValueError, TypeError):
+                pass
+
         return ComplianceReport(
             report_id=uuid4(),
             generated_at=now,
@@ -451,4 +485,10 @@ class ReportGenerator:
             session_ids=session_id_list,
             date_range=date_range,
             sections=sections,
+            event_count=data["total_events"],
+            time_range_start=summary_time_start,
+            time_range_end=summary_time_end,
+            chain_integrity_status="unverified",
+            coverage_caveat=COVERAGE_CAVEAT,
+            coverage_pct=None,
         )

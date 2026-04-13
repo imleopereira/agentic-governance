@@ -80,6 +80,11 @@ class GovernanceConfig:
     # module is opt-in via config, not code changes" invariant from
     # CLAUDE.md and prevents silent model substitution.
     enable_routing: bool = False
+    # When True, any call to sdk.audit.get_events() verifies the HMAC chain
+    # for the returned window before returning. Raises ChainIntegrityError if
+    # any link fails. Default False: opt-in because verification cost is
+    # O(n) in the number of events returned.
+    verify_chain_on_read: bool = False
 
 
 class GovernanceSDK:
@@ -172,7 +177,12 @@ class GovernanceSDK:
                 fallback_path or DEFAULT_FALLBACK_PATH
             )
             writer = BatchingWriter(primary=store, fallback=fallback)
-            self.audit = AuditModule(store, secret=resolved_secret, writer=writer)
+            self.audit = AuditModule(
+                store,
+                secret=resolved_secret,
+                writer=writer,
+                verify_chain_on_read=self.config.verify_chain_on_read,
+            )
         else:
             logger.warning(
                 "sdk.audit_disabled",
@@ -555,6 +565,51 @@ class GovernanceSDK:
         if self._shared_engine is not None:
             await self._shared_engine.dispose()
             self._shared_engine = None
+
+    # ------------------------------------------------------------------
+    # Stable public API: audit chain verification
+    # ------------------------------------------------------------------
+
+    async def verify_chain(
+        self,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+        session_id: Any | None = None,
+    ) -> bool:
+        """Verify the HMAC audit chain for integrity.
+
+        Delegates to :meth:`codeatelier_governance.audit.module.AuditModule.verify_chain`.
+
+        Parameters
+        ----------
+        from_seq:
+            0-based index of the first event to check (inclusive). ``None``
+            starts from the beginning of the session's event list.
+        to_seq:
+            0-based index of the last event to check (inclusive). ``None``
+            checks through the end.
+        session_id:
+            UUID of the session to verify. When ``None``, verifies all
+            events known to the in-memory store (suited for tests; for
+            production Postgres use, always pass an explicit session_id).
+
+        Returns
+        -------
+        True
+            Every checked link is intact.
+
+        Raises
+        ------
+        codeatelier_governance.audit.errors.ChainIntegrityError
+            Raised at the first failing link, carrying the 0-based sequence
+            number of the tampered event.
+        """
+        return await self.audit.verify_chain(
+            from_seq=from_seq,
+            to_seq=to_seq,
+            session_id=session_id,
+        )
 
     async def __aenter__(self) -> "GovernanceSDK":
         await self.start()
