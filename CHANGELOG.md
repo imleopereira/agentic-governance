@@ -26,6 +26,37 @@ A pre-existing append-only grants gap on `governance_audit_events` is also
 closed in this release (CLAUDE.md invariant 2). After upgrading, the
 `/health/governance` endpoint should report `append_only_grants_ok: true`.
 
+### ⚠️ Check your monitoring queries
+
+v0.6 renames the halt audit event kind from `agent.killed` to `agent.halted`.
+Existing SQL, grep, SIEM, or BI queries filtering on the literal string
+`agent.killed` will silently stop matching v0.6 halt events.
+
+**Action required**: audit your downstream consumers. Either:
+
+1. **Use the new view** — `governance_audit_events_halted` unions both kinds:
+
+   ```sql
+   SELECT * FROM governance_audit_events_halted
+   WHERE created_at > now() - interval '1 hour';
+   ```
+
+2. **Or update your queries** to match both kinds:
+
+   ```sql
+   WHERE kind IN ('agent.killed', 'agent.halted')
+   ```
+
+Historic `agent.killed` rows remain in the chain as-is (HMAC chain integrity
+requires append-only). Only new rows after the v0.6 upgrade use `agent.halted`.
+
+**JSON-schema consumers**: v0.6 also adds three new columns to
+`governance_audit_events` — `signature`, `signing_key_fingerprint`, and
+`signature_status`. Any SIEM, ETL, or BI pipeline that parses audit-event
+rows as JSON against a strict schema will see new keys after the upgrade
+and may trip schema validation. Either widen the schema to allow the new
+keys or filter them out at the export layer before they hit the consumer.
+
 ### Added
 
 - **F2.5 full `kill` → `halt` rename** across SDK, console, and audit.
@@ -116,12 +147,28 @@ closed in this release (CLAUDE.md invariant 2). After upgrading, the
   successfully". The new `rotation_aware` boolean on
   `ComplianceReportView` / `VerifyChainResponse` makes the distinction
   explicit; wiring the rotation-aware path ships in v0.6.1.
-- 6 v0.6 PRD features remain pending and ship in v0.6.1: F1 console
-  honesty pass, F2.5 full `kill`→`halt` rename, F4 compliance console
-  surface, F5 HITL approval queue panel, F8 code quality remainder
-  (TS literal narrowing, hand-rolled SSE validator, 4 critical v4 tests),
-  and F6 bundle items 3 (audit write rate limiting) and 6 (tenant-scoped
-  query keys).
+- The following v0.6 PRD items remain pending and ship in v0.6.1:
+  - **F5** — HITL approval queue panel.
+  - **F6 bundle item 3** — audit write rate limiting.
+  - **F6 bundle item 6** — tenant-scoped query keys.
+  - **`JsonlFallbackStore`** — does not yet round-trip the new
+    signature columns; rows recovered from the disk fallback degrade
+    to `signature_status='unsigned'` (constraint #7: not a chain
+    break).
+  - **`vitest.config.ts`** — missing in this cut; the path-alias and
+    JSX-from-ts-tests configurations are broken, and the v0.6 a11y
+    and v4 unit-test layer is currently pinned via source-grep tests
+    only.
+  - **No `axe-core`, `@testing-library/react`, or `@playwright/test`
+    in `console/package.json` devDependencies** — the a11y guarantees
+    are enforced by source-grep assertions until these land.
+  - **ESLint config bootstrap** — deferred; `eslint .` is not wired
+    into the v0.6 CI matrix.
+
+  F1 (console honesty pass), F2.5 (full `kill`→`halt` rename), F4
+  (compliance console surface), and F8 (code quality: TS literal
+  narrowing, hand-rolled SSE validator, 4 critical v4 tests) all
+  shipped in Wave 4 of v0.6.0 and are NOT pending.
 - The v3 console remains the default. The v4 IA shell exists under
   `console/src/app/(v4)/` and is opt-in via
   `NEXT_PUBLIC_CONSOLE_UI_VERSION=v4`. The default flips to v4 once F1

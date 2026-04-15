@@ -69,6 +69,120 @@ DML (`UPDATE`), because the append-only trigger on
 Legacy rows are NOT a chain break — the verifier accepts
 `legacy_unsigned` for rows that predate the Ed25519 rollout.
 
+## Dry-run before applying
+
+Alembic supports a SQL-only "offline" mode that prints the DDL it
+would run instead of executing it. Use this against a copy of your
+production schema before the real upgrade.
+
+```bash
+alembic upgrade head --sql > v0.6-upgrade.sql
+less v0.6-upgrade.sql
+```
+
+In the generated SQL you will see the `f6a1ed25519aid` step add three
+columns to `governance_audit_events`:
+
+```sql
+ALTER TABLE governance_audit_events
+    ADD COLUMN signature BYTEA;
+ALTER TABLE governance_audit_events
+    ADD COLUMN signing_key_fingerprint TEXT;
+ALTER TABLE governance_audit_events
+    ADD COLUMN signature_status TEXT NOT NULL DEFAULT 'legacy_unsigned';
+```
+
+This is the DDL-backfill pattern — the `DEFAULT 'legacy_unsigned'`
+populates every existing row in a single metadata-only operation
+(see "Time estimates" below). Verify the SQL matches the schema you
+expect, then apply for real with `alembic upgrade head`.
+
+## Time estimates for the v0.6 upgrade
+
+The v0.6 backfill is intentionally O(1) in row count.
+
+`ADD COLUMN ... DEFAULT 'legacy_unsigned'` on Postgres ≥ 11 is a
+metadata-only operation: Postgres records the default in
+`pg_attribute.atthasmissing` / `attmissingval` and reads it back at
+query time for any row that was inserted before the ALTER. No row is
+physically rewritten, no UPDATE is issued, and the table is locked
+only for the duration of the catalog change (sub-second on a healthy
+cluster).
+
+This means the v0.6 upgrade runs in **seconds even on a
+`governance_audit_events` table with 100M+ rows**. You do NOT need a
+maintenance window proportional to your audit history. If your DBA's
+runbook assumes a row-by-row UPDATE backfill — it does not apply
+here.
+
+The trigger-and-grant migrations (`978884c6b7f1`, `f9a1b2c3d4e5`) are
+also DDL-only. The merge node (`ab1f55d62f81`) is empty-bodied. The
+view migration (`f251kill2halt`) creates a SQL view, which is also
+metadata-only.
+
+## Rollback
+
+Each v0.6 migration has a working downgrade path. Use
+`alembic downgrade <rev>` where `<rev>` is the revision id you want
+to land at, or `alembic downgrade -1` to step back one.
+
+| Migration | Downgrade behaviour |
+|---|---|
+| `f6a1ed25519aid` | Drops `signature`, `signing_key_fingerprint`, `signature_status` columns and the `governance_agent_keys` / `governance_agent_key_revocations` tables. No UPDATE is issued — the columns simply disappear, so the append-only trigger is not in the way. |
+| `f6b2_chain_rotation` | Drops `governance_audit_chain_keys` and the `hmac_next` column. |
+| `f9a1b2c3d4e5` | Drops `governance_wrapper_registrations` and its spoofing-prevention trigger. |
+| `978884c6b7f1` | Restores `UPDATE, DELETE` grants to PUBLIC on `governance_audit_events`. **Cosmetic only** — the row-level append-only trigger has been in place since v0.1 and continues to block writes regardless of the grant state. |
+| `ab1f55d62f81` | No-op (empty merge node). |
+| `f251kill2halt` | Drops the `governance_audit_events_halted` view. The underlying `agent.killed` and `agent.halted` rows are untouched. |
+
+After a downgrade, `alembic current` should report the v0.5.x baseline
+revision and the SDK should run unchanged.
+
+## Monitoring queries — read this before downgrading SIEM consumers
+
+The v0.6 release renames the halt audit event kind from `agent.killed`
+to `agent.halted`. The `governance_audit_events_halted` SQL view
+unions both kinds so existing queries can be ported in-place. If you
+run downstream SIEM/BI consumers, see the **"Check your monitoring
+queries"** section in `CHANGELOG.md` for the worked SQL examples and
+the JSON-schema heads-up on the new `signature` /
+`signing_key_fingerprint` / `signature_status` columns.
+
+## `SQLALCHEMY_URL` vs `GOVERNANCE_DATABASE_URL`
+
+The two tools use two different conventions, on purpose:
+
+- The runtime SDK reads **`GOVERNANCE_DATABASE_URL`** (see
+  `docs/configuration.md`). This is what `GovernanceSDK(...)` and the
+  console backend use.
+- Alembic reads **`SQLALCHEMY_URL`** via the standard `migrations/env.py`
+  pattern, OR the `sqlalchemy.url` value baked into `alembic.ini`. This
+  is the upstream alembic convention and we did not invent it.
+
+Two equivalent ways to point alembic at the right database:
+
+```bash
+# Option 1: env var, leave alembic.ini untouched.
+export SQLALCHEMY_URL="postgresql://user:pass@host:5432/db"
+alembic upgrade head
+
+# Option 2: pass the URL on the command line via -x.
+alembic -x url="postgresql://user:pass@host:5432/db" upgrade head
+
+# Option 3: edit alembic.ini directly. NOT recommended — tends to
+# leak credentials into git.
+```
+
+Either `postgresql://` or `postgresql+asyncpg://` works for the
+alembic side; `migrations/env.py` rewrites the driver to
+`postgresql+psycopg://` at runtime so the same URL the SDK uses can
+be reused unchanged.
+
+The two-name split exists because alembic is a separate toolchain
+with its own conventions. We chose not to monkey-patch alembic into
+reading our env var — that would surprise operators who already know
+how alembic works.
+
 ## Troubleshooting
 
 **"Multiple head revisions are present"** — you are running a

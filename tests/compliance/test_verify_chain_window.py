@@ -133,7 +133,9 @@ async def test_report_generator_defaults_to_last_1000(
 
     audit.verify_chain = _spy  # type: ignore[assignment,method-assign]
     try:
-        status, fs, ts = await generator.run_chain_verification_windowed()
+        status, fs, ts, _rot, _unres = (
+            await generator.run_chain_verification_windowed()
+        )
     finally:
         audit.verify_chain = original  # type: ignore[method-assign]
 

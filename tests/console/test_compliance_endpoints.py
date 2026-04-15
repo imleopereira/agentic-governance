@@ -235,13 +235,17 @@ async def test_compliance_report_verify_called_exactly_once() -> None:
     _ = uuid4  # silence unused import if pruned
 
 
-def test_compliance_rate_limit_unauthenticated_bypasses_limit() -> None:
-    """Unauthenticated (user_id=None) callers MUST NOT hit the per-user limit."""
+def test_compliance_rate_limit_unauthenticated_uses_anon_bucket() -> None:
+    """BLOCKER C3: unauthenticated callers now share a single global
+    anonymous bucket (1 call per 300 s). The first call passes, the
+    second must 429. This replaces the v0.5.x behavior where anonymous
+    callers bypassed the limit entirely."""
     import asyncio
 
-    from fastapi import Request
+    from fastapi import HTTPException, Request
 
     _app._compliance_user_times.clear()
+    _app._compliance_anon_times.clear()
 
     async def _run() -> None:
         scope: dict[str, Any] = {
@@ -251,11 +255,15 @@ def test_compliance_rate_limit_unauthenticated_bypasses_limit() -> None:
             "path": "/",
         }
         req = Request(scope)  # type: ignore[arg-type]
-        # No user_id on request.state — hit the dep many times, must not 429.
-        for _ in range(10):
+        # First anonymous call passes.
+        await _app._compliance_rate_limit_dep(req)
+        # Second anonymous call within 300 s must 429.
+        with pytest.raises(HTTPException) as excinfo:
             await _app._compliance_rate_limit_dep(req)
+        assert excinfo.value.status_code == 429
 
     asyncio.get_event_loop().run_until_complete(_run())
+    _app._compliance_anon_times.clear()
 
 
 def test_compliance_rate_limit_window_boundary(monkeypatch) -> None:  # type: ignore[no-untyped-def]

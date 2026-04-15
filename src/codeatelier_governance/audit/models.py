@@ -16,6 +16,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from codeatelier_governance.audit.sanitization import sanitize_metadata
+
 # --- Size caps (security: DoS prevention at the SDK boundary) -----------------
 MAX_KIND_LEN = 128
 MAX_HASH_LEN = 128
@@ -94,7 +96,13 @@ class AuditEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
+        # BLOCKER C5: validate raw metadata size FIRST so an attacker
+        # cannot bypass the 64 KiB DoS cap by submitting one giant string
+        # that the sanitizer would otherwise truncate. THEN sanitize for
+        # ANSI / C0 control chars on every string leaf.
         _validate_metadata(self.metadata)
+        sanitized = sanitize_metadata(self.metadata)
+        object.__setattr__(self, "metadata", sanitized)
 
 
 PLACEHOLDER_HMAC = "0" * 64

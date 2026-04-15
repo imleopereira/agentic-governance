@@ -80,6 +80,15 @@ DATABASE_URL = os.environ.get("GOVERNANCE_DATABASE_URL", "")
 AUDIT_SECRET = os.environ.get("GOVERNANCE_AUDIT_SECRET", "")
 CONSOLE_TOKEN = os.environ.get("GOVERNANCE_CONSOLE_TOKEN", "")
 DEV_MODE = os.environ.get("GOVERNANCE_CONSOLE_DEV_MODE", "").lower() == "true"
+# BLOCKER C4: explicit acknowledgement env var. Without this set,
+# DEV_MODE refuses to start the app (dev mode silently grants admin to
+# every caller — a leaked env var would otherwise mean unauthenticated
+# admin in production).
+DEV_MODE_ACK = os.environ.get("GOVERNANCE_CONSOLE_ALLOW_DEV_MODE", "") == "1"
+# BLOCKER C4: bind address read from env so the startup guard can refuse
+# DEV_MODE on a non-localhost bind. Defaults to 127.0.0.1 to match the
+# console __main__ default.
+CONSOLE_HOST = os.environ.get("GOVERNANCE_CONSOLE_HOST", "127.0.0.1")
 SESSION_TTL_HOURS = int(os.environ.get("GOVERNANCE_CONSOLE_SESSION_TTL_HOURS", "8"))
 CORS_ORIGINS = os.environ.get(
     "GOVERNANCE_CONSOLE_CORS_ORIGINS", "http://localhost:3000"
@@ -381,8 +390,52 @@ def _validate_cors_origins(origins: list[str]) -> None:
             )
 
 
+def _enforce_dev_mode_guards() -> None:
+    """BLOCKER C4: enforce DEV_MODE start-up safety invariants.
+
+    DEV_MODE silently grants ``role=admin`` to every caller. A leaked
+    env var in a k8s deployment would otherwise mean unauthenticated
+    admin on /halt, /batch-approve, and user-CRUD. The guards below
+    refuse to start unless:
+
+      1. the operator has explicitly acknowledged the risk by setting
+         ``GOVERNANCE_CONSOLE_ALLOW_DEV_MODE=1``;
+      2. the bind address is localhost (``127.0.0.1`` / ``localhost`` /
+         ``::1``).
+
+    A loud structlog ERROR (NOT warn) is emitted on every startup with
+    DEV_MODE enabled so the line shows up in centralized logging even
+    if the operator misses it locally.
+    """
+    if not DEV_MODE:
+        return
+    _logger.error(
+        "console.dev_mode_enabled",
+        message=(
+            "GOVERNANCE_CONSOLE_DEV_MODE=true — all callers get admin. "
+            "This must NEVER be true in production."
+        ),
+        bind_host=CONSOLE_HOST,
+    )
+    if not DEV_MODE_ACK:
+        raise RuntimeError(
+            "GOVERNANCE_CONSOLE_DEV_MODE=true is set but "
+            "GOVERNANCE_CONSOLE_ALLOW_DEV_MODE=1 is NOT set. Refusing "
+            "to start: set ALLOW_DEV_MODE=1 to explicitly acknowledge "
+            "that every caller will be granted admin role."
+        )
+    localhost_binds = {"127.0.0.1", "localhost", "::1"}
+    if CONSOLE_HOST not in localhost_binds:
+        raise RuntimeError(
+            f"GOVERNANCE_CONSOLE_DEV_MODE=true cannot be enabled on a "
+            f"non-localhost bind (got {CONSOLE_HOST!r}). Set "
+            f"GOVERNANCE_CONSOLE_HOST=127.0.0.1 or unset DEV_MODE."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+    _enforce_dev_mode_guards()
     _validate_cors_origins(CORS_ORIGINS)
     global engine, audit_module, _sse_listen_task
     engine = create_async_engine(
@@ -1981,29 +2034,15 @@ class HaltRequest(BaseModel):
     @field_validator("reason")
     @classmethod
     def _sanitize_reason(cls, value: str) -> str:
-        # 1. NFC normalize FIRST so zalgo / combining-mark expansions can't
-        #    bypass the length cap by being applied post-decode.
-        value = unicodedata.normalize("NFC", value)
-        # 2. Cap RAW input (in Unicode codepoints, not bytes) BEFORE escaping.
-        #    Escape sequences like `\n` → `\\n` double the length; capping
-        #    after escape would let a 512-char stream of newlines still
-        #    produce a 1024-char audit field.
-        if len(value) > _HALT_REASON_MAX:
-            value = value[:_HALT_REASON_MAX]
-        # 3. Escape order: backslash MUST be first so that `\n` in the input
-        #    (which we escape to `\\n`) can't collide with an already-escaped
-        #    `\\n` from a later pass (`\\n` → `\\\\n`).
-        value = (
-            value.replace("\\", "\\\\")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
+        # BLOCKER C5: delegate to the shared sanitizer in
+        # codeatelier_governance.audit.sanitization so the HTTP layer and
+        # the programmatic audit layer apply IDENTICAL rules. The HTTP
+        # `reason` field uses the tighter 512-char cap.
+        from codeatelier_governance.audit.sanitization import (
+            HALT_REASON_MAX_LEN,
+            sanitize_string,
         )
-        # 4. Strip remaining C0 controls (\x00-\x08, \x0b-\x1f, \x7f). ANSI
-        #    escape sequences like `\x1b[31m` begin with \x1b and are stripped
-        #    at the first byte; the rest of the escape becomes harmless text.
-        value = _C0_CONTROL_RE.sub("", value)
-        return value
+        return sanitize_string(value, max_len=HALT_REASON_MAX_LEN)
 
 
 # Backward-compat alias (deprecated; removed in v0.7). v0.5.x callers that
@@ -2581,11 +2620,42 @@ def _scrub_secrets(value: Any) -> Any:
     return value
 
 
+def _user_can_access_agent(role: str, user_id: str, agent_id: str) -> bool:
+    """BLOCKER C2: viewer-scoped allowlist check.
+
+    Admin and reviewer roles can access any agent. Viewer is gated on
+    the ``GOVERNANCE_CONSOLE_SCOPE_VIEWERS_BY_AGENT=true`` env var:
+
+      * env var unset (default): permissive — viewers see all agents,
+        preserving existing single-tenant deployments.
+      * env var set: viewers see only agents listed in the
+        ``governance_console_user_agents`` join table (when present).
+
+    The full allowlist join table lands in v0.6.1; for v0.6 the check is
+    deny-on-no-row-found, allow-on-permissive-default. Documented in the
+    blocker writeup as a migration path.
+    """
+    if role in {"admin", "reviewer"}:
+        return True
+    scope_viewers = (
+        os.environ.get("GOVERNANCE_CONSOLE_SCOPE_VIEWERS_BY_AGENT", "")
+        .lower() == "true"
+    )
+    if not scope_viewers:
+        return True
+    # Strict mode: deny by default until the v0.6.1 join table is wired.
+    return False
+
+
+from .models.responses import AuditEventView as _AuditEventView_for_route
+
+
 @app.get(
     "/api/events/{event_id}",
     dependencies=[Depends(authenticate)],
+    response_model=_AuditEventView_for_route,
 )
-async def get_audit_event(event_id: str) -> dict[str, Any]:
+async def get_audit_event(event_id: str, request: Request) -> dict[str, Any]:
     """Return a single audit-event row for SSE stream hydration.
 
     The NOTIFY payload emitted by the governance_audit_events trigger
@@ -2629,6 +2699,49 @@ async def get_audit_event(event_id: str) -> dict[str, Any]:
     if row is None:
         raise HTTPException(404, "Event not found")
 
+    # BLOCKER C2: tenant isolation. A viewer (or any non-admin/non-reviewer
+    # role) may only fetch events for agents in their accessible list. We
+    # collapse the cross-tenant denial into 404 to avoid leaking event-id
+    # existence to a caller who shouldn't see it.
+    user_id = getattr(request.state, "user_id", "unknown")
+    role = getattr(request.state, "role", "viewer")
+    if not _user_can_access_agent(role, user_id, str(row["agent_id"])):
+        raise HTTPException(404, "Event not found")
+
+    # BLOCKER C2: emit an audit-of-audits event. Anyone reading sensitive
+    # audit data leaves a tamper-evident trail of their read. Pseudonymize
+    # the user_id with a stable hash so it does not duplicate PII into the
+    # audit chain.
+    if audit_module is not None:
+        try:
+            pseudonymous_user = hashlib.sha256(
+                f"audit-fetch:{user_id}".encode("utf-8")
+            ).hexdigest()[:16]
+            audit_session = UUID(
+                hashlib.md5(
+                    (
+                        "audit-fetch:" + str(parsed_id) + ":"
+                        + datetime.now(timezone.utc).isoformat()
+                    ).encode()
+                ).hexdigest()
+            )
+            await audit_module.log(
+                AuditEvent(
+                    agent_id=str(row["agent_id"]),
+                    session_id=audit_session,
+                    kind="pipeline.audit_event_fetched",
+                    metadata={
+                        "fetched_by": pseudonymous_user,
+                        "fetched_event_id": str(parsed_id),
+                        "role": role,
+                    },
+                )
+            )
+        except Exception:  # noqa: BLE001 — audit failures must not block reads
+            _logger.warning(
+                "console.audit_event_fetch_log_failed", exc_info=False
+            )
+
     raw_meta = row["metadata_json"] or {}
     # Two-pass scrub: key-name redaction, then value-shape redaction.
     scrubbed_meta = _scrub_secrets(_redact_metadata(raw_meta))
@@ -2650,7 +2763,7 @@ async def get_audit_event(event_id: str) -> dict[str, Any]:
         "metadata": meta_dict,
         "hmac_value": row["hmac_value"],
         "prev_hash": row["prev_hash"],
-        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "created_at": row["created_at"] if row["created_at"] else None,
     }
 
 
@@ -3001,6 +3114,21 @@ _COMPLIANCE_RATE_LIMIT_MAX = 1
 _compliance_user_times: dict[str, list[float]] = {}
 
 _COMPLIANCE_SEMAPHORE = asyncio.Semaphore(2)
+# BLOCKER C3: anonymous callers (no authenticated user_id) share a SINGLE
+# slot regardless of request rate. Stops a flood of unauthenticated chain
+# verifies from pinning both general slots.
+_COMPLIANCE_ANON_SEMAPHORE = asyncio.Semaphore(1)
+# BLOCKER C3: anonymous calls share a single global rate-limit bucket
+# (not per-user, since there is no user). 1 call per 300 s globally.
+_COMPLIANCE_ANON_RATE_WINDOW_SECONDS = 300
+_COMPLIANCE_ANON_RATE_MAX = 1
+_compliance_anon_times: list[float] = []
+# BLOCKER C3: SET LOCAL statement_timeout for chain verification calls.
+# 30 s matches the cache TTL — a verify that takes longer is failing
+# the cache anyway, and pinning a pool slot for minutes is unacceptable.
+_COMPLIANCE_STATEMENT_TIMEOUT_MS = int(
+    os.environ.get("GOVERNANCE_CONSOLE_COMPLIANCE_STATEMENT_TIMEOUT_MS", "30000")
+)
 
 _COMPLIANCE_CACHE_TTL_SECONDS = 30.0
 # Cache key -> (inserted_at_monotonic, payload_dict)
@@ -3031,9 +3159,38 @@ def _compliance_rate_limit_check(user_id: str) -> float | None:
 
 
 async def _compliance_rate_limit_dep(request: Request) -> None:
-    """FastAPI dependency: 1 req/60 s/user for F4 compliance endpoints."""
+    """FastAPI dependency: 1 req/60 s/user for F4 compliance endpoints.
+
+    BLOCKER C3: anonymous callers (no authenticated user_id) used to early-
+    return and bypass the limit entirely. They now share a SINGLE global
+    bucket capped at 1 call per 300 s. Authenticated callers continue on
+    the per-user 1 req / 60 s sliding window.
+    """
     user_id = getattr(request.state, "user_id", None)
     if not user_id:
+        # BLOCKER C3: anonymous global bucket.
+        now = time.monotonic()
+        global _compliance_anon_times
+        _compliance_anon_times = [
+            t
+            for t in _compliance_anon_times
+            if now - t < _COMPLIANCE_ANON_RATE_WINDOW_SECONDS
+        ]
+        if len(_compliance_anon_times) >= _COMPLIANCE_ANON_RATE_MAX:
+            oldest = _compliance_anon_times[0]
+            retry = max(
+                1.0,
+                _COMPLIANCE_ANON_RATE_WINDOW_SECONDS - (now - oldest),
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Anonymous compliance rate limit exceeded. "
+                    "Retry in 300 s."
+                ),
+                headers={"Retry-After": str(int(retry))},
+            )
+        _compliance_anon_times.append(now)
         return
     retry_after = _compliance_rate_limit_check(user_id)
     if retry_after is not None:
@@ -3097,6 +3254,39 @@ def _map_chain_status(raw: str) -> str:
     return "unverified"
 
 
+@asynccontextmanager
+async def _compliance_concurrency_guard(request: Request) -> Any:
+    """BLOCKER C3: layered concurrency guard for compliance endpoints.
+
+    Acquires the global compliance semaphore (max 2 concurrent verifies).
+    For anonymous callers, ALSO acquires the anonymous-only semaphore
+    (max 1 concurrent), guaranteeing that even a flood of unauthenticated
+    callers cannot starve authenticated traffic.
+    """
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        async with _COMPLIANCE_ANON_SEMAPHORE:
+            async with _COMPLIANCE_SEMAPHORE:
+                yield
+    else:
+        async with _COMPLIANCE_SEMAPHORE:
+            yield
+
+
+@asynccontextmanager
+async def _compliance_statement_timeout(conn: Any) -> Any:
+    """BLOCKER C3: SET LOCAL statement_timeout for chain verify queries.
+
+    A million-row chain otherwise pins a pool slot for minutes. Same
+    pattern as the F4 ``event_stats`` endpoint, but at the configured
+    compliance timeout (default 30 s, env-overridable).
+    """
+    await conn.execute(
+        text(f"SET LOCAL statement_timeout = '{_COMPLIANCE_STATEMENT_TIMEOUT_MS}'")
+    )
+    yield
+
+
 def _build_report_generator() -> Any:
     """Construct a :class:`ReportGenerator` wired to the current backend.
 
@@ -3151,19 +3341,29 @@ async def compliance_report(request: Request) -> dict[str, Any]:
         )
 
     try:
-        async with _COMPLIANCE_SEMAPHORE:
+        async with _compliance_concurrency_guard(request):
             # Double-check the cache after acquiring the semaphore so a
             # burst of callers funnels onto one verify.
             cached = _compliance_cache_get(cache_key)
             if cached is not None:
                 return cached
-            report = await generator.generate_article12(verify_chain=True)
+            # BLOCKER C3: wall-clock timeout. The report generator opens
+            # its own engine for verify; we cannot SET LOCAL on it from
+            # here, so we bound the whole call instead. Default 30 s.
+            report = await asyncio.wait_for(
+                generator.generate_article12(verify_chain=True),
+                timeout=_COMPLIANCE_STATEMENT_TIMEOUT_MS / 1000.0,
+            )
             # DA Wave 4 blocker fix: read from/to seq directly off the
             # already-generated report — the previous implementation ran
             # ``verify_chain`` a second time, doubling O(n) HMAC work per
             # cold cache miss.
             from_seq = report.chain_verified_from_seq
             to_seq = report.chain_verified_to_seq
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504, "Compliance report generation timed out."
+        ) from None
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — degradation, not error path
@@ -3193,10 +3393,9 @@ async def compliance_report(request: Request) -> dict[str, Any]:
         ),  # type: ignore[arg-type]
         chain_verified_from_seq=from_seq,
         chain_verified_to_seq=to_seq,
-        # DA Wave 4 SHIP-WITH-CHANGES: explicit rotation-aware flag so
-        # an empty unresolved_fingerprints list cannot be misread as
-        # "all keys verified". False in v0.6 until F6 Track B lands.
-        rotation_aware=False,
+        # BLOCKER C1: read directly from the generated report. True iff
+        # the rotation-aware verifier path was used.
+        rotation_aware=report.rotation_aware,
         coverage_pct=report.coverage_pct,
         coverage_pct_reason=report.coverage_pct_reason,
         coverage_caveat=report.coverage_caveat,
@@ -3242,15 +3441,26 @@ async def compliance_verify_chain(
         )
 
     try:
-        async with _COMPLIANCE_SEMAPHORE:
+        async with _compliance_concurrency_guard(request):
             cached = _compliance_cache_get(cache_key)
             if cached is not None:
                 return cached
-            status_raw, resolved_from, resolved_to = (
-                await generator.run_chain_verification_windowed(
+            (
+                status_raw,
+                resolved_from,
+                resolved_to,
+                rotation_aware,
+                unresolved_fingerprints,
+            ) = await asyncio.wait_for(
+                generator.run_chain_verification_windowed(
                     from_seq=from_seq, to_seq=to_seq,
-                )
+                ),
+                timeout=_COMPLIANCE_STATEMENT_TIMEOUT_MS / 1000.0,
             )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            504, "Chain verification timed out."
+        ) from None
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -3284,10 +3494,11 @@ async def compliance_verify_chain(
         to_seq=resolved_to,
         verified_count=verified_count,
         failed_count=failed_count,
-        # DA Wave 4 SHIP-WITH-CHANGES: single-key verifier path — empty
-        # unresolved list is NOT a verification signal. See model docstring.
-        rotation_aware=False,
-        unresolved_fingerprints=[],
+        # BLOCKER C1: rotation_aware is now driven by the verifier itself.
+        # When True, unresolved_fingerprints carries the real list of
+        # historical key fingerprints that could not be resolved.
+        rotation_aware=rotation_aware,
+        unresolved_fingerprints=list(unresolved_fingerprints),
         verified_at_utc=_round_to_minute(datetime.now(timezone.utc)),
     )
     payload = view.model_dump(mode="json")

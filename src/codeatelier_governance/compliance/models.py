@@ -97,6 +97,20 @@ class ComplianceReport(BaseModel):
     chain_verified_from_seq: int | None = Field(default=None, ge=0)
     chain_verified_to_seq: int | None = Field(default=None, ge=0)
 
+    #: BLOCKER C1: ``True`` when verification used the rotation-aware path
+    #: (i.e. at least one ``audit.chain_key_rotation`` marker row exists in
+    #: the audited window). When ``False``, ``unresolved_fingerprints`` is
+    #: ALWAYS empty and MUST NOT be interpreted as "all keys verified" —
+    #: the single-key path simply does not track it.
+    rotation_aware: bool = False
+
+    #: BLOCKER C1: list of fingerprints that the rotation-aware verifier
+    #: could not resolve to key material (env vars missing). When the
+    #: rotation-aware path runs and this list is non-empty, the chain
+    #: status MUST be ``"unverified"`` (NOT ``"verified"`` — the verifier
+    #: cannot decide whether those rows are intact or tampered with).
+    unresolved_fingerprints: list[str] = Field(default_factory=list)
+
     #: Always populated.  Never empty.  Reminds consumers that this report
     #: only covers events that passed through the SDK wrapper.
     coverage_caveat: str = Field(min_length=1)
