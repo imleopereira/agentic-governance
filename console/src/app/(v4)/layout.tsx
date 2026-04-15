@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 
 import { ErrorBoundary } from "@/components/v4/ErrorBoundary";
 import { DisconnectBanner } from "@/components/DisconnectBanner";
+import { ComplianceHeaderPill } from "@/components/v4/ComplianceHeaderPill";
 
 /**
  * v4 console shell layout boundary.
@@ -35,6 +36,17 @@ export default function V4Layout({ children }: { children: ReactNode }) {
     <ErrorBoundary>
       <div className="v4-shell">
         <DisconnectBanner />
+        <div
+          className="v4-header-pill-slot"
+          style={{
+            position: "fixed",
+            top: 12,
+            right: 16,
+            zIndex: 50,
+          }}
+        >
+          <ComplianceHeaderPill />
+        </div>
         {children}
       </div>
     </ErrorBoundary>

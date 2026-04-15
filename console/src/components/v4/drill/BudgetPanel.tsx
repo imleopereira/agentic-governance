@@ -10,8 +10,10 @@
 import { SectionLabel } from "../SectionLabel";
 import { InfoBox } from "../InfoBox";
 import { EmptyState } from "../EmptyState";
+import { Skeleton } from "@/components/Skeleton";
 import { useAgent } from "@/hooks/useAgentQueries";
 import { sanitizeErrorMessage } from "@/lib/connectionStore";
+import { EMPTY_STATES } from "@/lib/empty-states";
 
 export interface BudgetPanelProps {
   agentId: string;
@@ -21,13 +23,13 @@ export function BudgetPanel({ agentId }: BudgetPanelProps) {
   const { data: agent, isLoading, error } = useAgent(agentId);
 
   if (isLoading) {
+    // WCAG 4.1.3: Skeleton is the right semantic for loading state.
     return (
-      <div className="space-y-3">
+      <div className="space-y-3" aria-busy="true">
         <SectionLabel>Budget</SectionLabel>
-        <EmptyState
-          title="Loading budget..."
-          description="Fetching posture from governance backend."
-        />
+        <Skeleton className="h-8 w-32" />
+        <Skeleton className="h-4 w-48" />
+        <Skeleton className="h-4 w-40" />
       </div>
     );
   }
@@ -48,8 +50,8 @@ export function BudgetPanel({ agentId }: BudgetPanelProps) {
       <div className="space-y-3">
         <SectionLabel>Budget</SectionLabel>
         <EmptyState
-          title="Agent not found in posture"
-          description="No cost data available for this agent."
+          title={EMPTY_STATES.budgetPanel.title}
+          description={EMPTY_STATES.budgetPanel.description}
         />
       </div>
     );
@@ -57,6 +59,19 @@ export function BudgetPanel({ agentId }: BudgetPanelProps) {
 
   const { cost } = agent;
   const exceeded = cost.exceeded_today > 0;
+  const noActivity = cost.usd_today === 0 && cost.tokens_today === 0;
+
+  if (noActivity) {
+    return (
+      <div className="space-y-3">
+        <SectionLabel>Budget</SectionLabel>
+        <EmptyState
+          title={EMPTY_STATES.budgetPanel.title}
+          description={EMPTY_STATES.budgetPanel.description}
+        />
+      </div>
+    );
+  }
 
   // FIX 8: the previous implementation rendered a magic `35%` progress
   // bar when there was ANY spend — pure fabrication, no cap field
@@ -91,10 +106,6 @@ export function BudgetPanel({ agentId }: BudgetPanelProps) {
           today
         </div>
       </div>
-
-      <InfoBox tone="info">
-        Session cap not available — shipping in v0.6.
-      </InfoBox>
 
       {/* Policy grid */}
       <div className="grid grid-cols-2 gap-3">
@@ -158,28 +169,6 @@ export function BudgetPanel({ agentId }: BudgetPanelProps) {
             }}
           >
             {cost.exceeded_today}
-          </div>
-        </div>
-        <div>
-          <div
-            className="font-mono uppercase"
-            style={{
-              fontSize: 9,
-              letterSpacing: "0.1em",
-              color: "var(--text-tertiary)",
-            }}
-          >
-            Session cap
-          </div>
-          <div
-            className="font-mono"
-            style={{
-              fontSize: 12,
-              marginTop: 2,
-              color: "var(--text-tertiary)",
-            }}
-          >
-            v0.6
           </div>
         </div>
       </div>

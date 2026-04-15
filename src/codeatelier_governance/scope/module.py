@@ -71,12 +71,13 @@ class ScopeModule:
             self._policies[policy.agent_id] = policy
 
     def set_presence_module(self, presence: Any) -> None:
-        """Wire the PresenceModule for kill-switch enforcement (v0.5.4).
+        """Wire the PresenceModule for halt-switch enforcement (v0.5.4 → v0.6).
 
         Called by GovernanceSDK during start() after both modules exist.
         Once set, every scope.check() call will first call
-        presence.assert_alive(agent_id) and fail-closed with AgentKilledError
-        if the agent has been killed by an operator via the console.
+        presence.assert_not_halted(agent_id) and fail-closed with
+        AgentHaltedError if the agent has been halted by an operator via
+        the console.
         """
         self._presence = presence
 
@@ -288,20 +289,22 @@ class ScopeModule:
         """Check whether ``agent_id`` is permitted to call ``tool`` or ``api``.
 
         Raises:
-            AgentKilledError: an operator has killed this agent via the
-                console kill switch (v0.5.4 hotfix). Fail-closed before
-                any other check. The kill check is fast (5-second TTL cache,
-                no DB query on the hot path) and degrades gracefully if the
-                governance DB is unreachable (Invariant #1).
+            AgentHaltedError: an operator has halted this agent via the
+                console halt switch (v0.5.4 hotfix, renamed from "kill"
+                in v0.6). Fail-closed before any other check. The halt
+                check is fast (5-second TTL cache, no DB query on the
+                hot path) and degrades gracefully if the governance DB
+                is unreachable (Invariant #1). ``AgentKilledError`` is a
+                deprecated alias of the same class.
             PolicyNotRegistered: no policy exists for ``agent_id``.
             ScopeViolation: the action is outside the registered scope.
         """
-        # v0.5.4 kill switch — first thing in the check.
-        # If presence module is wired, fail-closed on killed agents BEFORE
+        # v0.5.4 halt switch — first thing in the check.
+        # If presence module is wired, fail-closed on halted agents BEFORE
         # any policy lookup. Skipped silently if no presence module is
         # configured (back-compat with v0.5.3 SDK construction).
         if self._presence is not None:
-            await self._presence.assert_alive(agent_id)
+            await self._presence.assert_not_halted(agent_id)
 
         if tool is None and api is None:
             raise ValueError(

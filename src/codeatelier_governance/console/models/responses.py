@@ -21,7 +21,8 @@ class of bugs at the serialization boundary. The collection-time lint in
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Union
+from typing import Any, Literal, Union
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -64,15 +65,37 @@ class StrictResponse(BaseModel):
 # Policies
 # ---------------------------------------------------------------------------
 class PolicyRow(StrictResponse):
-    """Single row from governance_policies."""
+    """Single row from governance_policies.
+
+    DA Wave 4 blocker fix (F1): the four scope list fields are hoisted to
+    typed top-level attributes. The ``policy`` dict is strictly scalar-only
+    (``MetadataValue`` = JSON scalars); any attempt to stuff a list into it
+    is rejected at serialization time. Backend handlers are responsible
+    for lifting ``allowed_tools`` / ``hidden_tools`` / ``allowed_apis`` /
+    ``allowed_models`` off the raw policy JSON before instantiating this
+    model.
+    """
 
     model_config = _STRICT
 
     agent_id: str
     policy_type: str
     policy: dict[str, MetadataValue] = Field(
-        description="Parsed policy JSON. Values restricted to JSON scalars.",
+        description=(
+            "Parsed policy JSON. Values restricted to JSON scalars — list "
+            "fields like allowed_tools are exposed as typed top-level "
+            "attributes instead and MUST NOT appear in this dict."
+        ),
     )
+    #: Scope: tools this agent is permitted to call. ``None`` when the
+    #: row is not a scope policy or the backend did not populate it.
+    allowed_tools: list[str] | None = None
+    #: Scope: tools suppressed from the UI for this agent.
+    hidden_tools: list[str] | None = None
+    #: Scope: HTTP hosts / APIs this agent may call.
+    allowed_apis: list[str] | None = None
+    #: Scope: LLM model IDs this agent may invoke.
+    allowed_models: list[str] | None = None
     updated_at: datetime | None = None
 
 
@@ -348,3 +371,82 @@ class GovernanceHealthView(StrictResponse):
     chain_integrity_status: str  # verified | unverified | degraded | halted
     chain_keys_resolved: list[str]
     chain_keys_unresolved: list[str]
+
+
+# ---------------------------------------------------------------------------
+# F4 Compliance Console Surface
+# ---------------------------------------------------------------------------
+ComplianceChainStatus = Literal["verified", "unverified", "degraded", "halted"]
+CoveragePctReason = Literal[
+    "no_scope_policies_registered",
+    "registry_disabled",
+    "ok",
+]
+
+
+class ComplianceReportView(StrictResponse):
+    """GET /api/compliance/report — Article 12 evidence summary view.
+
+    The full ``ComplianceReport`` Pydantic carries the section-level
+    detail; this surface view exposes only the top-level fields the
+    frontend renders in the compliance page and in the persistent header
+    pill. Field names align 1:1 with the backing report so an auditor
+    can cross-reference the JSON directly against
+    ``codeatelier_governance.compliance.models.ComplianceReport``.
+
+    DA blocker fix (F4): the ``chain_verified_from_seq`` /
+    ``chain_verified_to_seq`` fields make the verification window
+    explicit. The default window is the last 1000 events — without this
+    pair a reader cannot tell whether the verified status applies to
+    the whole chain or a slice.
+    """
+
+    model_config = _STRICT
+
+    report_id: UUID
+    generated_at: datetime
+    chain_integrity_status: ComplianceChainStatus
+    chain_verified_from_seq: int | None = Field(default=None, ge=0)
+    chain_verified_to_seq: int | None = Field(default=None, ge=0)
+    #: DA Wave 4: ``True`` when the rotation-aware verifier path was taken
+    #: (F6 Track B). When ``False``, any sibling ``unresolved_fingerprints``
+    #: list is ALWAYS empty and MUST NOT be interpreted as "all keys
+    #: verified successfully" — it is simply not tracked on this path.
+    #: Defaults to ``False`` in v0.6 because the rotation-aware path is
+    #: not yet wired into the console handlers.
+    rotation_aware: bool = False
+    coverage_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    coverage_pct_reason: CoveragePctReason | None = None
+    coverage_caveat: str | None = None
+    total_events_audited: int = Field(ge=0)
+    total_agents: int = Field(ge=0)
+
+
+class VerifyChainResponse(StrictResponse):
+    """POST /api/compliance/verify-chain — on-demand chain re-verification.
+
+    Returns a fresh HMAC chain verification over the caller-supplied
+    window (or the last 1000 events by default).
+
+    ``unresolved_fingerprints`` is populated ONLY when ``rotation_aware``
+    is ``True`` (the F6 Track B rotation-aware verifier path). On the
+    default single-key path, ``rotation_aware`` is ``False`` and
+    ``unresolved_fingerprints`` is ALWAYS empty — an empty list is NOT
+    a verification signal on that path and MUST NOT be interpreted as
+    "all keys verified successfully". DA Wave 4 fix: the new
+    ``rotation_aware`` flag makes the distinction explicit so auditors
+    reading the JSON cannot misread ``[]`` as a green light.
+    """
+
+    model_config = _STRICT
+
+    chain_integrity_status: ComplianceChainStatus
+    from_seq: int | None = Field(default=None, ge=0)
+    to_seq: int | None = Field(default=None, ge=0)
+    verified_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    #: See class docstring. Defaults to ``False`` in v0.6 because the
+    #: rotation-aware verifier path is not yet wired into the console.
+    rotation_aware: bool = False
+    unresolved_fingerprints: list[str]
+    verified_at_utc: datetime

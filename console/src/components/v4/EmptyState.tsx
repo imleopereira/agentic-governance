@@ -16,8 +16,13 @@ export function EmptyState({
   glyph = "\u2014",
   children,
 }: EmptyStateProps) {
+  // WCAG 4.1.3 Status Messages: announce the empty state to AT without
+  // stealing focus. WCAG 1.3.1 Info and Relationships: the title is a
+  // heading so the page outline actually reflects the semantic section.
   return (
     <div
+      role="status"
+      aria-live="polite"
       className="flex flex-col items-center justify-center py-8 px-4 text-center rounded-md border border-dashed"
       style={{
         borderColor: "var(--border)",
@@ -31,12 +36,12 @@ export function EmptyState({
       >
         {glyph}
       </div>
-      <div
-        className="text-sm font-medium"
+      <h3
+        className="text-sm font-medium m-0"
         style={{ color: "var(--fg)" }}
       >
         {title}
-      </div>
+      </h3>
       {description && (
         <div className="text-xs mt-1 max-w-md">{description}</div>
       )}

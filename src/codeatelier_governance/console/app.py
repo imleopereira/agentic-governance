@@ -1578,6 +1578,56 @@ async def deny_gate(
     return {"ok": True, "request_id": str(request_id), "resolution": "denied"}
 
 
+# F1 scope list fields that must be lifted to typed top-level attrs on
+# PolicyRow because ``policy: dict[str, MetadataValue]`` is scalar-only.
+_POLICY_LIST_FIELDS = (
+    "allowed_tools",
+    "hidden_tools",
+    "allowed_apis",
+    "allowed_models",
+)
+
+
+def _coerce_string_list(raw: Any) -> list[str] | None:
+    """Narrow a raw policy-JSON value to ``list[str]`` or ``None``.
+
+    Drops non-string entries fail-closed so a drifted backend cannot
+    smuggle arbitrary scalars into the typed API surface. Returns
+    ``None`` when the field is absent / not a list.
+    """
+    if not isinstance(raw, list):
+        return None
+    return [v for v in raw if isinstance(v, str)]
+
+
+def _build_policy_row(row: Any) -> PolicyRow:
+    """Build a typed ``PolicyRow`` from a raw governance_policies mapping.
+
+    DA Wave 4 blocker fix (F1): lifts the four scope list fields out of
+    the raw policy JSON and onto typed top-level attributes. The scalar
+    residue stays in ``policy`` (which is strict scalar-only).
+    """
+    raw_policy = redact_secrets(row["policy_json"] or {})
+    # Split scalars from list fields so ``policy`` stays scalar-only.
+    list_fields: dict[str, list[str] | None] = {}
+    scalar_policy: dict[str, Any] = {}
+    for key, val in raw_policy.items():
+        if key in _POLICY_LIST_FIELDS:
+            list_fields[key] = _coerce_string_list(val)
+        else:
+            scalar_policy[key] = val
+    return PolicyRow(
+        agent_id=row["agent_id"],
+        policy_type=row["policy_type"],
+        policy=scalar_policy,
+        allowed_tools=list_fields.get("allowed_tools"),
+        hidden_tools=list_fields.get("hidden_tools"),
+        allowed_apis=list_fields.get("allowed_apis"),
+        allowed_models=list_fields.get("allowed_models"),
+        updated_at=row["updated_at"],
+    )
+
+
 @app.get(
     "/api/policies",
     dependencies=[Depends(authenticate), Depends(rate_limit_per_user)],
@@ -1603,15 +1653,7 @@ async def list_policies() -> PolicyListResponse:
         )
         raise HTTPException(500, "Failed to load policies.") from None
 
-    policies = [
-        PolicyRow(
-            agent_id=row["agent_id"],
-            policy_type=row["policy_type"],
-            policy=redact_secrets(row["policy_json"] or {}),
-            updated_at=row["updated_at"],
-        )
-        for row in rows
-    ]
+    policies = [_build_policy_row(row) for row in rows]
     return PolicyListResponse(policies=policies)
 
 
@@ -1642,15 +1684,7 @@ async def get_agent_policies(agent_id: str) -> AgentPoliciesResponse:
         )
         raise HTTPException(500, "Failed to load agent policies.") from None
 
-    policies = [
-        PolicyRow(
-            agent_id=row["agent_id"],
-            policy_type=row["policy_type"],
-            policy=redact_secrets(row["policy_json"] or {}),
-            updated_at=row["updated_at"],
-        )
-        for row in rows
-    ]
+    policies = [_build_policy_row(row) for row in rows]
     return AgentPoliciesResponse(agent_id=agent_id, policies=policies)
 
 
@@ -1907,18 +1941,21 @@ async def agent_presence() -> AgentPresenceResponse:
     return AgentPresenceResponse(agents=agents)
 
 # ---------------------------------------------------------------------------
-# New endpoint: Agent kill switch
+# New endpoint: Agent halt switch (v0.6 F2.5 rename of the v0.5.4 kill switch)
 # ---------------------------------------------------------------------------
 # C0 controls to strip from `reason` (post-escape) so that an operator can't
 # sneak raw terminal / log-injection bytes into the audit chain. Note `\x09`
 # (tab), `\x0a` (LF), `\x0d` (CR) are EXCLUDED here because they are already
 # converted to their printable backslash forms in the escape step above.
 _C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-_KILL_REASON_MAX = 512
+_HALT_REASON_MAX = 512
+# Back-compat alias (removed in v0.7). v0.5.x code that reached into
+# app-internal constants keeps working for one release.
+_KILL_REASON_MAX = _HALT_REASON_MAX
 
 
-class KillRequest(BaseModel):
-    """Kill-switch request body.
+class HaltRequest(BaseModel):
+    """Halt-switch request body.
 
     Security (F2 P0, Cybersec HIGH): the `reason` field flows all the way
     into the HMAC-chained audit row. An unescaped newline would let an
@@ -1927,6 +1964,10 @@ class KillRequest(BaseModel):
     (combining marks) would expand post-decode if we capped bytes instead
     of Unicode codepoints. The validator below normalizes, length-caps,
     escapes, then strips C0 controls — in that order.
+
+    v0.6 F2.5: renamed from ``KillRequest``. The ``KillRequest`` name is
+    preserved as a module-level alias (``KillRequest = HaltRequest``) for
+    one release and removed in v0.7.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -1947,8 +1988,8 @@ class KillRequest(BaseModel):
         #    Escape sequences like `\n` → `\\n` double the length; capping
         #    after escape would let a 512-char stream of newlines still
         #    produce a 1024-char audit field.
-        if len(value) > _KILL_REASON_MAX:
-            value = value[:_KILL_REASON_MAX]
+        if len(value) > _HALT_REASON_MAX:
+            value = value[:_HALT_REASON_MAX]
         # 3. Escape order: backslash MUST be first so that `\n` in the input
         #    (which we escape to `\\n`) can't collide with an already-escaped
         #    `\\n` from a later pass (`\\n` → `\\\\n`).
@@ -1959,23 +2000,34 @@ class KillRequest(BaseModel):
             .replace("\t", "\\t")
         )
         # 4. Strip remaining C0 controls (\x00-\x08, \x0b-\x1f, \x7f). ANSI
-        #    escape sequences like `\x1b[31m` begin with \x1b and are killed
+        #    escape sequences like `\x1b[31m` begin with \x1b and are stripped
         #    at the first byte; the rest of the escape becomes harmless text.
         value = _C0_CONTROL_RE.sub("", value)
         return value
 
 
+# Backward-compat alias (deprecated; removed in v0.7). v0.5.x callers that
+# import ``KillRequest`` from this module keep working. Because this is an
+# identity alias, ``isinstance(req, KillRequest)`` and
+# ``isinstance(req, HaltRequest)`` are both True.
+KillRequest = HaltRequest
+
+
 @app.post(
-    "/api/agents/{agent_id}/kill",
+    "/api/agents/{agent_id}/halt",
     dependencies=[Depends(authenticate), require_role("admin")],
 )
-async def kill_agent(
-    agent_id: str, body: KillRequest, request: Request
+async def halt_agent(
+    agent_id: str, body: HaltRequest, request: Request
 ) -> dict[str, Any]:
-    """Kill (halt) an agent -- admin only. Audit-logged. Requires reason.
+    """Halt an agent -- admin only. Audit-logged. Requires reason.
 
-    Sets the agent's presence status to unresponsive and records kill
+    Sets the agent's presence status to unresponsive and records halt
     metadata in metadata_json. Process termination is the host's responsibility.
+
+    v0.6 F2.5: renamed from ``kill_agent`` / ``POST /api/agents/{id}/kill``.
+    The old route is preserved as a deprecated alias that delegates to this
+    handler and attaches ``Deprecation``/``Sunset`` response headers.
     """
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
@@ -1990,10 +2042,10 @@ async def kill_agent(
         if res.first() is None:
             raise HTTPException(404, "Agent not found in presence table.")
 
-        kill_meta = json.dumps({
-            "_killed_by": user_id,
-            "_killed_at": now.isoformat(),
-            "_kill_reason": body.reason,
+        halt_meta = json.dumps({
+            "_halted_by": user_id,
+            "_halted_at": now.isoformat(),
+            "_halt_reason": body.reason,
         })
         await conn.execute(
             text(
@@ -2003,28 +2055,69 @@ async def kill_agent(
                 "                    || :meta::jsonb "
                 "WHERE agent_id = :aid"
             ),
-            {"aid": agent_id, "meta": kill_meta},
+            {"aid": agent_id, "meta": halt_meta},
         )
 
     if audit_module is not None:
         session_id = UUID(
-            hashlib.md5(("kill:" + agent_id + ":" + now.isoformat()).encode()).hexdigest()
+            hashlib.md5(("halt:" + agent_id + ":" + now.isoformat()).encode()).hexdigest()
         )
         await audit_module.log(
             AuditEvent(
                 agent_id=agent_id,
                 session_id=session_id,
-                kind="agent.killed",
+                kind="agent.halted",
                 metadata={
-                    "killed_by": user_id,
+                    "halted_by": user_id,
                     "reason": body.reason,
-                    "killed_at": now.isoformat(),
+                    "halted_at": now.isoformat(),
                 },
             )
         )
 
-    _logger.info("console.agent_killed", agent_id=agent_id, killed_by=user_id)
-    return {"ok": True, "agent_id": agent_id, "action": "killed", "killed_at": now.isoformat()}
+    _logger.info("console.agent_halted", agent_id=agent_id, halted_by=user_id)
+    return {
+        "ok": True,
+        "agent_id": agent_id,
+        "action": "halted",
+        "halted_at": now.isoformat(),
+    }
+
+
+# Back-compat route (v0.6 → removed in v0.7). Delegates to halt_agent and
+# attaches Deprecation + Sunset headers. Body-preserving 308 redirects are
+# flaky across HTTP clients (some downgrade POST to GET), so we internally
+# delegate and return the same JSON payload the /halt route returns, plus
+# an additional WARN log on the deprecated structlog event.
+@app.post(
+    "/api/agents/{agent_id}/kill",
+    dependencies=[Depends(authenticate), require_role("admin")],
+)
+async def kill_agent(
+    agent_id: str, body: HaltRequest, request: Request
+) -> JSONResponse:
+    """Deprecated alias of ``POST /api/agents/{agent_id}/halt``.
+
+    Preserved for one release (v0.6) so v0.5.x clients keep working while
+    they upgrade. Removed in v0.7. Emits a deprecated structlog event
+    ``console.agent_killed`` at WARN level alongside the new
+    ``console.agent_halted`` event and attaches ``Deprecation: true`` and
+    ``Sunset: Wed, 15 Oct 2026 00:00:00 GMT`` response headers.
+    """
+    _logger.warning(
+        "console.agent_killed",
+        agent_id=agent_id,
+        msg="deprecated event kind; use console.agent_halted.",
+    )
+    payload = await halt_agent(agent_id, body, request)
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Deprecation": "true",
+            "Sunset": "Wed, 15 Oct 2026 00:00:00 GMT",
+            "Link": '</api/agents/{agent_id}/halt>; rel="successor-version"',
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2884,3 +2977,319 @@ async def governance_health(request: Request) -> dict[str, Any]:
         chain_keys_unresolved=chain_keys_unresolved,
     )
     return view.model_dump(mode="json")
+
+
+# ---------------------------------------------------------------------------
+# F4 Compliance Console Surface
+# ---------------------------------------------------------------------------
+# Two endpoints back the persistent header pill and the full compliance
+# page in the v4 console:
+#
+#   GET  /api/compliance/report         — returns the Article 12 summary
+#   POST /api/compliance/verify-chain   — runs a window-limited HMAC verify
+#
+# Both share a semaphore (max 2 concurrent) and a 30-second short-circuit
+# cache keyed on the verification window. The cache prevents a thundering
+# herd when a tab auto-refreshes the header pill while an analyst clicks
+# the compliance page; the semaphore prevents a single misbehaving client
+# from pinning the chain verifier. Rate limit is imposed at 1 req / 60 s
+# per authenticated user — compliance calls are expensive (O(n) over the
+# verify window) and should not be treated as cheap polling endpoints.
+# ---------------------------------------------------------------------------
+_COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS = 60
+_COMPLIANCE_RATE_LIMIT_MAX = 1
+_compliance_user_times: dict[str, list[float]] = {}
+
+_COMPLIANCE_SEMAPHORE = asyncio.Semaphore(2)
+
+_COMPLIANCE_CACHE_TTL_SECONDS = 30.0
+# Cache key -> (inserted_at_monotonic, payload_dict)
+_compliance_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _compliance_rate_limit_check(user_id: str) -> float | None:
+    """Sliding-window per-user rate limit for the F4 compliance endpoints.
+
+    Returns ``retry_after`` (seconds) when the caller is over quota, else
+    ``None``. Dedicated from the shared ``_check_user_rate_limit`` pool
+    so normal polling endpoints don't exhaust the compliance quota and
+    vice versa.
+    """
+    now = time.monotonic()
+    times = _compliance_user_times.get(user_id, [])
+    times = [
+        t for t in times if now - t < _COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS
+    ]
+    _compliance_user_times[user_id] = times
+    if len(times) >= _COMPLIANCE_RATE_LIMIT_MAX:
+        oldest = times[0]
+        retry = _COMPLIANCE_RATE_LIMIT_WINDOW_SECONDS - (now - oldest)
+        return max(1.0, retry)
+    times.append(now)
+    _compliance_user_times[user_id] = times
+    return None
+
+
+async def _compliance_rate_limit_dep(request: Request) -> None:
+    """FastAPI dependency: 1 req/60 s/user for F4 compliance endpoints."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        return
+    retry_after = _compliance_rate_limit_check(user_id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Compliance rate limit exceeded. Retry in 60 s.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
+
+
+def _compliance_cache_get(key: str) -> dict[str, Any] | None:
+    """Return a cached payload for ``key`` if it is still within TTL."""
+    entry = _compliance_cache.get(key)
+    if entry is None:
+        return None
+    inserted_at, payload = entry
+    if time.monotonic() - inserted_at > _COMPLIANCE_CACHE_TTL_SECONDS:
+        _compliance_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _compliance_cache_put(key: str, payload: dict[str, Any]) -> None:
+    """Insert ``payload`` into the short-circuit cache under ``key``."""
+    _compliance_cache[key] = (time.monotonic(), payload)
+    # Opportunistic GC: cache holds at most a handful of keys under
+    # normal operation, but a buggy client could still flood it.
+    if len(_compliance_cache) > 64:
+        now = time.monotonic()
+        stale = [
+            k
+            for k, (ts, _) in _compliance_cache.items()
+            if now - ts > _COMPLIANCE_CACHE_TTL_SECONDS
+        ]
+        for k in stale:
+            _compliance_cache.pop(k, None)
+
+
+def _round_to_minute(ts: datetime) -> datetime:
+    """Round a datetime down to the minute.
+
+    Cybersec MED (F4): timestamp precision at the millisecond level
+    leaks a scraping signal. Every F4 surface exposes chain-verify
+    timestamps at minute granularity only.
+    """
+    return ts.replace(second=0, microsecond=0)
+
+
+def _map_chain_status(raw: str) -> str:
+    """Map backend chain status strings to the F4 surface vocabulary.
+
+    The backend returns ``"verified" | "unverified" | "failed"``. The
+    F4 surface exposes ``"verified" | "unverified" | "degraded" | "halted"``
+    to align with the governance-health vocabulary. ``"failed"`` becomes
+    ``"halted"``; everything else passes through.
+    """
+    if raw == "failed":
+        return "halted"
+    if raw in {"verified", "unverified", "degraded", "halted"}:
+        return raw
+    return "unverified"
+
+
+def _build_report_generator() -> Any:
+    """Construct a :class:`ReportGenerator` wired to the current backend.
+
+    Prefers the live ``audit_module`` (so chain verification is available)
+    and falls back to the configured ``DATABASE_URL``. Returns ``None``
+    when neither is available — callers map that to a 503.
+    """
+    from ..compliance.report import ReportGenerator
+
+    if audit_module is not None:
+        return ReportGenerator(
+            database_url=DATABASE_URL or None,
+            audit_module=audit_module,
+        )
+    if DATABASE_URL:
+        return ReportGenerator(database_url=DATABASE_URL)
+    return None
+
+
+@app.get(
+    "/api/compliance/report",
+    dependencies=[
+        Depends(authenticate),
+        Depends(_compliance_rate_limit_dep),
+    ],
+)
+async def compliance_report(request: Request) -> dict[str, Any]:
+    """F4: Article 12 evidence summary for the v4 compliance page.
+
+    Assembles a :class:`ComplianceReportView` from an Article 12 report
+    generated by :class:`ReportGenerator`, including a windowed HMAC
+    chain verification (last 1000 events by default — see
+    ``ReportGenerator._CHAIN_VERIFY_WINDOW``).
+
+    Concurrency: protected by a module-level semaphore (max 2 concurrent
+    verify_chain calls) and a 30-second short-circuit cache keyed on the
+    (backend, verify_window) tuple. Rate limited at 1 req/60 s/user via
+    the ``_compliance_rate_limit_dep`` dependency.
+    """
+    from .models.responses import ComplianceReportView
+
+    cache_key = "article12"
+    cached = _compliance_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    generator = _build_report_generator()
+    if generator is None:
+        raise HTTPException(
+            503,
+            "Compliance reports unavailable: no audit backend configured.",
+        )
+
+    try:
+        async with _COMPLIANCE_SEMAPHORE:
+            # Double-check the cache after acquiring the semaphore so a
+            # burst of callers funnels onto one verify.
+            cached = _compliance_cache_get(cache_key)
+            if cached is not None:
+                return cached
+            report = await generator.generate_article12(verify_chain=True)
+            # DA Wave 4 blocker fix: read from/to seq directly off the
+            # already-generated report — the previous implementation ran
+            # ``verify_chain`` a second time, doubling O(n) HMAC work per
+            # cold cache miss.
+            from_seq = report.chain_verified_from_seq
+            to_seq = report.chain_verified_to_seq
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — degradation, not error path
+        _logger.warning(
+            "console.compliance_report_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise HTTPException(
+            503, "Compliance report temporarily unavailable."
+        ) from None
+
+    # Count distinct agents across sessions by asking the report sections.
+    total_agents = 0
+    for section in report.sections:
+        if section.title.lower().startswith("reference"):
+            for row in section.data:
+                val = row.get("value") if isinstance(row, dict) else None
+                if isinstance(val, list):
+                    total_agents = max(total_agents, len(val))
+
+    view = ComplianceReportView(
+        report_id=report.report_id,
+        generated_at=_round_to_minute(report.generated_at),
+        chain_integrity_status=_map_chain_status(
+            report.chain_integrity_status
+        ),  # type: ignore[arg-type]
+        chain_verified_from_seq=from_seq,
+        chain_verified_to_seq=to_seq,
+        # DA Wave 4 SHIP-WITH-CHANGES: explicit rotation-aware flag so
+        # an empty unresolved_fingerprints list cannot be misread as
+        # "all keys verified". False in v0.6 until F6 Track B lands.
+        rotation_aware=False,
+        coverage_pct=report.coverage_pct,
+        coverage_pct_reason=report.coverage_pct_reason,
+        coverage_caveat=report.coverage_caveat,
+        total_events_audited=report.event_count,
+        total_agents=total_agents,
+    )
+    payload = view.model_dump(mode="json")
+    _compliance_cache_put(cache_key, payload)
+    return payload
+
+
+@app.post(
+    "/api/compliance/verify-chain",
+    dependencies=[
+        Depends(authenticate),
+        Depends(_compliance_rate_limit_dep),
+    ],
+)
+async def compliance_verify_chain(
+    request: Request,
+    from_seq: int | None = Query(default=None, ge=0),
+    to_seq: int | None = Query(default=None, ge=0),
+) -> dict[str, Any]:
+    """F4: on-demand HMAC chain re-verification for the header pill.
+
+    Accepts optional ``from_seq``/``to_seq`` query parameters and
+    defaults to the last 1000 events. Shares the F4 compliance
+    semaphore + 30 s cache so a burst of header-pill clicks collapses
+    onto a single backend verify.
+    """
+    from .models.responses import VerifyChainResponse
+
+    cache_key = f"verify_chain:{from_seq}:{to_seq}"
+    cached = _compliance_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    generator = _build_report_generator()
+    if generator is None:
+        raise HTTPException(
+            503,
+            "Chain verification unavailable: no audit backend configured.",
+        )
+
+    try:
+        async with _COMPLIANCE_SEMAPHORE:
+            cached = _compliance_cache_get(cache_key)
+            if cached is not None:
+                return cached
+            status_raw, resolved_from, resolved_to = (
+                await generator.run_chain_verification_windowed(
+                    from_seq=from_seq, to_seq=to_seq,
+                )
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning(
+            "console.compliance_verify_chain_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise HTTPException(
+            503, "Chain verification temporarily unavailable."
+        ) from None
+
+    # The single-key verifier returns one of verified/unverified/failed
+    # and does not produce per-row counts. We emit the coarse roll-up
+    # here; the F6 Track B rotation-aware verifier (verify_chain_with_
+    # rotation) is invoked separately and produces fingerprint lists.
+    mapped = _map_chain_status(status_raw)
+    if mapped == "verified":
+        verified_count = 1
+        failed_count = 0
+    elif mapped == "halted":
+        verified_count = 0
+        failed_count = 1
+    else:
+        verified_count = 0
+        failed_count = 0
+
+    view = VerifyChainResponse(
+        chain_integrity_status=mapped,  # type: ignore[arg-type]
+        from_seq=resolved_from,
+        to_seq=resolved_to,
+        verified_count=verified_count,
+        failed_count=failed_count,
+        # DA Wave 4 SHIP-WITH-CHANGES: single-key verifier path — empty
+        # unresolved list is NOT a verification signal. See model docstring.
+        rotation_aware=False,
+        unresolved_fingerprints=[],
+        verified_at_utc=_round_to_minute(datetime.now(timezone.utc)),
+    )
+    payload = view.model_dump(mode="json")
+    _compliance_cache_put(cache_key, payload)
+    return payload

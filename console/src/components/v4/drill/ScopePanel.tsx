@@ -1,27 +1,27 @@
 "use client";
 
 /**
- * ScopePanel — displays scope policy (allowed tools / apis / models).
+ * ScopePanel — renders the live scope policy for an agent.
  *
- * The `useAgentPolicy` hook is a stable shim until the `/api/policy/*`
- * endpoints ship (see comment in `@/hooks/useAgentQueries`). Until
- * then, this panel renders an empty state + info box rather than
- * guessing values.
+ * Wired to F3's `GET /api/policies/{agent_id}` via `useAgentPolicy`.
+ * The hook returns a `ScopePolicyView` that has already been narrowed
+ * (every string in the list is a `typeof "string"` at runtime). No
+ * `as` cast, no dict passthrough — anything the backend leaks that
+ * isn't a string tool name is dropped before it can reach the DOM.
  */
 
 import { Pill } from "../Pill";
 import { SectionLabel } from "../SectionLabel";
 import { EmptyState } from "../EmptyState";
 import { InfoBox } from "../InfoBox";
-import { useAgentPolicy } from "@/hooks/useAgentQueries";
+import {
+  useAgentPolicy,
+  type ScopePolicyView,
+} from "@/hooks/useAgentQueries";
 import { sanitizeErrorMessage } from "@/lib/connectionStore";
+import { EMPTY_STATES } from "@/lib/empty-states";
 
-export interface ScopePolicyView {
-  allowed_tools?: readonly string[];
-  hidden_tools?: readonly string[];
-  allowed_apis?: readonly string[];
-  allowed_models?: readonly string[];
-}
+export type { ScopePolicyView };
 
 export interface ScopePanelProps {
   agentId: string;
@@ -45,16 +45,38 @@ function PillList({
   );
 }
 
+function isEmptyPolicy(p: ScopePolicyView | undefined): boolean {
+  if (!p) return true;
+  return (
+    p.allowed_tools.length === 0 &&
+    p.hidden_tools.length === 0 &&
+    p.allowed_apis.length === 0 &&
+    p.allowed_models.length === 0
+  );
+}
+
 export function ScopePanel({ agentId }: ScopePanelProps) {
-  const { data: policy, error } = useAgentPolicy(agentId) as {
-    data: ScopePolicyView | undefined;
-    error: Error | null;
-  };
+  const { data: policy, error, isLoading } = useAgentPolicy(agentId);
+
+  if (isLoading) {
+    return (
+      <div className="space-y-3">
+        <h3 className="text-xs font-mono uppercase tracking-wide">
+          Scope Policy
+        </h3>
+        <div className="text-xs" style={{ color: "var(--text-tertiary)" }}>
+          Loading policy...
+        </div>
+      </div>
+    );
+  }
 
   if (error) {
     return (
       <div className="space-y-3">
-        <SectionLabel>Scope Policy</SectionLabel>
+        <h3 className="text-xs font-mono uppercase tracking-wide">
+          Scope Policy
+        </h3>
         <InfoBox tone="danger" title="Failed to load policy">
           {sanitizeErrorMessage(error.message)}
         </InfoBox>
@@ -62,65 +84,65 @@ export function ScopePanel({ agentId }: ScopePanelProps) {
     );
   }
 
-  if (!policy) {
+  if (isEmptyPolicy(policy)) {
     return (
       <div className="space-y-4">
-        <SectionLabel>Scope Policy</SectionLabel>
+        <h3 className="text-xs font-mono uppercase tracking-wide">
+          Scope Policy
+        </h3>
         <EmptyState
-          title="Policy endpoint not available"
-          description="Current scope is still enforced in-process by the SDK."
+          title={EMPTY_STATES.scopePanel.title}
+          description={EMPTY_STATES.scopePanel.description}
         />
-        <InfoBox tone="info" title="Shipping in v0.6">
-          The <code>/api/policy/*</code> endpoints will expose the live
-          scope policy. Until then, the SDK&rsquo;s pre-call check
-          fail-closes on anything not in the allowlist.
-        </InfoBox>
       </div>
     );
   }
 
-  const hasTools = (policy.allowed_tools?.length ?? 0) > 0;
-  const hasHidden = (policy.hidden_tools?.length ?? 0) > 0;
-  const hasApis = (policy.allowed_apis?.length ?? 0) > 0;
-  const hasModels = (policy.allowed_models?.length ?? 0) > 0;
+  const p = policy as ScopePolicyView;
+  const hasTools = p.allowed_tools.length > 0;
+  const hasHidden = p.hidden_tools.length > 0;
+  const hasApis = p.allowed_apis.length > 0;
+  const hasModels = p.allowed_models.length > 0;
 
   return (
     <div className="space-y-5">
-      <SectionLabel>Scope Policy</SectionLabel>
+      <h3 className="text-xs font-mono uppercase tracking-wide">
+        Scope Policy
+      </h3>
 
       {hasTools && (
         <div>
           <SectionLabel>
-            Allowed Tools ({policy.allowed_tools!.length})
+            Allowed Tools ({p.allowed_tools.length})
           </SectionLabel>
-          <PillList items={policy.allowed_tools!} tone="success" />
+          <PillList items={p.allowed_tools} tone="success" />
         </div>
       )}
 
       {hasHidden && (
         <div>
           <SectionLabel>
-            Hidden from Agent ({policy.hidden_tools!.length})
+            Hidden from Agent ({p.hidden_tools.length})
           </SectionLabel>
-          <PillList items={policy.hidden_tools!} tone="danger" />
+          <PillList items={p.hidden_tools} tone="danger" />
         </div>
       )}
 
       {hasApis && (
         <div>
           <SectionLabel>
-            Allowed APIs ({policy.allowed_apis!.length})
+            Allowed APIs ({p.allowed_apis.length})
           </SectionLabel>
-          <PillList items={policy.allowed_apis!} tone="info" />
+          <PillList items={p.allowed_apis} tone="info" />
         </div>
       )}
 
       {hasModels && (
         <div>
           <SectionLabel>
-            Allowed Models ({policy.allowed_models!.length})
+            Allowed Models ({p.allowed_models.length})
           </SectionLabel>
-          <PillList items={policy.allowed_models!} tone="info" />
+          <PillList items={p.allowed_models} tone="info" />
         </div>
       )}
 

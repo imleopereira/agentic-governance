@@ -90,6 +90,13 @@ class ComplianceReport(BaseModel):
     #: ``"failed"`` — chain check was attempted and found a broken link.
     chain_integrity_status: ChainIntegrityStatus = "unverified"
 
+    #: DA Wave 4 blocker fix: window bounds that the chain verification
+    #: actually covered. Stored here so the console handler can read them
+    #: off the already-generated report instead of running ``verify_chain``
+    #: a second time. Both are ``None`` when chain verification was skipped.
+    chain_verified_from_seq: int | None = Field(default=None, ge=0)
+    chain_verified_to_seq: int | None = Field(default=None, ge=0)
+
     #: Always populated.  Never empty.  Reminds consumers that this report
     #: only covers events that passed through the SDK wrapper.
     coverage_caveat: str = Field(min_length=1)

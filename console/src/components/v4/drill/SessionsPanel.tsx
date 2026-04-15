@@ -11,8 +11,10 @@ import { SectionLabel } from "../SectionLabel";
 import { EmptyState } from "../EmptyState";
 import { InfoBox } from "../InfoBox";
 import { Pill } from "../Pill";
+import { Skeleton } from "@/components/Skeleton";
 import { useAgentSessions } from "@/hooks/useAgentQueries";
 import { sanitizeErrorMessage } from "@/lib/connectionStore";
+import { EMPTY_STATES, SESSIONS_PANEL_TITLE } from "@/lib/empty-states";
 
 export interface SessionsPanelProps {
   agentId: string;
@@ -22,13 +24,14 @@ export function SessionsPanel({ agentId }: SessionsPanelProps) {
   const { data: sessions, isLoading, error } = useAgentSessions(agentId);
 
   if (isLoading) {
+    // WCAG 4.1.3: use Skeleton, not EmptyState — a loading placeholder
+    // is a different announcement category from "no data".
     return (
-      <div className="space-y-3">
-        <SectionLabel>Sessions</SectionLabel>
-        <EmptyState
-          title="Loading sessions..."
-          description="Fetching session cost data."
-        />
+      <div className="space-y-3" aria-busy="true">
+        <SectionLabel>{SESSIONS_PANEL_TITLE}</SectionLabel>
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-5/6" />
+        <Skeleton className="h-4 w-2/3" />
       </div>
     );
   }
@@ -36,7 +39,7 @@ export function SessionsPanel({ agentId }: SessionsPanelProps) {
   if (error) {
     return (
       <div className="space-y-3">
-        <SectionLabel>Sessions</SectionLabel>
+        <SectionLabel>{SESSIONS_PANEL_TITLE}</SectionLabel>
         <InfoBox tone="danger" title="Failed to load sessions">
           {sanitizeErrorMessage((error as Error).message)}
         </InfoBox>
@@ -47,10 +50,10 @@ export function SessionsPanel({ agentId }: SessionsPanelProps) {
   if (!sessions || sessions.length === 0) {
     return (
       <div className="space-y-3">
-        <SectionLabel>Sessions</SectionLabel>
+        <SectionLabel>{SESSIONS_PANEL_TITLE}</SectionLabel>
         <EmptyState
-          title="No sessions"
-          description="No session-level cost data is available for this agent yet."
+          title={EMPTY_STATES.sessionsPanel.title}
+          description={EMPTY_STATES.sessionsPanel.description}
         />
       </div>
     );
@@ -58,7 +61,7 @@ export function SessionsPanel({ agentId }: SessionsPanelProps) {
 
   return (
     <div>
-      <SectionLabel>Sessions ({sessions.length})</SectionLabel>
+      <SectionLabel>{SESSIONS_PANEL_TITLE} ({sessions.length})</SectionLabel>
       <ul>
         {sessions.map((s) => {
           const active = s.last_updated !== null;

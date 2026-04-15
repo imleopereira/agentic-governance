@@ -133,29 +133,93 @@ export interface GateResolved {
   resolved_by?: string | null;
 }
 
+/** Module-health literal emitted by the backend posture endpoint.
+ *  Source: `src/codeatelier_governance/console/app.py` (governance_posture),
+ *  lines ~1766-1812 of v0.6. Values are EXACTLY these three strings —
+ *  narrowing the wire shape here lets every consumer (statusMap, posture
+ *  badge, compliance pill) avoid `as string` casts and receive exhaustive
+ *  switch coverage. Unknown literal values from a drifted backend are
+ *  a programmer error and are handled at the renderer layer
+ *  (see `mapAgentStatus` — `_unknownStatusWarned` fail-loud). */
+export type PostureStatus = "PASS" | "WARN" | "FAIL";
+
 export interface PostureAgent {
   agent_id: string;
   event_count: number;
   last_active: string | null;
   scope: {
-    status: string;
+    status: PostureStatus;
     violations_today: number;
     latest_violation: { tool: string; created_at: string | null } | null;
   };
   cost: {
-    status: string;
+    status: PostureStatus;
     usd_today: number;
     tokens_today: number;
     exceeded_today: number;
   };
-  gates: { status: string; pending: number };
-  audit: { status: string; events_total: number };
+  gates: { status: PostureStatus; pending: number };
+  audit: { status: PostureStatus; events_total: number };
 }
 
 export interface Posture {
   timestamp: string;
   agent_count: number;
   agents: PostureAgent[];
+}
+
+/** Mirrors backend `PolicyRow` Pydantic model (responses.py).
+ *
+ *  DA Wave 4 blocker fix (F1): the four scope list fields are now typed
+ *  top-level attributes on the backend model. `policy` remains strictly
+ *  scalar-only (`MetadataValue`). Readers SHOULD prefer the top-level
+ *  `allowed_tools` etc., and fall back to parsing `policy.allowed_tools`
+ *  only for legacy v0.5.x rows that pre-date the split. See
+ *  `derivePolicyView` in `useAgentQueries.ts` for the canonical reader. */
+export interface PolicyRow {
+  agent_id: string;
+  policy_type: string;
+  policy: Record<string, unknown>;
+  allowed_tools?: string[] | null;
+  hidden_tools?: string[] | null;
+  allowed_apis?: string[] | null;
+  allowed_models?: string[] | null;
+  updated_at: string | null;
+}
+
+/** Mirrors backend `AgentPoliciesResponse` — GET /api/policies/{agent_id}. */
+export interface AgentPoliciesResponse {
+  agent_id: string;
+  policies: PolicyRow[];
+}
+
+// ---------- F4 Compliance surface types ----------
+
+export interface ComplianceReportView {
+  report_id: string;
+  generated_at: string;
+  chain_integrity_status: "verified" | "unverified" | "degraded" | "halted";
+  chain_verified_from_seq: number | null;
+  chain_verified_to_seq: number | null;
+  coverage_pct: number | null;
+  coverage_pct_reason:
+    | "no_scope_policies_registered"
+    | "registry_disabled"
+    | "ok"
+    | null;
+  coverage_caveat: string | null;
+  total_events_audited: number;
+  total_agents: number;
+}
+
+export interface VerifyChainResponse {
+  chain_integrity_status: "verified" | "unverified" | "degraded" | "halted";
+  from_seq: number | null;
+  to_seq: number | null;
+  verified_count: number;
+  failed_count: number;
+  unresolved_fingerprints: string[];
+  verified_at_utc: string;
 }
 
 // ---------- API functions ----------
@@ -205,11 +269,11 @@ export const api = {
    *  but cannot pass any scope check, budget check, or contract enforcement.
    *  Process termination is the host application's responsibility. Admin only.
    *
-   *  Note: backend route is still `/kill` in v0.6; the full rename to `/halt`
-   *  lands in F2.5. This call site is named `haltAgent` for the product-level
-   *  vocabulary while hitting the current wire URL. */
+   *  v0.6 F2.5: backend route renamed from `/kill` → `/halt`. The old `/kill`
+   *  route still exists as a deprecated alias (Deprecation + Sunset headers)
+   *  for one release so v0.5.x callers keep working while they upgrade. */
   haltAgent: (agentId: string, reason: string) =>
-    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/kill`, { reason }),
+    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/halt`, { reason }),
 
   /** Fetch a single audit event by ID, for SSE-stream hydration (the NOTIFY
    *  trigger payload omits `model`/`metadata`/`hmac_value`/`prev_hash` to keep
@@ -217,4 +281,28 @@ export const api = {
    *  first opens an event whose `_needs_hydration` flag is true. */
   getAuditEvent: (eventId: string) =>
     get<AuditEvent>(`/api/events/${encodeURIComponent(eventId)}`),
+
+  /** F3 typed endpoint: scope + budget policy rows for one agent. */
+  getAgentPolicies: (agentId: string) =>
+    get<AgentPoliciesResponse>(
+      `/api/policies/${encodeURIComponent(agentId)}`
+    ),
+
+  /** F4: Article 12 evidence summary view. */
+  getComplianceReport: () =>
+    get<ComplianceReportView>("/api/compliance/report"),
+
+  /** F4: on-demand HMAC chain re-verification.
+   *
+   *  ``from_seq`` / ``to_seq`` are optional — when omitted the backend
+   *  verifies the last 1000 events (DA blocker: verify_chain is O(n)). */
+  verifyChain: (args: { from_seq?: number; to_seq?: number }) => {
+    const params: Record<string, string> = {};
+    if (args.from_seq !== undefined) params.from_seq = String(args.from_seq);
+    if (args.to_seq !== undefined) params.to_seq = String(args.to_seq);
+    const qs = new URLSearchParams(params).toString();
+    return post<VerifyChainResponse>(
+      `/api/compliance/verify-chain${qs ? `?${qs}` : ""}`,
+    );
+  },
 };

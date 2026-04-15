@@ -16,16 +16,21 @@ from typing import Any
 
 import structlog
 
-from .errors import AgentKilledError
+from .errors import AgentHaltedError
 from .models import AgentStatus
 
 logger = structlog.get_logger(__name__)
 
-# Kill-switch cache TTL: 5 seconds.
+# Halt-switch cache TTL: 5 seconds.
 # Trade-off: bounds DB load (max 1 query per 5s per host process) at the cost
-# of a worst-case 5-second delay between an operator clicking Kill in the
-# console and the SDK fail-closing on that agent. Hotfix v0.5.4 default.
-_KILL_CACHE_TTL_SECONDS = 5.0
+# of a worst-case 5-second delay between an operator clicking Halt in the
+# console and the SDK fail-closing on that agent. Hotfix v0.5.4 default,
+# renamed from `_KILL_CACHE_TTL_SECONDS` in v0.6 (F2.5).
+_HALT_CACHE_TTL_SECONDS = 5.0
+
+# Backward-compat alias (removed in v0.7). v0.5.x code that reaches into the
+# module's private constants continues to work; new code uses `_HALT_*`.
+_KILL_CACHE_TTL_SECONDS = _HALT_CACHE_TTL_SECONDS
 
 
 class PresenceModule:
@@ -43,14 +48,14 @@ class PresenceModule:
         # In-memory fallback: {agent_id: {status, last_heartbeat, started_at, metadata}}
         self._agents: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
-        # Kill-switch cache: agent_id -> kill metadata dict.
-        # Refreshed from DB on stale read. See _refresh_killed_cache below.
-        # Designed for Invariant #1: if the DB is unreachable, _killed_cache
-        # holds the last known good state so already-killed agents stay killed
+        # Halt-switch cache: agent_id -> halt metadata dict.
+        # Refreshed from DB on stale read. See _maybe_refresh_halted_cache below.
+        # Designed for Invariant #1: if the DB is unreachable, _halted_cache
+        # holds the last known good state so already-halted agents stay halted
         # and live agents stay live, instead of crashing the host application.
-        self._killed_cache: dict[str, dict[str, Any]] = {}
-        self._killed_cache_at: float = 0.0
-        self._killed_lock = asyncio.Lock()
+        self._halted_cache: dict[str, dict[str, Any]] = {}
+        self._halted_cache_at: float = 0.0
+        self._halted_lock = asyncio.Lock()
 
     def _get_engine(self) -> Any:
         """Return the shared engine, or lazily create one if no shared engine was provided."""
@@ -323,131 +328,140 @@ class PresenceModule:
             )
 
     # ------------------------------------------------------------------
-    # Kill switch (v0.5.4 hotfix)
+    # Halt switch (v0.5.4 hotfix; renamed from "kill" → "halt" in v0.6 F2.5)
     # ------------------------------------------------------------------
     #
-    # The kill switch is the single fail-closed control an operator has over
-    # a running agent. When an operator clicks "Kill" in the console
-    # (POST /api/agents/{agent_id}/kill), the console writes a marker into
-    # `governance_agent_presence.metadata_json` containing `_killed_by`,
-    # `_killed_at`, `_kill_reason`. THIS module is the SDK-side enforcement
+    # The halt switch is the single fail-closed control an operator has over
+    # a running agent. When an operator clicks "Halt" in the console
+    # (POST /api/agents/{agent_id}/halt), the console writes a marker into
+    # `governance_agent_presence.metadata_json` containing `_halted_by`,
+    # `_halted_at`, `_halt_reason`. THIS module is the SDK-side enforcement
     # of that marker.
     #
+    # Backward-compat (v0.6 → removed in v0.7): v0.5.4 wrote the marker under
+    # `_killed_by` / `_killed_at` / `_kill_reason`. Historic rows in customer
+    # databases still carry those keys. This module READS BOTH key families
+    # (prefer `_halted_*`, fall back to `_killed_*`) so upgrading the SDK
+    # without running the console upgrade first still fails closed on halted
+    # agents. v0.7 drops the fallback branch.
+    #
     # IMPORTANT: as of v0.5.4 we do NOT use `status='unresponsive'` to detect
-    # kills, because `check_stale()` also writes that status for heartbeat
+    # halts, because `check_stale()` also writes that status for heartbeat
     # timeouts. Conflating the two would block agents that simply went idle.
-    # The metadata marker is the unambiguous kill signal.
+    # The metadata marker is the unambiguous halt signal.
     #
-    # Cache strategy: 5-second TTL in-memory dict. On every is_killed() /
-    # assert_alive() call, if the cache is older than TTL, refresh from DB.
-    # If the DB is unreachable (Invariant #1), the cache holds the last known
-    # state — already-killed agents stay killed, live agents stay live, and
-    # the host application keeps running. A WARNING is logged on DB error
-    # but no exception propagates.
-    #
-    # Why on PresenceModule and not a separate KillSwitchModule: presence
-    # already owns `governance_agent_presence` and has the engine wiring.
-    # Adding a second module for one column-read would double the DB-engine
-    # lifecycle surface area for zero gain.
+    # Cache strategy: 5-second TTL in-memory dict. On every is_halted() /
+    # assert_not_halted() call, if the cache is older than TTL, refresh from
+    # DB. If the DB is unreachable (Invariant #1), the cache holds the last
+    # known state — already-halted agents stay halted, live agents stay live,
+    # and the host application keeps running. A WARNING is logged on DB
+    # error but no exception propagates.
 
-    async def is_killed(self, agent_id: str) -> bool:
-        """Return True if the agent has been killed by an operator.
+    async def is_halted(self, agent_id: str) -> bool:
+        """Return True if the agent has been halted by an operator.
 
         Reads from a 5-second TTL cache. On cache miss or stale, refreshes
-        from `governance_agent_presence` looking for any row where
-        `metadata_json->>'_killed_by'` IS NOT NULL. On DB error, falls back
-        to the existing cache (Invariant #1: never crashes the host).
+        from `governance_agent_presence` looking for any row where a halt
+        marker is present under either the v0.6 (`_halted_by`) or the
+        v0.5.x back-compat (`_killed_by`) key. On DB error, falls back to
+        the existing cache (Invariant #1: never crashes the host).
 
-        This method is the source of truth for kill state inside the SDK.
+        This method is the source of truth for halt state inside the SDK.
         Called by:
           * scope.check() top-of-function
           * cost.check_budget() top-of-function
           * gates.check() top-of-function
           * any wrapped LLM client (wrap_anthropic / wrap_openai) before send
         """
-        await self._maybe_refresh_killed_cache()
-        return agent_id in self._killed_cache
+        await self._maybe_refresh_halted_cache()
+        return agent_id in self._halted_cache
 
-    async def assert_alive(self, agent_id: str) -> None:
-        """Raise AgentKilledError if the agent has been killed.
+    async def assert_not_halted(self, agent_id: str) -> None:
+        """Raise AgentHaltedError if the agent has been halted.
 
-        Convenience wrapper over is_killed() that includes the kill metadata
+        Convenience wrapper over is_halted() that includes the halt metadata
         in the exception so callers don't have to look it up separately.
 
         Raises:
-            AgentKilledError: the agent is in the killed-cache.
+            AgentHaltedError: the agent is in the halted-cache.
         """
-        await self._maybe_refresh_killed_cache()
-        kill_meta = self._killed_cache.get(agent_id)
-        if kill_meta is not None:
-            raise AgentKilledError(
+        await self._maybe_refresh_halted_cache()
+        halt_meta = self._halted_cache.get(agent_id)
+        if halt_meta is not None:
+            raise AgentHaltedError(
                 agent_id,
-                killed_by=kill_meta.get("killed_by"),
-                killed_at=kill_meta.get("killed_at"),
-                reason=kill_meta.get("reason"),
+                halted_by=halt_meta.get("halted_by"),
+                halted_at=halt_meta.get("halted_at"),
+                reason=halt_meta.get("reason"),
             )
 
-    async def _maybe_refresh_killed_cache(self) -> None:
-        """Refresh the killed-agent cache from DB if older than TTL.
+    async def _maybe_refresh_halted_cache(self) -> None:
+        """Refresh the halted-agent cache from DB if older than TTL.
 
         Locked so concurrent callers only trigger one DB query per refresh.
         Best-effort: on DB error, leaves the existing cache in place and
         logs. Never raises (Invariant #1).
         """
         now = time.monotonic()
-        if (now - self._killed_cache_at) < _KILL_CACHE_TTL_SECONDS:
+        if (now - self._halted_cache_at) < _HALT_CACHE_TTL_SECONDS:
             return
-        async with self._killed_lock:
+        async with self._halted_lock:
             # Double-check after acquiring the lock — another coroutine may
             # have refreshed while we were waiting.
             now = time.monotonic()
-            if (now - self._killed_cache_at) < _KILL_CACHE_TTL_SECONDS:
+            if (now - self._halted_cache_at) < _HALT_CACHE_TTL_SECONDS:
                 return
             engine = self._get_engine()
             if engine is None:
                 # No DB configured (in-memory mode for tests). Use the
                 # in-memory _agents dict as the source of truth.
-                self._killed_cache = self._derive_killed_from_memory()
-                self._killed_cache_at = now
+                self._halted_cache = self._derive_halted_from_memory()
+                self._halted_cache_at = now
                 return
             try:
-                fresh = await self._fetch_killed_from_postgres(engine)
+                fresh = await self._fetch_halted_from_postgres(engine)
             except Exception as exc:
                 logger.warning(
-                    "presence.killed_cache_refresh_failed",
+                    "presence.halted_cache_refresh_failed",
                     error_type=type(exc).__name__,
-                    cached_count=len(self._killed_cache),
+                    cached_count=len(self._halted_cache),
                 )
                 # Keep the existing cache. Bump the timestamp so we don't
                 # hammer the DB during an outage; we'll retry next TTL.
-                self._killed_cache_at = now
+                self._halted_cache_at = now
                 return
-            self._killed_cache = fresh
-            self._killed_cache_at = now
+            self._halted_cache = fresh
+            self._halted_cache_at = now
 
-    def _derive_killed_from_memory(self) -> dict[str, dict[str, Any]]:
-        """Extract kill markers from the in-memory _agents fallback."""
+    def _derive_halted_from_memory(self) -> dict[str, dict[str, Any]]:
+        """Extract halt markers from the in-memory _agents fallback.
+
+        Reads BOTH `_halted_*` (v0.6) and `_killed_*` (v0.5.x back-compat)
+        keys. Prefers the new keys when both are present. Back-compat
+        branch removed in v0.7.
+        """
         out: dict[str, dict[str, Any]] = {}
         for aid, data in self._agents.items():
             meta = data.get("metadata") or {}
-            killed_by = meta.get("_killed_by")
-            if killed_by is None:
+            halted_by = meta.get("_halted_by") or meta.get("_killed_by")
+            if halted_by is None:
                 continue
             out[aid] = {
-                "killed_by": killed_by,
-                "killed_at": meta.get("_killed_at"),
-                "reason": meta.get("_kill_reason"),
+                "halted_by": halted_by,
+                "halted_at": meta.get("_halted_at") or meta.get("_killed_at"),
+                "reason": meta.get("_halt_reason") or meta.get("_kill_reason"),
             }
         return out
 
-    async def _fetch_killed_from_postgres(
+    async def _fetch_halted_from_postgres(
         self, engine: Any
     ) -> dict[str, dict[str, Any]]:
-        """Query DB for all currently-killed agents.
+        """Query DB for all currently-halted agents.
 
-        SELECT agent_id + the three kill metadata fields. Filters on
-        metadata_json->>'_killed_by' IS NOT NULL — the marker the console
-        writes in `kill_agent` (app.py:1788-1802).
+        SELECT agent_id + the three halt metadata fields. Reads BOTH key
+        families (``_halted_*`` written by v0.6, ``_killed_*`` written by
+        v0.5.x) via COALESCE so an SDK upgrade without a console upgrade
+        still fails closed. v0.7 drops the COALESCE fallback.
         """
         from sqlalchemy import text
 
@@ -455,31 +469,149 @@ class PresenceModule:
             res = await conn.execute(
                 text(
                     "SELECT agent_id, "
-                    "       metadata_json->>'_killed_by' AS killed_by, "
-                    "       metadata_json->>'_killed_at' AS killed_at, "
-                    "       metadata_json->>'_kill_reason' AS reason "
+                    "       COALESCE(metadata_json->>'_halted_by', "
+                    "                metadata_json->>'_killed_by') AS halted_by, "
+                    "       COALESCE(metadata_json->>'_halted_at', "
+                    "                metadata_json->>'_killed_at') AS halted_at, "
+                    "       COALESCE(metadata_json->>'_halt_reason', "
+                    "                metadata_json->>'_kill_reason') AS reason "
                     "FROM governance_agent_presence "
-                    "WHERE metadata_json->>'_killed_by' IS NOT NULL"
+                    "WHERE metadata_json->>'_halted_by' IS NOT NULL "
+                    "   OR metadata_json->>'_killed_by' IS NOT NULL"
                 )
             )
             rows = list(res.mappings())
         return {
             row["agent_id"]: {
-                "killed_by": row["killed_by"],
-                "killed_at": row["killed_at"],
+                "halted_by": row["halted_by"],
+                "halted_at": row["halted_at"],
                 "reason": row["reason"],
             }
             for row in rows
         }
 
-    async def force_refresh_killed_cache(self) -> None:
-        """Force an immediate refresh of the killed-cache, bypassing TTL.
+    async def force_refresh_halted_cache(self) -> None:
+        """Force an immediate refresh of the halted-cache, bypassing TTL.
 
-        Used by tests and by future LISTEN/NOTIFY-driven invalidation
-        (out of scope for v0.5.4 — that's v0.6 work).
+        Used by tests and by future LISTEN/NOTIFY-driven invalidation.
         """
-        self._killed_cache_at = 0.0
-        await self._maybe_refresh_killed_cache()
+        self._halted_cache_at = 0.0
+        await self._maybe_refresh_halted_cache()
+
+    # ------------------------------------------------------------------
+    # Backward-compat aliases (v0.5.x → v0.6). Removed in v0.7.
+    # ------------------------------------------------------------------
+    #
+    # These keep the old `kill` / `killed` / `alive` vocabulary working
+    # for exactly one release. The goal is that v0.5.x wrappers, tests,
+    # and operator tooling that call `presence.is_killed(...)` or
+    # `presence.assert_alive(...)` continue to work unchanged when the
+    # library is upgraded to v0.6 — they forward directly to the new
+    # halt-named methods. v0.7 deletes these aliases.
+    #
+    # Keeping the aliases as ordinary (non-wrapped) method references
+    # means there is NO runtime warning on every call — a warning fired
+    # on every enforcement check would flood logs in any app that's on
+    # the hot path. The deprecation is announced via CHANGELOG + the
+    # deprecation HTTP header on the /kill route instead.
+
+    async def is_killed(self, agent_id: str) -> bool:
+        """Deprecated alias of :meth:`is_halted`. Removed in v0.7."""
+        return await self.is_halted(agent_id)
+
+    async def assert_alive(self, agent_id: str) -> None:
+        """Deprecated alias of :meth:`assert_not_halted`. Removed in v0.7."""
+        await self.assert_not_halted(agent_id)
+
+    async def force_refresh_killed_cache(self) -> None:
+        """Deprecated alias of :meth:`force_refresh_halted_cache`. Removed in v0.7."""
+        await self.force_refresh_halted_cache()
+
+    async def _maybe_refresh_killed_cache(self) -> None:
+        """Deprecated alias of :meth:`_maybe_refresh_halted_cache`. Removed in v0.7."""
+        await self._maybe_refresh_halted_cache()
+
+    async def _fetch_killed_from_postgres(
+        self, engine: Any
+    ) -> dict[str, dict[str, Any]]:
+        """Deprecated alias of :meth:`_fetch_halted_from_postgres`. Removed in v0.7.
+
+        Returned dicts use the v0.5.x key names (``killed_by`` / ``killed_at``)
+        so tests that assert on the old cache shape keep passing.
+        """
+        fresh = await self._fetch_halted_from_postgres(engine)
+        return {
+            aid: {
+                "killed_by": entry.get("halted_by"),
+                "killed_at": entry.get("halted_at"),
+                "reason": entry.get("reason"),
+            }
+            for aid, entry in fresh.items()
+        }
+
+    def _derive_killed_from_memory(self) -> dict[str, dict[str, Any]]:
+        """Deprecated alias of :meth:`_derive_halted_from_memory`. Removed in v0.7.
+
+        Returned dicts still use the v0.5.x key names (``killed_by`` /
+        ``killed_at``) so tests that compare cache contents against the
+        v0.5.4 schema keep passing.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for aid, entry in self._derive_halted_from_memory().items():
+            out[aid] = {
+                "killed_by": entry.get("halted_by"),
+                "killed_at": entry.get("halted_at"),
+                "reason": entry.get("reason"),
+            }
+        return out
+
+    # Back-compat attribute aliases for the private cache. v0.5.x tests
+    # reach into `presence._killed_cache` / `_killed_cache_at` / `_killed_lock`
+    # — we expose these as @property so they transparently proxy to the
+    # new halt-named attributes. Removed in v0.7.
+
+    @property
+    def _killed_cache(self) -> dict[str, dict[str, Any]]:
+        """Deprecated alias of ``_halted_cache``. Removed in v0.7.
+
+        Returns a view mapped to the v0.5.x key names so legacy tests that
+        assert on ``entry["killed_by"]`` keep working.
+        """
+        return {
+            aid: {
+                "killed_by": entry.get("halted_by"),
+                "killed_at": entry.get("halted_at"),
+                "reason": entry.get("reason"),
+            }
+            for aid, entry in self._halted_cache.items()
+        }
+
+    @_killed_cache.setter
+    def _killed_cache(self, value: dict[str, dict[str, Any]]) -> None:
+        # v0.5.x tests assign dicts keyed by `killed_by`. Translate them
+        # into the v0.6 halt shape on write.
+        translated: dict[str, dict[str, Any]] = {}
+        for aid, entry in (value or {}).items():
+            translated[aid] = {
+                "halted_by": entry.get("halted_by", entry.get("killed_by")),
+                "halted_at": entry.get("halted_at", entry.get("killed_at")),
+                "reason": entry.get("reason"),
+            }
+        self._halted_cache = translated
+
+    @property
+    def _killed_cache_at(self) -> float:
+        """Deprecated alias of ``_halted_cache_at``. Removed in v0.7."""
+        return self._halted_cache_at
+
+    @_killed_cache_at.setter
+    def _killed_cache_at(self, value: float) -> None:
+        self._halted_cache_at = value
+
+    @property
+    def _killed_lock(self) -> asyncio.Lock:
+        """Deprecated alias of ``_halted_lock``. Removed in v0.7."""
+        return self._halted_lock
 
     async def close(self) -> None:
         """Release resources. Disposes the engine only if this module owns it."""

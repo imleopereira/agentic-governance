@@ -439,3 +439,38 @@ async def test_revoke_session_emits_pipeline_session_revoked_audit(
     # Operator id is pseudonymized, not leaked raw.
     assert logged[0].metadata["revoked_by"] != "operator-42"
     assert len(logged[0].metadata["revoked_by"]) == 16
+
+
+# ---------- DA Wave 4 BLOCKER 2: typed scope list fields on PolicyRow ----
+
+def test_policy_row_accepts_allowed_tools_list() -> None:
+    """PolicyRow must accept list[str] on the typed top-level attributes."""
+    from codeatelier_governance.console.models.responses import PolicyRow
+
+    row = PolicyRow(
+        agent_id="a",
+        policy_type="scope",
+        policy={},
+        allowed_tools=["tool_a", "tool_b"],
+        hidden_tools=None,
+        allowed_apis=["https://example.com"],
+        allowed_models=["gpt-4"],
+    )
+    dumped = row.model_dump()
+    assert dumped["allowed_tools"] == ["tool_a", "tool_b"]
+    assert dumped["allowed_apis"] == ["https://example.com"]
+    assert dumped["allowed_models"] == ["gpt-4"]
+
+
+def test_policy_row_rejects_list_in_policy_dict() -> None:
+    """The `policy` dict MUST remain scalar-only (MetadataValue)."""
+    from pydantic import ValidationError
+
+    from codeatelier_governance.console.models.responses import PolicyRow
+
+    with pytest.raises(ValidationError):
+        PolicyRow(
+            agent_id="a",
+            policy_type="scope",
+            policy={"bad": ["shouldnt_be_here"]},  # type: ignore[dict-item]
+        )

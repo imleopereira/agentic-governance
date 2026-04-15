@@ -1,22 +1,31 @@
 "use client";
 
 /**
- * DrillPanel — slide-over dialog with focus trap and tab navigation.
+ * DrillPanel — non-modal slide-over aside for a single agent.
  *
- * PRD §6.2:
- *  - role="dialog" + aria-modal="true"
- *  - Focus trap: Tab/Shift-Tab cycle within panel
- *  - Escape closes
- *  - Focus restoration via triggerRef on close
- *  - Tabs: Trail / Scope / Budget / Sessions / Contracts (NO Delegation)
- *  - Halt button disabled with v0.6 tooltip
- *
- * The focus-trap is ~40 lines, hand-rolled (no focus-trap-react dep).
+ * v0.6 F1 Console Honesty Pass changes:
+ *  - `role="complementary"` + `<aside>` — this is NOT a modal dialog, it's
+ *    a persistent side panel next to the agents list. The previous
+ *    `role="dialog" aria-modal="false"` was a lie to AT (WCAG 1.3.1).
+ *  - Focus trap removed. Non-modal drawers must not trap tab — focus
+ *    should flow naturally back to the list (WCAG 2.1.2 No Keyboard Trap,
+ *    WCAG 2.4.3 Focus Order).
+ *  - Halt button removed. The disabled "Halt (v0.6)" button had no
+ *    accessible explanation for the disabled state (WCAG 4.1.2). The
+ *    halt action ships via F2.5 as a separate wire call.
+ *  - Contracts tab removed from `TABS`. The ContractsPanel file stays
+ *    on disk (not deleted) — it's just unmounted from the drawer.
+ *  - Metric strip shows non-duplicative data: last event timestamp,
+ *    integration mode, chain status. The previous strip duplicated
+ *    columns already shown in AgentsList (WCAG 3.2.4 Consistent
+ *    Identification — don't say the same thing twice with different
+ *    phrasing).
  */
 
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type RefObject,
@@ -25,17 +34,12 @@ import { TrailPanel } from "./drill/TrailPanel";
 import { ScopePanel } from "./drill/ScopePanel";
 import { BudgetPanel } from "./drill/BudgetPanel";
 import { SessionsPanel } from "./drill/SessionsPanel";
-import { ContractsPanel } from "./ContractsPanel";
 import { StatusDot } from "./StatusDot";
-import { useAgent } from "@/hooks/useAgentQueries";
+import { useAgent, useAgentTrail } from "@/hooks/useAgentQueries";
 import { mapAgentStatus } from "@/lib/v4/statusMap";
+import type { AuditEvent } from "@/lib/api";
 
-export type DrillTabId =
-  | "trail"
-  | "scope"
-  | "budget"
-  | "sessions"
-  | "contracts";
+export type DrillTabId = "trail" | "scope" | "budget" | "sessions";
 
 export interface DrillPanelProps {
   agentId: string;
@@ -47,25 +51,42 @@ export interface DrillPanelProps {
   initialTab?: DrillTabId;
 }
 
-const FOCUSABLE_SELECTOR = [
-  "a[href]",
-  "button:not([disabled])",
-  "textarea:not([disabled])",
-  "input:not([disabled])",
-  "select:not([disabled])",
-  '[tabindex]:not([tabindex="-1"])',
-].join(",");
-
-const TABS: ReadonlyArray<{ id: DrillTabId; label: string }> = [
+/** Exported so F1 DrillPanel.test can assert length === 4 (no Contracts). */
+export const TABS: ReadonlyArray<{ id: DrillTabId; label: string }> = [
   { id: "trail", label: "Trail" },
   { id: "scope", label: "Scope" },
   { id: "budget", label: "Budget" },
   { id: "sessions", label: "Sessions" },
-  { id: "contracts", label: "Contracts" },
 ];
 
-const HALT_TOOLTIP =
-  "Halt API pending — requires operator token model, self-approval prevention, and signed audit write. Target: v0.6.";
+function formatEventTime(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toISOString().slice(11, 19);
+}
+
+function inferIntegrationMode(event: AuditEvent | undefined): string {
+  if (!event) return "—";
+  const kind = event.kind;
+  if (kind.startsWith("llm.")) return "wrap_llm";
+  if (kind.startsWith("chain.")) return "langchain";
+  if (kind.startsWith("routing.")) return "routing";
+  if (kind.startsWith("tool.")) return "tool";
+  return "manual";
+}
+
+function inferChainStatus(event: AuditEvent | undefined): {
+  label: string;
+  ok: boolean;
+} {
+  if (!event) return { label: "—", ok: true };
+  if (event.kind === "chain.degraded_start")
+    return { label: "degraded", ok: false };
+  return event.hmac_value
+    ? { label: "verified", ok: true }
+    : { label: "unverified", ok: false };
+}
 
 export function DrillPanel({
   agentId,
@@ -75,62 +96,50 @@ export function DrillPanel({
   initialTab = "trail",
 }: DrillPanelProps) {
   const [tab, setTab] = useState<DrillTabId>(initialTab);
-  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const asideRef = useRef<HTMLElement | null>(null);
   const { data: agent } = useAgent(open ? agentId : null);
+  const { data: trail } = useAgentTrail(open ? agentId : null, 1);
 
-  // Focus management: on open, move focus inside; on close, restore to trigger.
+  const latestEvent = trail?.[0];
+  const integrationMode = useMemo(
+    () => inferIntegrationMode(latestEvent),
+    [latestEvent],
+  );
+  const chainStatus = useMemo(
+    () => inferChainStatus(latestEvent),
+    [latestEvent],
+  );
+  const lastEventTs = useMemo(
+    () => formatEventTime(latestEvent?.created_at),
+    [latestEvent],
+  );
+
+  // On open, move focus into the aside so keyboard users land inside
+  // the newly-rendered panel. On close, restore focus to the trigger.
+  // NO focus trap — Tab flows back to the list naturally.
   useEffect(() => {
     if (!open) return;
-    const dialog = dialogRef.current;
-    if (!dialog) return;
-
-    const focusables = dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-    const first = focusables[0];
-    if (first) {
-      first.focus();
-    } else {
-      dialog.focus();
-    }
-
+    const aside = asideRef.current;
+    if (!aside) return;
+    const first = aside.querySelector<HTMLElement>(
+      'a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    if (first) first.focus();
+    else aside.focus();
     const restoreTarget = triggerRef?.current ?? null;
     return () => {
       if (restoreTarget && typeof restoreTarget.focus === "function") {
         restoreTarget.focus();
       }
     };
-    // DA M1: include `tab` so when the operator switches tabs the
-    // focusable-element list is requeried and focus re-enters the new
-    // tabpanel content. Without this, focus stays on stale DOM nodes
-    // from the previously-mounted tab.
   }, [open, tab, triggerRef]);
 
-  // Keydown handler: Escape closes, Tab cycles focus within dialog.
+  // Escape closes. NO Tab cycling — this is a non-modal drawer.
   const onKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLDivElement>) => {
+    (e: React.KeyboardEvent<HTMLElement>) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();
-        return;
-      }
-      if (e.key !== "Tab") return;
-      const dialog = dialogRef.current;
-      if (!dialog) return;
-      const focusables = Array.from(
-        dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR),
-      ).filter((el) => !el.hasAttribute("disabled"));
-      if (focusables.length === 0) {
-        e.preventDefault();
-        return;
-      }
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
       }
     },
     [onClose],
@@ -138,18 +147,10 @@ export function DrillPanel({
 
   if (!open) return null;
 
-  // FIX 1: DrillPanel is no longer a fullscreen modal. It is a normal
-  // flex child that fills its parent aside (rendered by the parallel
-  // `@drill` slot in `(v4)/agents/layout.tsx`). No backdrop, no
-  // position:fixed — the list stays visible to the left. `role="dialog"`
-  // is retained for semantic parity with the previous slide-over; the
-  // route itself is the "open" state, so there is no backdrop click
-  // handler either. Close via the explicit button or the Escape key.
   return (
-    <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="false"
+    <aside
+      ref={asideRef}
+      role="complementary"
       aria-label={agentId}
       tabIndex={-1}
       onKeyDown={onKeyDown}
@@ -173,142 +174,112 @@ export function DrillPanel({
           >
             {agentId}
           </h2>
-          {/* FIX 7: surface live status next to the agent id. */}
           {agent && <StatusDot status={mapAgentStatus(agent)} />}
         </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled
-              title={HALT_TOOLTIP}
-              aria-label={HALT_TOOLTIP}
-              className="rounded-md border px-3 py-1 text-xs cursor-not-allowed opacity-50"
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close drill panel"
+            className="rounded-md border px-3 py-1 text-xs"
+            style={{
+              borderColor: "var(--border)",
+              color: "var(--fg)",
+            }}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+
+      {/* Metric strip — non-duplicative of AgentsList columns. */}
+      <div
+        className="grid grid-cols-3 px-5 py-3 border-b"
+        style={{ borderColor: "var(--border)", gap: 12 }}
+      >
+        {[
+          { label: "Last event", value: lastEventTs, danger: false },
+          { label: "Integration", value: integrationMode, danger: false },
+          {
+            label: "Chain",
+            value: chainStatus.label,
+            danger: !chainStatus.ok,
+          },
+        ].map((m) => (
+          <div key={m.label}>
+            <div
+              className="font-mono uppercase"
               style={{
-                borderColor: "var(--border)",
+                fontSize: 9,
+                letterSpacing: "0.1em",
                 color: "var(--text-tertiary)",
               }}
             >
-              Halt (v0.6)
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close drill panel"
-              className="rounded-md border px-3 py-1 text-xs"
+              {m.label}
+            </div>
+            <div
+              className="font-mono"
               style={{
-                borderColor: "var(--border)",
-                color: "var(--fg)",
+                fontSize: 12,
+                marginTop: 2,
+                color: m.danger ? "var(--danger)" : "var(--fg)",
               }}
             >
-              Close
-            </button>
-          </div>
-        </div>
-
-        {/* Metric strip — real PostureAgent fields only */}
-        <div
-          className="grid grid-cols-4 px-5 py-3 border-b"
-          style={{ borderColor: "var(--border)", gap: 12 }}
-        >
-          {[
-            {
-              label: "Spend today",
-              value: agent ? `$${agent.cost.usd_today.toFixed(2)}` : "—",
-              danger: (agent?.cost.exceeded_today ?? 0) > 0,
-            },
-            {
-              label: "Events total",
-              value: agent
-                ? agent.audit.events_total.toLocaleString()
-                : "—",
-              danger: false,
-            },
-            {
-              label: "Violations today",
-              value: agent ? String(agent.scope.violations_today) : "—",
-              danger: (agent?.scope.violations_today ?? 0) > 0,
-            },
-            {
-              label: "Pending approvals",
-              value: agent ? String(agent.gates.pending) : "—",
-              danger: false,
-            },
-          ].map((m) => (
-            <div key={m.label}>
-              <div
-                className="font-mono uppercase"
-                style={{
-                  fontSize: 9,
-                  letterSpacing: "0.1em",
-                  color: "var(--text-tertiary)",
-                }}
-              >
-                {m.label}
-              </div>
-              <div
-                className="font-mono"
-                style={{
-                  fontSize: 12,
-                  marginTop: 2,
-                  color: m.danger ? "var(--danger)" : "var(--fg)",
-                }}
-              >
-                {m.value}
-              </div>
+              {m.value}
             </div>
-          ))}
-        </div>
-
-        {/* Tabs */}
-        <nav
-          role="tablist"
-          aria-label="Agent detail tabs"
-          className="flex gap-1 px-5 border-b"
-          style={{ borderColor: "var(--border)" }}
-        >
-          {TABS.map((t) => {
-            const active = t.id === tab;
-            return (
-              <button
-                key={t.id}
-                type="button"
-                role="tab"
-                aria-selected={active}
-                aria-controls={`drill-tabpanel-${t.id}`}
-                id={`drill-tab-${t.id}`}
-                onClick={() => setTab(t.id)}
-                className="font-sans"
-                style={{
-                  padding: "7px 10px",
-                  fontSize: 11,
-                  fontWeight: 500,
-                  color: active ? "var(--fg)" : "var(--text-tertiary)",
-                  borderBottom: active
-                    ? "2px solid var(--fg)"
-                    : "2px solid transparent",
-                  marginBottom: -1,
-                  background: "transparent",
-                }}
-              >
-                {t.label}
-              </button>
-            );
-          })}
-        </nav>
-
-        {/* Tab content */}
-        <div
-          role="tabpanel"
-          id={`drill-tabpanel-${tab}`}
-          aria-labelledby={`drill-tab-${tab}`}
-          className="p-5"
-        >
-          {tab === "trail" && <TrailPanel agentId={agentId} />}
-          {tab === "scope" && <ScopePanel agentId={agentId} />}
-          {tab === "budget" && <BudgetPanel agentId={agentId} />}
-          {tab === "sessions" && <SessionsPanel agentId={agentId} />}
-          {tab === "contracts" && <ContractsPanel agentId={agentId} />}
+          </div>
+        ))}
       </div>
-    </div>
+
+      {/* Tabs */}
+      <nav
+        role="tablist"
+        aria-label="Agent detail tabs"
+        className="flex gap-1 px-5 border-b"
+        style={{ borderColor: "var(--border)" }}
+      >
+        {TABS.map((t) => {
+          const active = t.id === tab;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              aria-controls={`drill-tabpanel-${t.id}`}
+              id={`drill-tab-${t.id}`}
+              onClick={() => setTab(t.id)}
+              className="font-sans"
+              style={{
+                padding: "7px 10px",
+                fontSize: 11,
+                fontWeight: 500,
+                color: active ? "var(--fg)" : "var(--text-tertiary)",
+                borderBottom: active
+                  ? "2px solid var(--fg)"
+                  : "2px solid transparent",
+                marginBottom: -1,
+                background: "transparent",
+              }}
+            >
+              {t.label}
+            </button>
+          );
+        })}
+      </nav>
+
+      {/* Tab content */}
+      <div
+        role="tabpanel"
+        id={`drill-tabpanel-${tab}`}
+        aria-labelledby={`drill-tab-${tab}`}
+        className="p-5"
+      >
+        {tab === "trail" && <TrailPanel agentId={agentId} />}
+        {tab === "scope" && <ScopePanel agentId={agentId} />}
+        {tab === "budget" && <BudgetPanel agentId={agentId} />}
+        {tab === "sessions" && <SessionsPanel agentId={agentId} />}
+      </div>
+    </aside>
   );
 }

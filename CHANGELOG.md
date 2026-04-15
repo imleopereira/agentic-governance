@@ -28,6 +28,14 @@ closed in this release (CLAUDE.md invariant 2). After upgrading, the
 
 ### Added
 
+- **F2.5 full `kill` → `halt` rename** across SDK, console, and audit.
+  Backward-compat aliases (`KillRequest`, `AgentKilledError`, `is_killed`,
+  `assert_alive`, `force_refresh_killed_cache`, `_killed_cache`,
+  `_KILL_CACHE_TTL_SECONDS`, and the `POST /api/agents/{agent_id}/kill`
+  route) are preserved for v0.6 and **REMOVED in v0.7**. Historic
+  `agent.killed` audit rows stay in the HMAC chain as-is (append-only
+  invariant #2); a SQL view `governance_audit_events_halted` unions
+  both `agent.killed` and `agent.halted` kinds for downstream queries.
 - **F6 Track A — Ed25519 agent identity** with three keystore backends
   (`file://`, `env://`, `ephemeral`), per-row signatures over the HMAC chain,
   append-only key registry and revocation tables, and graceful degradation
@@ -100,6 +108,14 @@ closed in this release (CLAUDE.md invariant 2). After upgrading, the
 
 ### Known limitations
 
+- **F4 `unresolved_fingerprints` is NOT a verification signal in v0.6.**
+  The field is always `[]` on the single-key verifier path and is only
+  populated when `rotation_aware=true` (F6 Track B rotation-aware
+  verifier), which is not wired into the console handlers in this
+  release. An empty list MUST NOT be interpreted as "all keys verified
+  successfully". The new `rotation_aware` boolean on
+  `ComplianceReportView` / `VerifyChainResponse` makes the distinction
+  explicit; wiring the rotation-aware path ships in v0.6.1.
 - 6 v0.6 PRD features remain pending and ship in v0.6.1: F1 console
   honesty pass, F2.5 full `kill`→`halt` rename, F4 compliance console
   surface, F5 HITL approval queue panel, F8 code quality remainder

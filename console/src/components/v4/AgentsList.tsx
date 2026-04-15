@@ -11,6 +11,7 @@
 
 import Link from "next/link";
 import React from "react";
+import { usePathname } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { api, type PostureAgent } from "@/lib/api";
 import { StatusDot } from "@/components/v4/StatusDot";
@@ -19,13 +20,23 @@ import { Skeleton } from "@/components/Skeleton";
 import { sanitizeErrorMessage } from "@/lib/connectionStore";
 import { mapAgentStatus } from "@/lib/v4/statusMap";
 
-const GRID_COLS = "1fr 180px 120px 90px 90px";
+const GRID_COLS_FULL = "1fr 180px 120px 90px 90px";
+// F1 1280px fix: when the drill aside is open the list column is only
+// ~840px wide. Collapse to a single "agent" column (no scope / spend /
+// pending / events echoes) so agent_ids render without ellipsis. The
+// compact row width targets 380px content. `GRID_COLS_FULL` is still
+// used when no drill is open.
+const GRID_COLS_COMPACT = "1fr";
 
 interface AgentRowProps {
   agent: PostureAgent;
+  compact: boolean;
 }
 
-const AgentRow = React.memo(function AgentRow({ agent }: AgentRowProps) {
+const AgentRow = React.memo(function AgentRow({
+  agent,
+  compact,
+}: AgentRowProps) {
   const status = mapAgentStatus(agent);
   const href = `/agents/${encodeURIComponent(agent.agent_id)}`;
   const pendingColor =
@@ -51,7 +62,7 @@ const AgentRow = React.memo(function AgentRow({ agent }: AgentRowProps) {
       aria-label={ariaLabel}
       className="agent-row grid items-center"
       style={{
-        gridTemplateColumns: GRID_COLS,
+        gridTemplateColumns: compact ? GRID_COLS_COMPACT : GRID_COLS_FULL,
         padding: "12px 28px",
         borderBottom: "1px solid var(--border)",
         borderLeft: "3px solid transparent",
@@ -92,6 +103,8 @@ const AgentRow = React.memo(function AgentRow({ agent }: AgentRowProps) {
         </div>
       </div>
 
+      {compact ? null : (
+      <>
       <div className="font-mono" style={{ fontSize: 12 }}>
         <span style={{ color: violationsColor }}>
           {agent.scope.violations_today}
@@ -127,11 +140,22 @@ const AgentRow = React.memo(function AgentRow({ agent }: AgentRowProps) {
       >
         {agent.audit.events_total.toLocaleString()}
       </div>
+      </>
+      )}
     </Link>
   );
 });
 
+// TODO(F1): once Playwright is in devDependencies, add a 1280x800
+// snapshot test at `console/tests/playwright/agents-list-1280.spec.ts`
+// asserting compact mode renders the first 5 agent_ids without ellipsis
+// when the drill drawer is open. Playwright is NOT yet in
+// devDependencies so the snapshot is deferred.
 export default function AgentsList() {
+  const pathname = usePathname();
+  // Drawer-open signal is the URL (see `(v4)/agents/layout.tsx`).
+  const compact = /^\/agents\/[^/]+/.test(pathname ?? "");
+
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["posture"],
     queryFn: () => api.posture(),
@@ -173,17 +197,17 @@ export default function AgentsList() {
               key={i}
               className="grid items-center"
               style={{
-                gridTemplateColumns: GRID_COLS,
+                gridTemplateColumns: compact ? GRID_COLS_COMPACT : GRID_COLS_FULL,
                 padding: "12px 28px",
                 borderBottom: "1px solid var(--border)",
                 gap: 8,
               }}
             >
               <Skeleton className="h-4 w-48" />
-              <Skeleton className="h-3 w-28" />
-              <Skeleton className="h-4 w-16" />
-              <Skeleton className="h-3 w-10" />
-              <Skeleton className="h-3 w-12" />
+              {!compact && <Skeleton className="h-3 w-28" />}
+              {!compact && <Skeleton className="h-4 w-16" />}
+              {!compact && <Skeleton className="h-3 w-10" />}
+              {!compact && <Skeleton className="h-3 w-12" />}
             </div>
           ))}
         </div>
@@ -215,7 +239,7 @@ export default function AgentsList() {
             role="row"
             className="grid items-center font-mono uppercase"
             style={{
-              gridTemplateColumns: GRID_COLS,
+              gridTemplateColumns: compact ? GRID_COLS_COMPACT : GRID_COLS_FULL,
               padding: "8px 28px",
               borderBottom: "1px solid var(--border)",
               fontSize: 10.5,
@@ -224,14 +248,14 @@ export default function AgentsList() {
             }}
           >
             <div>Agent</div>
-            <div>Scope</div>
-            <div>Spend</div>
-            <div style={{ textAlign: "right" }}>Pending</div>
-            <div style={{ textAlign: "right" }}>Events</div>
+            {!compact && <div>Scope</div>}
+            {!compact && <div>Spend</div>}
+            {!compact && <div style={{ textAlign: "right" }}>Pending</div>}
+            {!compact && <div style={{ textAlign: "right" }}>Events</div>}
           </div>
 
           {agents.map((a) => (
-            <AgentRow key={a.agent_id} agent={a} />
+            <AgentRow key={a.agent_id} agent={a} compact={compact} />
           ))}
         </div>
       )}

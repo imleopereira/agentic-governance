@@ -37,9 +37,12 @@ const TONE: Record<
 
 export function InfoBox({ tone = "info", children, title }: InfoBoxProps) {
   const t = TONE[tone];
+  // WCAG 4.1.3: danger-tone info boxes are alerts and must be
+  // announced immediately; info/warn stay as passive `note` landmarks.
+  const role = tone === "danger" ? "alert" : "note";
   return (
     <div
-      role="note"
+      role={role}
       className="flex gap-2 rounded-md border p-3 text-xs"
       style={{
         background: t.bg,

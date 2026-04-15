@@ -351,9 +351,10 @@ class GovernanceSDK:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
             )
-            # v0.5.4 kill switch wiring: scope.check() will fail-closed
-            # with AgentKilledError when an operator clicks "Kill" in the
-            # console. Setter is no-op if scope is also disabled.
+            # v0.5.4 halt switch wiring (renamed from "kill" in v0.6):
+            # scope.check() will fail-closed with AgentHaltedError when an
+            # operator clicks "Halt" in the console. Setter is no-op if
+            # scope is also disabled.
             if hasattr(self, "scope") and hasattr(self.scope, "set_presence_module"):
                 self.scope.set_presence_module(self.presence)
         else:

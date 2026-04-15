@@ -294,35 +294,118 @@ class ReportGenerator:
             "date_end": date_end,
         }
 
-    async def _run_chain_verification(self) -> ChainIntegrityStatus:
+    # DA blocker fix (F4): verify_chain is O(n). Running it over an
+    # Article-12 retention history (6 months of events) times out and
+    # creates a DoS vector. We window-limit to the most recent
+    # ``_CHAIN_VERIFY_WINDOW`` events by default.
+    _CHAIN_VERIFY_WINDOW: int = 1000
+
+    async def _run_chain_verification(
+        self,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+    ) -> tuple[ChainIntegrityStatus, int | None, int | None]:
         """Run HMAC chain verification via the audit module and return the status string.
 
-        Returns one of the :class:`ChainIntegrityStatus` literals:
+        Returns a tuple ``(status, verified_from_seq, verified_to_seq)``.
+        ``status`` is one of :class:`ChainIntegrityStatus` literals:
         ``"verified"`` — chain checked and passed.
         ``"failed"`` — chain checked and found a broken or missing link.
+        ``"unverified"`` — chain check skipped or errored.
 
         Never raises — errors are logged and mapped to ``"unverified"``.
         Callers must ensure ``self._audit_module`` is not None before calling;
         both ``generate_article12`` and ``generate_summary`` enforce this via
         an early ``ValueError`` guard.
+
+        Window behavior: when ``from_seq``/``to_seq`` are not provided the
+        verification scope is capped at the most recent
+        ``_CHAIN_VERIFY_WINDOW`` events to prevent O(n) timeouts on long
+        retention histories (DA blocker fix).
         """
         assert self._audit_module is not None  # enforced by callers
+        # Default the window to the last _CHAIN_VERIFY_WINDOW events.
+        if from_seq is None and to_seq is None:
+            try:
+                head_candidate = await self._current_chain_head()
+            except Exception:  # noqa: BLE001 — defensive
+                head_candidate = None
+            if head_candidate is not None and head_candidate >= 0:
+                window = self._CHAIN_VERIFY_WINDOW
+                # head_candidate is the 0-based index of the last event.
+                # Inclusive window: (head - 999) .. head spans 1000 events.
+                from_seq = max(0, head_candidate - (window - 1))
+                to_seq = head_candidate
         try:
-            await self._audit_module.verify_chain()
-            return "verified"
+            await self._audit_module.verify_chain(
+                from_seq=from_seq,
+                to_seq=to_seq,
+            )
+            return ("verified", from_seq, to_seq)
         except ChainIntegrityError as exc:
             logger.warning(
                 "compliance.report.chain_integrity_failed",
                 error=str(exc),
             )
-            return "failed"
+            return ("failed", from_seq, to_seq)
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "compliance.report.chain_verify_error",
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
-            return "unverified"
+            return ("unverified", from_seq, to_seq)
+
+    async def run_chain_verification_windowed(
+        self,
+        *,
+        from_seq: int | None = None,
+        to_seq: int | None = None,
+    ) -> tuple[ChainIntegrityStatus, int | None, int | None]:
+        """Public wrapper around :meth:`_run_chain_verification`.
+
+        Used by the F4 console endpoints to run a windowed HMAC chain
+        verification on demand (``POST /api/compliance/verify-chain``)
+        and to expose the verified window on Article 12 reports.
+        """
+        return await self._run_chain_verification(
+            from_seq=from_seq, to_seq=to_seq
+        )
+
+    async def _current_chain_head(self) -> int | None:
+        """Return the 0-based index of the last event available to verify.
+
+        For the in-memory store this is ``len(events) - 1`` across all
+        sessions. For Postgres, this is ``COUNT(*) - 1``.  Returns ``None``
+        when no events are available.
+        """
+        # In-memory path
+        if self._audit_store is not None:
+            store = self._audit_store
+            if hasattr(store, "_events"):
+                total = len(store._events)  # type: ignore[attr-defined]
+                return (total - 1) if total > 0 else None
+            return None
+        # Postgres path
+        if self._database_url:
+            from sqlalchemy import text
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            engine = create_async_engine(self._database_url)
+            try:
+                async with engine.connect() as conn:
+                    res = await conn.execute(
+                        text("SELECT COUNT(*) FROM governance_audit_events")
+                    )
+                    row = res.first()
+                    if row is None:
+                        return None
+                    total = int(row[0])
+                    return (total - 1) if total > 0 else None
+            finally:
+                await engine.dispose()
+        return None
 
     def _build_article12_sections(
         self, data: dict[str, Any],
@@ -419,11 +502,19 @@ class ReportGenerator:
             agent_id=agent_id,
         )
 
-        chain_integrity_status: ChainIntegrityStatus = (
-            await self._run_chain_verification() if verify_chain else "unverified"
-        )
+        if verify_chain:
+            chain_integrity_status, _cv_from, _cv_to = (
+                await self._run_chain_verification()
+            )
+        else:
+            chain_integrity_status = "unverified"
+            _cv_from = None
+            _cv_to = None
 
         now = datetime.now(timezone.utc)
+        # DA Wave 4 blocker fix (F4): persist the verified window on the
+        # report so the console handler does not have to re-run verify_chain
+        # a second time just to recover from_seq/to_seq.
         session_id_list: list[UUID] = []
         if session_ids:
             session_id_list = list(session_ids)
@@ -464,6 +555,8 @@ class ReportGenerator:
             time_range_start=time_range_start,
             time_range_end=time_range_end,
             chain_integrity_status=chain_integrity_status,
+            chain_verified_from_seq=_cv_from,
+            chain_verified_to_seq=_cv_to,
             coverage_caveat=COVERAGE_CAVEAT,
             coverage_pct=coverage_pct,
             coverage_pct_reason=coverage_reason,
@@ -512,9 +605,14 @@ class ReportGenerator:
         coverage_pct, coverage_reason = await self._coverage.compute(
             agent_id=agent_id,
         )
-        chain_integrity_status: ChainIntegrityStatus = (
-            await self._run_chain_verification() if verify_chain else "unverified"
-        )
+        if verify_chain:
+            chain_integrity_status, _cv_from, _cv_to = (
+                await self._run_chain_verification()
+            )
+        else:
+            chain_integrity_status = "unverified"
+            _cv_from = None
+            _cv_to = None
         total_violations = (
             data["scope_violations"]
             + data["budget_violations"]
@@ -604,6 +702,8 @@ class ReportGenerator:
             time_range_start=summary_time_start,
             time_range_end=summary_time_end,
             chain_integrity_status=chain_integrity_status,
+            chain_verified_from_seq=_cv_from,
+            chain_verified_to_seq=_cv_to,
             coverage_caveat=COVERAGE_CAVEAT,
             coverage_pct=coverage_pct,
             coverage_pct_reason=coverage_reason,
