@@ -83,6 +83,8 @@ from __future__ import annotations
 
 import hmac
 import re
+import unicodedata
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any
 
@@ -146,15 +148,30 @@ _REQUIRED_FIELDS: frozenset[str] = frozenset(
     {"kind", "ref_chain_seq_start", "ref_chain_seq_end", "reason", "operator_id"}
 )
 
-# All patterns are case-insensitive and matched against the note field.
+# All patterns are case-insensitive and matched against the note field
+# AFTER NFKC normalization (which defeats homoglyph / compatibility-form
+# evasion). Patterns cover both canonical and adversarially-permuted shapes
+# a motivated attacker might use to smuggle infra topology through the
+# allowlist. See the threat model in the module docstring.
 FORBIDDEN_NOTE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Absolute filesystem paths
+    # Absolute filesystem paths (POSIX)
     re.compile(r"/Users/", re.IGNORECASE),
     re.compile(r"/srv/", re.IGNORECASE),
     re.compile(r"(?:^|[^A-Za-z0-9])/?home/", re.IGNORECASE),
     re.compile(r"/var/", re.IGNORECASE),
     re.compile(r"/tmp/", re.IGNORECASE),
     re.compile(r"/opt/", re.IGNORECASE),
+    # URL-encoded path prefixes (%2F = /, %5C = \). An attacker who pipes
+    # a percent-encoded path through the correction form would otherwise
+    # bypass every literal ``/Users/`` style regex above.
+    re.compile(r"%2[Ff](?:Users|srv|home|var|tmp|opt)%2[Ff]", re.IGNORECASE),
+    re.compile(r"%5[Cc]", re.IGNORECASE),
+    # Windows absolute paths: ``C:\...``, ``D:\...``, UNC ``\\server\share``.
+    # The earlier ``.py\b`` / ``.sh\b`` rules caught only a Windows file
+    # suffix — a bare ``C:\srv\governance\x`` with no known extension
+    # slipped through. Match any drive-letter + backslash prefix or UNC.
+    re.compile(r"\b[A-Za-z]:\\"),
+    re.compile(r"\\\\[A-Za-z0-9._-]+\\"),
     # Source / script file extensions
     re.compile(r"\.py\b", re.IGNORECASE),
     re.compile(r"\.sh\b", re.IGNORECASE),
@@ -163,27 +180,42 @@ FORBIDDEN_NOTE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bcron(?:job)?\b", re.IGNORECASE),
     re.compile(r"\bbranch\b", re.IGNORECASE),
     re.compile(r"console-redesign", re.IGNORECASE),
-    # Raw git SHAs: 7+ hex chars as a standalone token. A ``sha256-<hex>``
-    # hashed token produced by ``hash_commit_sha`` is the sanctioned
-    # provenance format and is excluded via the ``(?<!<WB>sha256-)`` guard,
-    # where ``<WB>`` means a word boundary or start-of-string before
-    # ``sha256-``. The earlier ``(?<!sha256-)`` look-behind was too loose:
-    # ``xsha256-deadbeef`` satisfied it because ``x`` does not break the
-    # fixed-width look-behind, which meant a raw SHA glued onto a harmless
-    # prefix slipped through. The stricter form below requires the literal
-    # ``sha256-`` to start at a word boundary (or at the beginning of the
-    # note), matching the exact output format of ``hash_commit_sha`` and
-    # nothing else.
+    # Bare internal hostnames: ``ops-01``, ``db-primary``, ``web-3`` — the
+    # naming scheme used across our production inventory. Matches a short
+    # role prefix followed by a dash and 1-3 digits, anchored on word
+    # boundaries. Legitimate notes never need these tokens; raw hostnames
+    # in the audit surface are exactly the infra leak the allowlist blocks.
+    re.compile(r"\b(?:ops|db|web|api|gw|lb)-\d{1,3}\b", re.IGNORECASE),
+    # Raw git SHAs: 7+ hex chars as a standalone token. The sanctioned
+    # ``sha256-<hex>`` hashed token produced by ``hash_commit_sha`` is
+    # excluded via a word-boundary-anchored look-behind, case-insensitive
+    # so ``SHA256-<hex>`` is ALSO treated as sanctioned (previously the
+    # exemption was case-sensitive, meaning an uppercase hashed token
+    # would false-reject). The outer ``x`` prefix bypass is still blocked
+    # because ``sha256-`` must sit at a word boundary.
     re.compile(
         r"(?<![0-9a-fA-F])"
         r"(?<!(?:^|\b)sha256-)"
+        r"(?<!(?:^|\b)SHA256-)"
         r"[0-9a-fA-F]{7,40}"
         r"(?![0-9a-fA-F])"
     ),
     # IPv4 addresses
+    re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    # IPv6 addresses — any token with at least one ``::`` or two colon
+    # separators and hex groups. Intentionally loose: a false positive on
+    # a legitimate note is cheap (rewrite without colons); a false negative
+    # leaks network topology. Covers link-local (``fe80::1``), doc range
+    # (``2001:db8::5``), and compressed forms.
     re.compile(
-        r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
+        r"\b(?:[0-9a-fA-F]{1,4}:){3,}[0-9a-fA-F]{0,4}\b"
     ),
+    re.compile(r"::[0-9a-fA-F]{1,4}"),
+    # CRLF injection: log-line splitting into auxiliary fields is a known
+    # audit-forwarder exploit. No legitimate correction note spans lines.
+    re.compile(r"[\r\n]"),
+    # Null byte: string-termination bugs downstream + C-layer splitting.
+    re.compile(r"\x00"),
     # HTML tags (XSS defense-in-depth)
     re.compile(r"<[^>]+>"),
 )
@@ -323,18 +355,88 @@ def _validate_note(payload: dict[str, Any]) -> str:
             reason=f"over_{NOTE_MAX_CHARS}_chars",
             operator_hint=f"Truncate note to <= {NOTE_MAX_CHARS} characters.",
         )
+    # NFKC-normalize before scanning so compatibility-form homoglyph
+    # evasion (e.g. a full-width ``/`` U+FF0F that renders identical to
+    # ASCII ``/``) collapses to the canonical form the patterns expect.
+    # The scanned string is a local copy; the stored note is the original
+    # operator input so downstream rendering is unchanged.
+    scan_target = unicodedata.normalize("NFKC", note)
     for pattern in FORBIDDEN_NOTE_PATTERNS:
-        if pattern.search(note):
+        if pattern.search(scan_target):
             raise CorrectionValidationError(
                 field="note",
                 reason=f"forbidden_pattern:{pattern.pattern}",
                 operator_hint=(
-                    "Remove filesystem paths, source file names, cron/branch "
-                    "references, raw git SHAs, IP addresses, and HTML tags. "
-                    "Use hash_commit_sha() for commit references."
+                    "Remove filesystem paths (POSIX, Windows, URL-encoded), "
+                    "source file names, cron/branch references, raw git SHAs, "
+                    "IP addresses (v4/v6), internal hostnames, CRLF or null "
+                    "bytes, and HTML tags. Use hash_commit_sha() for commit "
+                    "references."
                 ),
             )
     return note
+
+
+def _validate_created_at(value: Any) -> datetime:
+    """Validate the optional ``created_at`` field.
+
+    Accepts only:
+        * timezone-aware ``datetime`` (naive datetimes are rejected so a
+          stray localtime never leaks onto the audit surface)
+        * ISO-8601 string parseable by ``datetime.fromisoformat`` — a
+          trailing ``Z`` is normalized to ``+00:00`` so standard UTC
+          representations round-trip cleanly.
+
+    Anything else (``int``, ``dict``, ``None``, SQL-ish string, etc.)
+    is rejected with a ``CorrectionValidationError``. This closes the
+    raw-passthrough hole where an attacker could set ``created_at`` to
+    an arbitrary object and have it carry through to the audit table
+    without any type check.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+            raise CorrectionValidationError(
+                field="created_at",
+                reason="naive_datetime",
+                operator_hint=(
+                    "created_at must be timezone-aware. Use "
+                    "datetime.now(timezone.utc) or an ISO-8601 UTC string."
+                ),
+            )
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        candidate = value.strip()
+        if candidate.endswith("Z"):
+            candidate = candidate[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError as exc:
+            raise CorrectionValidationError(
+                field="created_at",
+                reason="invalid_iso8601",
+                operator_hint=(
+                    "created_at must be an ISO-8601 UTC string "
+                    "(e.g. '2026-04-15T12:00:00Z')."
+                ),
+            ) from exc
+        if parsed.tzinfo is None:
+            raise CorrectionValidationError(
+                field="created_at",
+                reason="naive_datetime",
+                operator_hint=(
+                    "created_at string must include a timezone offset "
+                    "(e.g. trailing 'Z' or '+00:00')."
+                ),
+            )
+        return parsed.astimezone(timezone.utc)
+    raise CorrectionValidationError(
+        field="created_at",
+        reason="invalid_type",
+        operator_hint=(
+            "created_at must be a timezone-aware datetime or an ISO-8601 "
+            "UTC string; got type " + type(value).__name__ + "."
+        ),
+    )
 
 
 def validate_correction_payload(
@@ -418,7 +520,7 @@ def validate_correction_payload(
         "note": note,
     }
     if "created_at" in payload:
-        sanitized["created_at"] = payload["created_at"]
+        sanitized["created_at"] = _validate_created_at(payload["created_at"])
     return sanitized
 
 

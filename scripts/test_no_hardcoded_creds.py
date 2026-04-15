@@ -123,6 +123,15 @@ def _git_tracked_files() -> list[pathlib.Path]:
     Using git as the source of truth means gitignored agent-scratch files
     (under ``scripts/automation/``, etc.) are never scanned. If git isn't
     available we fall back to a filesystem walk.
+
+    **Scope limitation:** only *tracked* files are scanned. Files in the
+    working tree that have not yet been ``git add``'d are invisible to
+    this guard. If you are adding a new file with a credential pattern,
+    either run the guard *after* staging (``git add FILE && python
+    scripts/test_no_hardcoded_creds.py``) or rely on the pytest wrapper
+    ``tests/test_scripts_no_hardcoded_creds.py`` which runs on every
+    ``pytest`` invocation once the file is staged. The intent is that
+    commit hooks and CI re-run the guard after ``git add``.
     """
     try:
         out = subprocess.run(

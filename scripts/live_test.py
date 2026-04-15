@@ -37,14 +37,26 @@ BOLD = "\033[1m"
 
 
 def _redact_db_url(url: str) -> str:
-    """Return a log-safe form of a DB URL: scheme://<redacted>@host:port/db."""
+    """Return a log-safe form of a DB URL: scheme://<redacted>@host:port/db.
+
+    Raises only on unexpected internal failures — a catch-all ``except
+    Exception`` here would mask real bugs (e.g. a stacktrace leak hidden
+    behind ``repr``). ``urlparse`` itself raises ``ValueError`` on a few
+    malformed inputs; anything else escapes as a real bug. The port
+    attribute can raise ``ValueError`` on an out-of-range port (e.g.
+    ``host:99999``), which is narrowed below.
+    """
     try:
         parsed = urlparse(url)
         host = parsed.hostname or "<host>"
-        port = f":{parsed.port}" if parsed.port else ""
+        try:
+            port = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            port = ""
         db = parsed.path or ""
-        return f"{parsed.scheme}://<redacted>@{host}{port}{db}"
-    except Exception:
+        scheme = parsed.scheme or "<scheme>"
+        return f"{scheme}://<redacted>@{host}{port}{db}"
+    except ValueError:
         return "<unparseable-db-url>"
 
 
@@ -454,6 +466,10 @@ async def run_all_tests() -> None:
 
 if __name__ == "__main__":
     if not os.environ.get("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY env var required")
-        sys.exit(1)
+        sys.stderr.write(
+            f"{RED}FATAL{RESET}: OPENAI_API_KEY is not set. The live test suite "
+            "exercises a real OpenAI round-trip and will not run without it. "
+            "See README.md section 'Running the live test suite'.\n"
+        )
+        sys.exit(2)
     asyncio.run(run_all_tests())

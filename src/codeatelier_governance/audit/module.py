@@ -124,11 +124,18 @@ class AuditModule:
         # additional ``chain.degraded_start`` event so the discontinuity is
         # visible to auditors.
         self._degraded_starts: set[UUID] = set()
-        # Sentinel for the audit-correction second-layer guard. Set by
-        # ``log_validated_correction`` to the ``id()`` of the event it just
-        # constructed; cleared immediately after the call. Any other caller
-        # that reaches ``log`` with ``kind='audit.correction'`` is refused.
-        self._sanctioned_correction_event_id: int | None = None
+        # Sanctioned-event registry for the audit-correction second-layer
+        # guard. ``log_validated_correction`` adds ``id(event)`` to this set
+        # before awaiting ``log(event)`` and discards it in a ``finally``.
+        # Using a set (rather than a single-slot sentinel) lets multiple
+        # sanctioned calls run concurrently on the same AuditModule without
+        # false-denying each other: each call tracks its own event. Set
+        # mutations (``add``/``discard``/``in``) are atomic in CPython, so
+        # no lock is needed around them. The event object is held in the
+        # local frame of ``log_validated_correction`` for the full duration
+        # of the inner ``log()`` call, so CPython cannot GC-and-reuse its
+        # id while the check runs — the membership test is race-safe.
+        self._sanctioned_correction_event_ids: set[int] = set()
 
     def subscribe(
         self,
@@ -216,28 +223,42 @@ class AuditModule:
             kind=sanitized["kind"],
             metadata=metadata,
         )
-        # Mark the event as sanctioned so the guard in ``log`` lets it
-        # through. The flag is cleared immediately after the call returns
-        # so a stray subsequent ``log(AuditEvent(kind='audit.correction'))``
-        # still raises.
-        self._sanctioned_correction_event_id = id(event)
+        # Mark this specific event as sanctioned so the guard in ``log``
+        # lets it through. Concurrent sanctioned calls each register their
+        # own event id; the finally removes only this call's id, so a
+        # parallel sanctioned call is never false-denied. A subsequent
+        # direct ``log(AuditEvent(kind='audit.correction'))`` still raises
+        # because its id is not in the set.
+        sanctioned_id = id(event)
+        self._sanctioned_correction_event_ids.add(sanctioned_id)
         try:
             return await self.log(event)
         finally:
-            self._sanctioned_correction_event_id = None
+            self._sanctioned_correction_event_ids.discard(sanctioned_id)
 
     async def log(self, event: AuditEvent) -> AuditEventRecord:
         """Log an audit event. Returns the stored record with chain fields.
 
-        **Non-breaking guarantee:** this method NEVER raises. Audit is an
-        observation surface, not an enforcement gate — if our internal
-        storage is on fire, the host application call must continue. On
-        catastrophic failure (both primary and fallback unreachable, or any
-        unexpected internal exception) we log a critical-level message and
-        return a placeholder record with ``hmac="0"*64`` and a
-        ``metadata["audit.unavailable"] = True`` flag so the caller can
-        detect the degraded state if they care to. The host call always
-        gets a record back.
+        **Non-breaking guarantee:** this method never raises on storage
+        failure. Audit is an observation surface, not an enforcement gate —
+        if our internal storage is on fire, the host application call must
+        continue. On catastrophic failure (both primary and fallback
+        unreachable, or any unexpected internal exception) we log a
+        critical-level message and return a placeholder record with
+        ``hmac="0"*64`` and a ``metadata["audit.unavailable"] = True`` flag
+        so the caller can detect the degraded state if they care to. The
+        host call always gets a record back.
+
+        **Exception — reserved event kinds:** ``log()`` raises
+        ``RuntimeError`` when ``event.kind`` is in the reserved set
+        (currently ``{"audit.correction"}``). These event kinds must be
+        written through :meth:`log_validated_correction`, which routes the
+        payload through :func:`codeatelier_governance.audit.corrections.validate_correction_payload`
+        and its field/reason/pattern allowlist. Calling ``log()`` directly
+        with a reserved kind is a misuse bug, not a storage failure, and
+        the raise is deliberate — the contract is "observation always
+        succeeds, but reserved kinds are not observation." See the
+        ``corrections`` module docstring for the full rationale.
 
         Chain construction is atomic with the insert via the store's
         ``insert_with_chain_lock`` method — under PostgresAuditStore this is
@@ -258,9 +279,9 @@ class AuditModule:
         # and tries to bypass the field / reason / pattern allowlist.
         from . import corrections as _corrections
 
-        if event.kind in _corrections.PERMITTED_KINDS and (
-            self._sanctioned_correction_event_id is None
-            or self._sanctioned_correction_event_id != id(event)
+        if (
+            event.kind in _corrections.PERMITTED_KINDS
+            and id(event) not in self._sanctioned_correction_event_ids
         ):
             raise RuntimeError(
                 "audit.correction events must go through "

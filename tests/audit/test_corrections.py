@@ -5,7 +5,9 @@ Each test here maps back to one cell in the threat matrix in that docstring.
 """
 from __future__ import annotations
 
+import asyncio
 import secrets
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -435,3 +437,179 @@ async def test_log_validated_correction_rejects_unsanitized_kind(
         await audit.log_validated_correction(  # type: ignore[attr-defined]
             {"kind": "system.override"}, _HMAC_KEY
         )
+
+
+# ---------------------------------------------------------------------------
+# P0-1 — Concurrent sanctioned corrections (race on the sanctioned-id guard)
+# ---------------------------------------------------------------------------
+async def test_concurrent_sanctioned_corrections_no_false_deny(
+    audit: object,
+) -> None:
+    """10 parallel log_validated_correction calls must all succeed.
+
+    The earlier single-slot sentinel (``_sanctioned_correction_event_id``)
+    could be stomped by a racing coroutine: call-A set id(eventA), call-B
+    overwrote it with id(eventB), then call-A's ``log()`` guard saw the
+    wrong id and raised RuntimeError. Fixed by tracking sanctioned ids in
+    a ``set[int]`` that each call adds to / discards from independently.
+    """
+    sanitized = validate_correction_payload(_base_payload(), _HMAC_KEY)
+    coros = [
+        audit.log_validated_correction(dict(sanitized), _HMAC_KEY)  # type: ignore[attr-defined]
+        for _ in range(10)
+    ]
+    records = await asyncio.gather(*coros)
+    assert len(records) == 10
+    for record in records:
+        assert record.kind == "audit.correction"
+        assert record.metadata["reason"] == "operator_marked_erroneous"
+
+
+async def test_concurrent_direct_log_still_rejected_during_sanctioned_call(
+    audit: object,
+) -> None:
+    """A direct ``log(AuditEvent(kind='audit.correction'))`` racing with a
+    sanctioned call must still raise, and the sanctioned call must still
+    succeed. Demonstrates the two-call paths do not interfere.
+    """
+    from codeatelier_governance.audit.models import AuditEvent
+
+    sanitized = validate_correction_payload(_base_payload(), _HMAC_KEY)
+    sneaky_event = AuditEvent(
+        agent_id="sneaky",
+        kind="audit.correction",
+        metadata={"note": "bypass attempt"},
+    )
+
+    async def direct_bad() -> str:
+        with pytest.raises(RuntimeError, match="log_validated_correction"):
+            await audit.log(sneaky_event)  # type: ignore[attr-defined]
+        return "rejected"
+
+    async def sanctioned_good() -> object:
+        return await audit.log_validated_correction(  # type: ignore[attr-defined]
+            dict(sanitized), _HMAC_KEY
+        )
+
+    direct_result, sanctioned_record = await asyncio.gather(
+        direct_bad(), sanctioned_good()
+    )
+    assert direct_result == "rejected"
+    assert sanctioned_record.kind == "audit.correction"  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# P0-2 — created_at must be type-validated, not passthrough
+# ---------------------------------------------------------------------------
+def test_created_at_utc_datetime_accepted() -> None:
+    when = datetime(2026, 4, 14, 12, 0, 0, tzinfo=timezone.utc)
+    out = validate_correction_payload(
+        {**_base_payload(), "created_at": when}, _HMAC_KEY
+    )
+    assert isinstance(out["created_at"], datetime)
+    assert out["created_at"].tzinfo is not None
+    assert out["created_at"] == when
+
+
+def test_created_at_iso8601_z_string_accepted() -> None:
+    out = validate_correction_payload(
+        {**_base_payload(), "created_at": "2026-04-14T12:00:00Z"}, _HMAC_KEY
+    )
+    assert isinstance(out["created_at"], datetime)
+    assert out["created_at"].tzinfo is not None
+
+
+def test_created_at_iso8601_offset_string_accepted() -> None:
+    out = validate_correction_payload(
+        {**_base_payload(), "created_at": "2026-04-14T12:00:00+00:00"}, _HMAC_KEY
+    )
+    assert isinstance(out["created_at"], datetime)
+
+
+def test_created_at_nonutc_offset_normalized_to_utc() -> None:
+    out = validate_correction_payload(
+        {**_base_payload(), "created_at": "2026-04-14T14:00:00+02:00"}, _HMAC_KEY
+    )
+    assert out["created_at"].utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        datetime(2026, 4, 14, 12, 0, 0),  # naive (no tzinfo)
+        {"iso": "2026-04-14T12:00:00Z"},  # dict smuggling
+        "'; DROP TABLE governance_audit_events; --",  # SQL-ish string
+        "not-a-date",  # unparseable
+        "2026-04-14T12:00:00",  # naive ISO string
+        1_713_100_800,  # int epoch
+        None,  # None
+        [],  # list
+        1.5,  # float
+    ],
+)
+def test_created_at_invalid_types_rejected(bad_value: object) -> None:
+    with pytest.raises(CorrectionValidationError) as exc:
+        validate_correction_payload(
+            {**_base_payload(), "created_at": bad_value}, _HMAC_KEY
+        )
+    assert exc.value.field == "created_at"
+
+
+# ---------------------------------------------------------------------------
+# P0-3 — Pattern evasion: URL-encoded, Windows, IPv6, CRLF, null byte,
+# bare internal hostnames, uppercase sha256 exemption, homoglyph NFKC
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "note",
+    [
+        # URL-encoded POSIX paths
+        "see %2FUsers%2Fleo",
+        "%2Fsrv%2Fgov",
+        "%2Fhome%2Fops",
+        # URL-encoded backslash (Windows drive)
+        "C%5CUsers%5Cops",
+        # Windows absolute paths
+        "C:\\srv\\governance\\secret",
+        "D:\\data\\bundle",
+        # UNC paths
+        "\\\\fileserver\\share\\x",
+        # IPv6 — compressed and expanded
+        "traffic from fe80::1",
+        "2001:db8::5 leaked",
+        "fe80:0:0:0:0:0:0:1",
+        # Bare internal hostnames
+        "reported on ops-01",
+        "db-7 flapping",
+        "api-123 misroute",
+        # CRLF injection
+        "ok\r\nforged line",
+        "ok\nbare newline",
+        # Null byte
+        "ok\x00leak",
+    ],
+)
+def test_note_pattern_evasion_variants_rejected(note: str) -> None:
+    with pytest.raises(CorrectionValidationError) as exc:
+        validate_correction_payload(_base_payload(note=note), _HMAC_KEY)
+    assert exc.value.field == "note"
+
+
+def test_uppercase_sha256_prefix_is_sanctioned() -> None:
+    """The ``sha256-`` exemption is now case-insensitive, so an uppercase
+    ``SHA256-<hex>`` hashed token must also pass (without matching the raw
+    SHA rule via its hex tail).
+    """
+    note = "retraction; ref SHA256-deadbeef1234"
+    out = validate_correction_payload(_base_payload(note=note), _HMAC_KEY)
+    assert "SHA256-deadbeef1234" in out["note"]
+
+
+def test_homoglyph_fullwidth_path_rejected() -> None:
+    """A full-width ``/`` (U+FF0F) collapses to ASCII ``/`` under NFKC
+    normalization, so ``\uff0fUsers\uff0fleo`` must be rejected identically
+    to the literal ``/Users/leo``.
+    """
+    evil = "\uff0fUsers\uff0fleo"
+    with pytest.raises(CorrectionValidationError) as exc:
+        validate_correction_payload(_base_payload(note=evil), _HMAC_KEY)
+    assert exc.value.field == "note"
