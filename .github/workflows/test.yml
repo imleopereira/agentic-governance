@@ -78,6 +78,39 @@ jobs:
       - name: integration tests
         run: python -m pytest tests/ -q -m integration
 
+  console-typecheck:
+    name: console tsc --noEmit
+    runs-on: ubuntu-latest
+    # Path filter: only run when console/** changes on PRs. Push events
+    # (branches: production) always run as a safety net so main never
+    # drifts. F8 item 8 of the v0.6 PRD — gate added in standalone PR
+    # before any other v0.6 feature branch opens to avoid cascading CI
+    # breakage on pre-existing TS errors.
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect console changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            console:
+              - 'console/**'
+              - '.github/workflows/test.yml'
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: console/package-lock.json
+      - name: install console deps
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        working-directory: console
+        run: npm ci
+      - name: tsc --noEmit
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        working-directory: console
+        run: npm run typecheck
+
   package:
     name: clean-venv install smoke test
     runs-on: ubuntu-latest
@@ -120,3 +153,51 @@ jobs:
           from codeatelier_governance.integrations.anthropic_wrap import wrap_anthropic
           print('clean install OK:', codeatelier_governance.__version__)
           "
+
+  validate-cron-artifacts:
+    name: validate cron artifacts
+    runs-on: ubuntu-latest
+    # F7 sub-item #2: tree-diff any cron artifact under automation/
+    # against automation/.cron-baseline.json. Runs in CI, NOT as a
+    # cron job (the DX Consultant fix — running a cron-validator
+    # from cron is a circular dependency). As of v0.6 there are no
+    # cron artifacts checked in, so this job is a no-op stub that
+    # exits 0 with a WARN. It gains teeth automatically when
+    # automation/ is populated.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: validate
+        run: python automation/lib/validate_cron_artifacts.py
+
+  console-version-parity:
+    name: console version parity (app.py vs package.json)
+    runs-on: ubuntu-latest
+    # F7 sub-item #7: the FastAPI ``app = FastAPI(version=...)`` and
+    # the Next.js console ``package.json`` must agree. A drift here
+    # means the served API metadata and the built-client bundle
+    # report different versions, which breaks the observability
+    # story on the dashboard. This job greps both files and fails
+    # if they don't match.
+    steps:
+      - uses: actions/checkout@v4
+      - name: assert versions match
+        run: |
+          APP_VERSION=$(grep -oE 'version="[0-9]+\.[0-9]+\.[0-9]+"' \
+            src/codeatelier_governance/console/app.py \
+            | head -1 | sed -E 's/version="([^"]+)"/\1/')
+          PKG_VERSION=$(python -c "import json; \
+            print(json.load(open('console/package.json'))['version'])")
+          echo "app.py   version: $APP_VERSION"
+          echo "package  version: $PKG_VERSION"
+          if [ -z "$APP_VERSION" ] || [ -z "$PKG_VERSION" ]; then
+            echo "ERROR: could not extract one or both versions"
+            exit 1
+          fi
+          if [ "$APP_VERSION" != "$PKG_VERSION" ]; then
+            echo "ERROR: console version drift detected"
+            exit 1
+          fi
+          echo "OK: console versions match ($APP_VERSION)"

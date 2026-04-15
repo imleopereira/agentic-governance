@@ -81,18 +81,24 @@ export function useEventStream() {
           const raw = JSON.parse(e.data as string) as Record<string, unknown>;
           useEventStreamStore.getState().addEvents([
             {
+              // The backend NOTIFY trigger emits a minimal envelope —
+              // event_id, session_id, agent_id, kind, created_at, chain_seq,
+              // optional `truncated` — to keep WAL payload small. Fields
+              // like model/metadata/hmac_value/prev_hash are NOT in the
+              // stream; they are lazy-hydrated via api.getAuditEvent on
+              // first access (see store / EventDetailDrawer).
               event_id: String(raw.event_id ?? crypto.randomUUID()),
               session_id: raw.session_id as string | undefined,
-              agent_id: String(raw.agent_id ?? "unknown"),
+              agent_id: String(
+                raw.agent_id ?? (raw.truncated ? "_truncated" : "unknown")
+              ),
               kind: kindOverride ?? String(raw.kind ?? "audit"),
-              model: raw.model as string | null | undefined,
-              metadata: (raw.metadata as Record<string, unknown>) ?? {},
+              metadata: {},
               created_at: String(
                 raw.created_at ?? new Date().toISOString()
               ),
               chain_seq: raw.chain_seq as number | undefined,
-              hmac_value: raw.hmac_value as string | null | undefined,
-              prev_hash: raw.prev_hash as string | null | undefined,
+              _needs_hydration: true,
               _received_at: performance.now(),
             },
           ]);

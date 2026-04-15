@@ -41,6 +41,7 @@ class ReportGenerator:
         *,
         audit_store: AuditStore | None = None,
         audit_module: Any | None = None,
+        coverage: Any | None = None,
     ) -> None:
         """Initialize the report generator.
 
@@ -56,6 +57,15 @@ class ReportGenerator:
         self._database_url = database_url
         self._audit_store = audit_store
         self._audit_module = audit_module
+        # F9 collaborator: compute coverage_pct + coverage_pct_reason.
+        # When not provided, falls back to a disabled computer that always
+        # returns ("registry_disabled"). Mirrors the optional audit_module
+        # injection pattern above.
+        if coverage is None:
+            from .coverage_stub import _DisabledCoverageComputer
+
+            coverage = _DisabledCoverageComputer()
+        self._coverage = coverage
 
     async def _query_events_postgres(
         self,
@@ -405,6 +415,9 @@ class ReportGenerator:
 
         data = self._extract_report_data(events)
         sections = self._build_article12_sections(data)
+        coverage_pct, coverage_reason = await self._coverage.compute(
+            agent_id=agent_id,
+        )
 
         chain_integrity_status: ChainIntegrityStatus = (
             await self._run_chain_verification() if verify_chain else "unverified"
@@ -452,7 +465,8 @@ class ReportGenerator:
             time_range_end=time_range_end,
             chain_integrity_status=chain_integrity_status,
             coverage_caveat=COVERAGE_CAVEAT,
-            coverage_pct=None,
+            coverage_pct=coverage_pct,
+            coverage_pct_reason=coverage_reason,
         )
 
     async def generate_summary(
@@ -495,6 +509,9 @@ class ReportGenerator:
 
         data = self._extract_report_data(events)
         total = data["total_events"]
+        coverage_pct, coverage_reason = await self._coverage.compute(
+            agent_id=agent_id,
+        )
         chain_integrity_status: ChainIntegrityStatus = (
             await self._run_chain_verification() if verify_chain else "unverified"
         )
@@ -588,5 +605,6 @@ class ReportGenerator:
             time_range_end=summary_time_end,
             chain_integrity_status=chain_integrity_status,
             coverage_caveat=COVERAGE_CAVEAT,
-            coverage_pct=None,
+            coverage_pct=coverage_pct,
+            coverage_pct_reason=coverage_reason,
         )

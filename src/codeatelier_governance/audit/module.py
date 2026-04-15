@@ -29,7 +29,7 @@ from uuid import UUID, uuid4
 import structlog
 
 from . import context
-from .chain import compute_event_hmac, verify_event
+from .chain import compute_event_hmac, sign_audit_row, verify_event
 from .errors import ChainIntegrityError
 from .models import AuditEvent, AuditEventRecord
 from .store import AuditStore, BatchingWriter
@@ -105,10 +105,18 @@ class AuditModule:
         secret: bytes,
         writer: BatchingWriter | None = None,
         verify_chain_on_read: bool = False,
+        signer: Any = None,
     ) -> None:
         _check_secret_strength(secret, "audit secret")
         self._store = store
         self._secret = secret
+        # F6 Track A: optional Ed25519 signer. When None, every row is
+        # written with signature_status='unsigned'. When set, each row's
+        # sign attempt is wrapped in try/except per design constraint #1
+        # (graceful degradation): a signer failure MUST NOT break the host
+        # call path — the row is still written with
+        # signature_status='unsigned_local_failure'.
+        self._signer = signer
         self._started = False
         self._start_warned = False
         self._verify_chain_on_read = verify_chain_on_read
@@ -391,6 +399,36 @@ class AuditModule:
                 prev_hash=prev_hash,
                 created_at=created_at,
             )
+            # F6 Track A: Ed25519 signing wiring. ``sign_audit_row`` itself
+            # catches every exception and returns ``(None, None,
+            # 'unsigned_local_failure')`` — but wrap again in defense-in-depth
+            # so any import-time / unexpected bug inside the helper also
+            # degrades rather than breaks the host. Constraint #1.
+            try:
+                row_for_signing: dict[str, Any] = {
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "agent_id": event.agent_id,
+                    "parent_event_id": parent_id,
+                    "kind": event.kind,
+                    "model": event.model,
+                    "input_hash": event.input_hash,
+                    "output_hash": event.output_hash,
+                    "metadata": event.metadata,
+                    "prev_hash": prev_hash,
+                    "created_at": created_at,
+                    "hmac": mac,
+                }
+                sig_bytes, sig_fp, sig_status = sign_audit_row(
+                    row_for_signing, self._signer
+                )
+            except Exception as exc:  # noqa: BLE001 — constraint #1
+                logger.warning(
+                    "audit.signing_outer_failure",
+                    error_type=type(exc).__name__,
+                    agent_id=event.agent_id,
+                )
+                sig_bytes, sig_fp, sig_status = (None, None, "unsigned_local_failure")
             return AuditEventRecord(
                 event_id=event_id,
                 session_id=session_id,
@@ -404,6 +442,9 @@ class AuditModule:
                 prev_hash=prev_hash,
                 hmac=mac,
                 created_at=created_at,
+                signature=sig_bytes,
+                signing_key_fingerprint=sig_fp,
+                signature_status=sig_status,  # type: ignore[arg-type]
             )
 
         async def build_marker(prev_hash: str | None) -> AuditEventRecord:

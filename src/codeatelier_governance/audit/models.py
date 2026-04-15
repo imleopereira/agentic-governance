@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -130,6 +130,20 @@ class AuditEventRecord(BaseModel):
     prev_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     hmac: str = Field(min_length=64, max_length=MAX_HASH_LEN)
     created_at: datetime
+    # --- F6 Track A: Ed25519 agent identity -------------------------------
+    # Optional — pre-v0.6 rows and rows written with agent_identity disabled
+    # carry None/unsigned here. See design doc constraints #1 and #7.
+    signature: bytes | None = Field(default=None)
+    signing_key_fingerprint: str | None = Field(default=None, max_length=MAX_HASH_LEN)
+    signature_status: Literal[
+        "signed",
+        "unsigned",
+        "unsigned_local_failure",
+        "legacy_unsigned",
+        "revoked_key",
+        "invalid_signature",
+        "unknown_key",
+    ] = "unsigned"
 
     @property
     def is_placeholder(self) -> bool:

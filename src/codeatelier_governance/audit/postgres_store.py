@@ -15,7 +15,17 @@ from uuid import UUID
 
 import struct
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, select, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    LargeBinary,
+    MetaData,
+    String,
+    Table,
+    Text,
+    select,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -55,6 +65,10 @@ audit_events = Table(
     Column("prev_hash", String(128), nullable=True),
     Column("hmac_value", String(128), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+    # F6 Track A: Ed25519 agent identity columns (migration f6a1ed25519aid).
+    Column("signature", LargeBinary(), nullable=True),
+    Column("signing_key_fingerprint", Text(), nullable=True),
+    Column("signature_status", Text(), nullable=False, server_default="unsigned"),
 )
 
 
@@ -147,6 +161,9 @@ class PostgresAuditStore(AuditStore):
                             "prev_hash": record.prev_hash,
                             "hmac_value": record.hmac,
                             "created_at": record.created_at,
+                            "signature": record.signature,
+                            "signing_key_fingerprint": record.signing_key_fingerprint,
+                            "signature_status": record.signature_status,
                         }
                     ],
                 )
@@ -155,6 +172,21 @@ class PostgresAuditStore(AuditStore):
             raise StoreUnavailableError(
                 f"postgres insert_with_chain_lock failed: {type(exc).__name__}"
             ) from exc
+
+    async def get_current_chain_seq(self) -> int:
+        """Return ``MAX(chain_seq)`` across all sessions, or 0 on empty chain.
+
+        Used by the F6 Track A key registration path to stamp
+        ``activated_at_chain_seq`` with the current chain head rather than
+        a hardcoded 0. If the table is unreachable the caller is expected
+        to catch the exception and treat the registration as deferred.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text("SELECT COALESCE(MAX(chain_seq), 0) FROM governance_audit_events")
+            )
+            row = res.first()
+        return int(row[0]) if row is not None and row[0] is not None else 0
 
     async def _read_last_hmac_no_lock(self, session_id: UUID) -> str | None:
         """Optimistic read of the latest hmac for a session, no advisory lock."""
@@ -187,6 +219,9 @@ class PostgresAuditStore(AuditStore):
                 "prev_hash": e.prev_hash,
                 "hmac_value": e.hmac,
                 "created_at": e.created_at,
+                "signature": e.signature,
+                "signing_key_fingerprint": e.signing_key_fingerprint,
+                "signature_status": e.signature_status,
             }
             for e in events
         ]
@@ -242,7 +277,8 @@ class PostgresAuditStore(AuditStore):
                 text(
                     "SELECT event_id, session_id, agent_id, parent_event_id, "
                     "kind, model, input_hash, output_hash, metadata_json, "
-                    "prev_hash, hmac_value, created_at "
+                    "prev_hash, hmac_value, created_at, "
+                    "signature, signing_key_fingerprint, signature_status "
                     "FROM governance_audit_events "
                     "WHERE session_id = :sid "
                     "ORDER BY chain_seq"
@@ -272,4 +308,7 @@ def _row_to_record(row: Any) -> AuditEventRecord:
         prev_hash=row["prev_hash"],
         hmac=row["hmac_value"],
         created_at=row["created_at"],
+        signature=row.get("signature"),
+        signing_key_fingerprint=row.get("signing_key_fingerprint"),
+        signature_status=row.get("signature_status") or "unsigned",
     )

@@ -203,7 +203,18 @@ export const api = {
     ),
   /** Halt agent — blocks all enforcement gates. The agent process keeps running
    *  but cannot pass any scope check, budget check, or contract enforcement.
-   *  Process termination is the host application's responsibility. Admin only. */
+   *  Process termination is the host application's responsibility. Admin only.
+   *
+   *  Note: backend route is still `/kill` in v0.6; the full rename to `/halt`
+   *  lands in F2.5. This call site is named `haltAgent` for the product-level
+   *  vocabulary while hitting the current wire URL. */
   haltAgent: (agentId: string, reason: string) =>
-    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/halt`, { reason }),
+    post<{ ok: boolean; agent_id: string }>(`/api/agents/${agentId}/kill`, { reason }),
+
+  /** Fetch a single audit event by ID, for SSE-stream hydration (the NOTIFY
+   *  trigger payload omits `model`/`metadata`/`hmac_value`/`prev_hash` to keep
+   *  the WAL payload small). Used by the event-stream store when the consumer
+   *  first opens an event whose `_needs_hydration` flag is true. */
+  getAuditEvent: (eventId: string) =>
+    get<AuditEvent>(`/api/events/${encodeURIComponent(eventId)}`),
 };

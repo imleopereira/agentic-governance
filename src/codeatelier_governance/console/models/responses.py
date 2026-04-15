@@ -241,3 +241,110 @@ class SessionRevokeResponse(StrictResponse):
 
     ok: bool
     session_id: str
+
+
+# ---------------------------------------------------------------------------
+# Audit event detail (F2 P0 SSE hydration endpoint)
+# ---------------------------------------------------------------------------
+class AuditEventView(StrictResponse):
+    """GET /api/events/{event_id} — single audit-event row.
+
+    Used by the console SSE hydration path: the NOTIFY trigger emits a
+    minimal envelope (event_id, agent_id, kind, chain_seq, created_at) to
+    keep WAL small, and the frontend calls this endpoint on first access
+    to lazy-hydrate the remaining fields (model / metadata / hmac_value /
+    prev_hash).
+
+    Metadata values are restricted to JSON scalars to match the rest of
+    the strict response surface, and the endpoint applies the same
+    ``_redact_metadata`` layer as the list endpoint before serialization.
+    """
+
+    model_config = _STRICT
+
+    event_id: str
+    chain_seq: int
+    agent_id: str
+    kind: str
+    model: str | None = None
+    tool: str | None = None
+    request_id: str | None = None
+    metadata: dict[str, MetadataValue] = Field(
+        default_factory=dict,
+        description="Redacted metadata. Values restricted to JSON scalars.",
+    )
+    hmac_value: str | None = None
+    prev_hash: str | None = None
+    created_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# F9 Wrapper Coverage
+# ---------------------------------------------------------------------------
+class WrapperCoverageAgentEntry(StrictResponse):
+    """One row in the ``by_agent`` list on ``GET /api/coverage``."""
+
+    model_config = _STRICT
+
+    agent_id: str
+    provider: str
+    active: bool
+    last_seen_at: datetime | None = None
+
+
+class WrapperCoverageView(StrictResponse):
+    """GET /api/coverage — F9 wrapper coverage registry view.
+
+    Shape matches ``decisions/2026-04-15-f9-wrapper-coverage-design.md``
+    section 11. ``coverage_pct`` may be ``None`` when no scope policies
+    are declared or the registry is disabled — always paired with
+    ``coverage_pct_reason`` so consumers can disambiguate.
+    """
+
+    model_config = _STRICT
+
+    as_of: datetime
+    active_wrappers: int = Field(ge=0)
+    total_wrappers: int = Field(ge=0)
+    coverage_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+    coverage_pct_reason: str | None = None
+    by_agent: list[WrapperCoverageAgentEntry]
+    unwrapped_agents_seen_in_audit: list[str]
+    active_window_days: int = Field(ge=1)
+
+
+# ---------------------------------------------------------------------------
+# F7 Governance Health
+# ---------------------------------------------------------------------------
+class GovernanceHealthView(StrictResponse):
+    """GET /health/governance — authenticated response shape.
+
+    Per F7 (v0.6 PRD), this endpoint has two response shapes:
+
+    * Unauthenticated callers receive only ``{"status": "ok"}`` to avoid
+      leaking load/latency patterns to anonymous probes (K8s liveness
+      compatibility). That minimal shape is serialized as a plain dict and
+      does NOT go through this model.
+    * Authenticated callers (session cookie or dev mode) receive the full
+      view below, including chain-integrity signals and missing-key
+      fingerprints surfaced by F6 Track B.
+
+    The ``chain_keys_unresolved`` list is the LOUD signal that F6 Track B
+    deferred to F7: any HMAC key fingerprint referenced by audit events
+    that cannot currently be resolved to a verification key. A non-empty
+    list with ``chain_integrity_status`` still ``verified`` means the
+    chain segment signed by the missing key is skipped rather than
+    rejected, and operators MUST rotate or restore the key.
+    """
+
+    model_config = _STRICT
+
+    status: str
+    db_reachable: bool
+    last_chain_verify_ts: datetime | None = None
+    append_only_grants_ok: bool
+    audit_write_p50_ms: float | None = Field(default=None, ge=0.0)
+    audit_write_p95_ms: float | None = Field(default=None, ge=0.0)
+    chain_integrity_status: str  # verified | unverified | degraded | halted
+    chain_keys_resolved: list[str]
+    chain_keys_unresolved: list[str]

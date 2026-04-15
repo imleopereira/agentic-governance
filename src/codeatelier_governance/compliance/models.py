@@ -101,6 +101,26 @@ class ComplianceReport(BaseModel):
     #: Must be in the range [0.0, 1.0] when provided.
     coverage_pct: float | None = Field(default=None, ge=0.0, le=1.0)
 
+    #: DA-blocker discriminator for ``coverage_pct=None``.  Distinguishes:
+    #:
+    #: - ``"ok"``: ``coverage_pct`` is populated and meaningful.
+    #: - ``"no_scope_policies_registered"``: denominator is zero (no governed
+    #:   agents have been declared); ``coverage_pct`` is mathematically
+    #:   undefined.
+    #: - ``"registry_disabled"``: the F9 wrapper registry is not available
+    #:   (engine absent, feature opt-out, or transient DB error).
+    #: - ``None``: legacy v0.5.x reports reconstructed from old data, where
+    #:   the field did not exist.
+    #:
+    #: A v0.6+ report MUST always populate this field.  Without it, an
+    #: auditor cannot disambiguate "no agents declared" from "coverage
+    #: measurement opted out", and the compliance artifact is ambiguous.
+    coverage_pct_reason: Literal[
+        "no_scope_policies_registered",
+        "registry_disabled",
+        "ok",
+    ] | None = None
+
     @field_validator("coverage_caveat")
     @classmethod
     def _coverage_caveat_not_empty(cls, v: str) -> str:

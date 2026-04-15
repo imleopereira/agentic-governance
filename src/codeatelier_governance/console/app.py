@@ -22,7 +22,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
+import unicodedata
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -42,7 +44,7 @@ except ImportError as exc:
         "Install with: pip install codeatelier-governance[console]"
     ) from exc
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -51,6 +53,23 @@ from ..audit.chain import verify_event
 from ..audit.models import AuditEvent, AuditEventRecord
 from ..audit.module import AuditModule
 from .auth import create_session_id, hash_password, session_expires_at, verify_password
+from .models.responses import (
+    AgentPoliciesResponse,
+    AgentPresenceResponse,
+    AgentPresenceRow,
+    BatchApproveFailure,
+    BatchApproveResponse,
+    EventStatsResponse,
+    GateAgentPresence,
+    GateClaimResponse,
+    GateContextResponse,
+    GateEscalateResponse,
+    GateRecentEvent,
+    PolicyListResponse,
+    PolicyRow,
+    SessionRevokeResponse,
+)
+from .redaction import redact_secrets
 
 _logger = structlog.get_logger(__name__)
 
@@ -108,6 +127,63 @@ def _record_login_attempt(ip: str) -> None:
     ]
     for k in stale_ips:
         del _login_attempts[k]
+
+
+# ---------------------------------------------------------------------------
+# F6 Track B: per-user rate limiter for authenticated endpoints
+# ---------------------------------------------------------------------------
+# The login rate limiter above is per-IP by design (anonymous, no user
+# identity yet). Once authenticated, we rate-limit per user_id — an
+# attacker behind a single NAT should not DoS a co-tenant, and a runaway
+# browser tab should not burn the DB.
+_USER_RATE_LIMIT_MAX = int(os.environ.get("GOVERNANCE_CONSOLE_USER_RATE_LIMIT", "60"))
+_USER_RATE_LIMIT_WINDOW_SECONDS = 60
+_user_request_times: dict[str, list[float]] = {}
+
+
+def _check_user_rate_limit(user_id: str) -> float | None:
+    """Return seconds-until-retry if ``user_id`` is over quota, else None.
+
+    Sliding 60 s window; cap is ``_USER_RATE_LIMIT_MAX`` requests.
+    """
+    now = time.monotonic()
+    times = _user_request_times.get(user_id, [])
+    times = [t for t in times if now - t < _USER_RATE_LIMIT_WINDOW_SECONDS]
+    _user_request_times[user_id] = times
+    if len(times) >= _USER_RATE_LIMIT_MAX:
+        oldest = times[0]
+        retry = _USER_RATE_LIMIT_WINDOW_SECONDS - (now - oldest)
+        return max(1.0, retry)
+    times.append(now)
+    _user_request_times[user_id] = times
+    # Opportunistic GC so the dict can't grow forever.
+    if len(_user_request_times) > 4096:
+        stale = [
+            k
+            for k, v in _user_request_times.items()
+            if all(now - t >= _USER_RATE_LIMIT_WINDOW_SECONDS for t in v)
+        ]
+        for k in stale:
+            del _user_request_times[k]
+    return None
+
+
+async def rate_limit_per_user(request: Request) -> None:
+    """FastAPI dependency: 429 if the authenticated user is over quota.
+
+    MUST be ordered AFTER ``authenticate`` so ``request.state.user_id``
+    is populated. Anonymous callers fall through cleanly.
+    """
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        return
+    retry_after = _check_user_rate_limit(user_id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Slow down and retry shortly.",
+            headers={"Retry-After": str(int(retry_after))},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +431,7 @@ async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Code Atelier Governance Console",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -469,7 +545,7 @@ def require_role(role: str) -> Any:
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    return {"ok": True, "version": "0.4.0"}
+    return {"ok": True, "version": "0.5.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -882,24 +958,84 @@ async def update_user(user_id: UUID, body: UpdateUserRequest) -> dict[str, Any]:
 @app.delete(
     "/api/auth/sessions/{session_id}",
     dependencies=[Depends(authenticate), require_role("admin")],
+    response_model=SessionRevokeResponse,
 )
-async def revoke_session(session_id: UUID) -> dict[str, Any]:
-    """Revoke a specific session (admin only)."""
+async def revoke_session(
+    session_id: UUID, request: Request
+) -> SessionRevokeResponse:
+    """Revoke a specific session (admin only).
+
+    Writes a ``pipeline.session_revoked`` audit event to the HMAC chain so
+    revocation is tamper-evidently recorded. Per CLAUDE.md invariant
+    "audit logs are append-only, never updated or deleted" — session
+    deletion must leave a permanent audit trace.
+    """
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
-    async with engine.begin() as conn:
-        res = await conn.execute(
-            text(
-                "UPDATE governance_console_sessions SET revoked = TRUE "
-                "WHERE session_id = :sid AND revoked = FALSE"
-            ),
-            {"sid": str(session_id)},
+    operator_id = getattr(request.state, "user_id", None) or "unknown"
+    # Pseudonymize operator id in audit metadata — log the SHA-256 prefix so
+    # the console can correlate without leaking the raw UUID/username.
+    revoked_by_hash = hashlib.sha256(
+        str(operator_id).encode("utf-8")
+    ).hexdigest()[:16]
+    now = datetime.now(timezone.utc)
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(
+                text(
+                    "UPDATE governance_console_sessions SET revoked = TRUE "
+                    "WHERE session_id = :sid AND revoked = FALSE "
+                    "RETURNING created_at"
+                ),
+                {"sid": str(session_id)},
+            )
+            row = res.mappings().first()
+            if row is None:
+                raise HTTPException(404, "Session not found or already revoked.")
+            created_at = row["created_at"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _logger.error(
+            "console.revoke_session_failed",
+            error_type=type(exc).__name__,
         )
-        if res.rowcount == 0:
-            raise HTTPException(404, "Session not found or already revoked.")
+        raise HTTPException(500, "Failed to revoke session.") from None
+
+    # Append-only audit record: the DB row flipped, but the chain captures
+    # the event permanently (F3 PRD mandate).
+    if audit_module is not None:
+        try:
+            audit_session_id = UUID(
+                hashlib.md5(str(session_id).encode("utf-8")).hexdigest()
+            )
+            await audit_module.log(
+                AuditEvent(
+                    agent_id="console",
+                    session_id=audit_session_id,
+                    kind="pipeline.session_revoked",
+                    metadata={
+                        "session_id": str(session_id),
+                        "revoked_by": revoked_by_hash,
+                        "revoked_at": now.isoformat(),
+                        "session_created_at": created_at.isoformat()
+                        if created_at
+                        else None,
+                    },
+                )
+            )
+        except Exception as exc:
+            # Audit failure MUST NOT leave the caller without a revoke ack —
+            # the DB row is already updated. Log loudly and carry on.
+            _logger.error(
+                "console.revoke_session_audit_failed",
+                session_id=str(session_id),
+                error_type=type(exc).__name__,
+            )
+
     # Signal all SSE connections for this session to close within 1 s
     _revoke_sse_session(str(session_id))
-    return {"ok": True, "session_id": str(session_id)}
+    return SessionRevokeResponse(ok=True, session_id=str(session_id))
 
 
 @app.get("/api/agents", dependencies=[Depends(authenticate)])
@@ -1127,7 +1263,7 @@ async def cost_sessions(
         ]
 
 
-@app.get("/api/gates/pending", dependencies=[Depends(authenticate)])
+@app.get("/api/gates/pending", dependencies=[Depends(authenticate), Depends(rate_limit_per_user)])
 async def gates_pending() -> list[dict[str, Any]]:
     """List all unresolved approval requests."""
     if engine is None:
@@ -1161,7 +1297,7 @@ async def gates_pending() -> list[dict[str, Any]]:
         ]
 
 
-@app.get("/api/gates/recent", dependencies=[Depends(authenticate)])
+@app.get("/api/gates/recent", dependencies=[Depends(authenticate), Depends(rate_limit_per_user)])
 async def gates_recent(
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict[str, Any]]:
@@ -1442,58 +1578,80 @@ async def deny_gate(
     return {"ok": True, "request_id": str(request_id), "resolution": "denied"}
 
 
-@app.get("/api/policies", dependencies=[Depends(authenticate)])
-async def list_policies() -> list[dict[str, Any]]:
+@app.get(
+    "/api/policies",
+    dependencies=[Depends(authenticate), Depends(rate_limit_per_user)],
+    response_model=PolicyListResponse,
+)
+async def list_policies() -> PolicyListResponse:
     """Return all policies from the governance_policies table."""
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
-    async with engine.connect() as conn:
-        res = await conn.execute(
-            text(
-                "SELECT agent_id, policy_type, policy_json, updated_at "
-                "FROM governance_policies "
-                "ORDER BY agent_id, policy_type"
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT agent_id, policy_type, policy_json, updated_at "
+                    "FROM governance_policies "
+                    "ORDER BY agent_id, policy_type"
+                )
             )
+            rows = list(res.mappings())
+    except Exception as exc:
+        _logger.warning(
+            "console.list_policies_failed", exc_type=type(exc).__name__
         )
-        return [
-            {
-                "agent_id": row["agent_id"],
-                "policy_type": row["policy_type"],
-                "policy": row["policy_json"],
-                "updated_at": row["updated_at"].isoformat()
-                if row["updated_at"]
-                else None,
-            }
-            for row in res.mappings()
-        ]
+        raise HTTPException(500, "Failed to load policies.") from None
+
+    policies = [
+        PolicyRow(
+            agent_id=row["agent_id"],
+            policy_type=row["policy_type"],
+            policy=redact_secrets(row["policy_json"] or {}),
+            updated_at=row["updated_at"],
+        )
+        for row in rows
+    ]
+    return PolicyListResponse(policies=policies)
 
 
-@app.get("/api/policies/{agent_id}", dependencies=[Depends(authenticate)])
-async def get_agent_policies(agent_id: str) -> list[dict[str, Any]]:
+@app.get(
+    "/api/policies/{agent_id}",
+    dependencies=[Depends(authenticate), Depends(rate_limit_per_user)],
+    response_model=AgentPoliciesResponse,
+)
+async def get_agent_policies(agent_id: str) -> AgentPoliciesResponse:
     """Return scope + budget policies for a single agent."""
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
-    async with engine.connect() as conn:
-        res = await conn.execute(
-            text(
-                "SELECT agent_id, policy_type, policy_json, updated_at "
-                "FROM governance_policies "
-                "WHERE agent_id = :agent_id "
-                "ORDER BY policy_type"
-            ),
-            {"agent_id": agent_id},
+    try:
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT agent_id, policy_type, policy_json, updated_at "
+                    "FROM governance_policies "
+                    "WHERE agent_id = :agent_id "
+                    "ORDER BY policy_type"
+                ),
+                {"agent_id": agent_id},
+            )
+            rows = list(res.mappings())
+    except Exception as exc:
+        _logger.warning(
+            "console.get_agent_policies_failed", exc_type=type(exc).__name__
         )
-        return [
-            {
-                "agent_id": row["agent_id"],
-                "policy_type": row["policy_type"],
-                "policy": row["policy_json"],
-                "updated_at": row["updated_at"].isoformat()
-                if row["updated_at"]
-                else None,
-            }
-            for row in res.mappings()
-        ]
+        raise HTTPException(500, "Failed to load agent policies.") from None
+
+    policies = [
+        PolicyRow(
+            agent_id=row["agent_id"],
+            policy_type=row["policy_type"],
+            policy=redact_secrets(row["policy_json"] or {}),
+            updated_at=row["updated_at"],
+        )
+        for row in rows
+    ]
+    return AgentPoliciesResponse(agent_id=agent_id, policies=policies)
 
 
 @app.get("/api/posture", dependencies=[Depends(authenticate)])
@@ -1709,8 +1867,12 @@ async def cost_model_breakdown(
         return []
 
 
-@app.get("/api/agents/presence", dependencies=[Depends(authenticate)])
-async def agent_presence() -> list[dict[str, Any]]:
+@app.get(
+    "/api/agents/presence",
+    dependencies=[Depends(authenticate), Depends(rate_limit_per_user)],
+    response_model=AgentPresenceResponse,
+)
+async def agent_presence() -> AgentPresenceResponse:
     """List all agents with their presence status."""
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
@@ -1723,41 +1885,84 @@ async def agent_presence() -> list[dict[str, Any]]:
                     "ORDER BY agent_id"
                 )
             )
-            return [
-                {
-                    "agent_id": row["agent_id"],
-                    "status": row["status"],
-                    "last_heartbeat": row["last_heartbeat"].isoformat()
-                    if row["last_heartbeat"]
-                    else None,
-                    "started_at": row["started_at"].isoformat()
-                    if row["started_at"]
-                    else None,
-                    "metadata": row["metadata_json"],
-                }
-                for row in res.mappings()
-            ]
+            rows = list(res.mappings())
     except Exception as exc:
         # Table may not exist yet if migration hasn't been run
         _logger.debug(
             "console.agent_presence_skipped",
             exc_type=type(exc).__name__,
         )
-        return []
+        return AgentPresenceResponse(agents=[])
+
+    agents = [
+        AgentPresenceRow(
+            agent_id=row["agent_id"],
+            status=row["status"],
+            last_heartbeat=row["last_heartbeat"],
+            started_at=row["started_at"],
+            metadata=redact_secrets(row["metadata_json"] or {}),
+        )
+        for row in rows
+    ]
+    return AgentPresenceResponse(agents=agents)
 
 # ---------------------------------------------------------------------------
 # New endpoint: Agent kill switch
 # ---------------------------------------------------------------------------
-class KillRequest(BaseModel):
-    """Kill-switch request body."""
+# C0 controls to strip from `reason` (post-escape) so that an operator can't
+# sneak raw terminal / log-injection bytes into the audit chain. Note `\x09`
+# (tab), `\x0a` (LF), `\x0d` (CR) are EXCLUDED here because they are already
+# converted to their printable backslash forms in the escape step above.
+_C0_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_KILL_REASON_MAX = 512
 
-    model_config = ConfigDict(strict=True)
+
+class KillRequest(BaseModel):
+    """Kill-switch request body.
+
+    Security (F2 P0, Cybersec HIGH): the `reason` field flows all the way
+    into the HMAC-chained audit row. An unescaped newline would let an
+    operator forge a follow-on "event" visually in chain exports. An
+    unbounded length would let them DoS a reviewer's UI. A zalgo bomb
+    (combining marks) would expand post-decode if we capped bytes instead
+    of Unicode codepoints. The validator below normalizes, length-caps,
+    escapes, then strips C0 controls — in that order.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     reason: str = Field(
         min_length=1,
-        max_length=2000,
-        description="Required: why the agent is being killed.",
+        description="Required: why the agent is being halted. Max 512 chars "
+        "after NFC normalization; control characters are escaped or stripped.",
     )
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str) -> str:
+        # 1. NFC normalize FIRST so zalgo / combining-mark expansions can't
+        #    bypass the length cap by being applied post-decode.
+        value = unicodedata.normalize("NFC", value)
+        # 2. Cap RAW input (in Unicode codepoints, not bytes) BEFORE escaping.
+        #    Escape sequences like `\n` → `\\n` double the length; capping
+        #    after escape would let a 512-char stream of newlines still
+        #    produce a 1024-char audit field.
+        if len(value) > _KILL_REASON_MAX:
+            value = value[:_KILL_REASON_MAX]
+        # 3. Escape order: backslash MUST be first so that `\n` in the input
+        #    (which we escape to `\\n`) can't collide with an already-escaped
+        #    `\\n` from a later pass (`\\n` → `\\\\n`).
+        value = (
+            value.replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+        )
+        # 4. Strip remaining C0 controls (\x00-\x08, \x0b-\x1f, \x7f). ANSI
+        #    escape sequences like `\x1b[31m` begin with \x1b and are killed
+        #    at the first byte; the rest of the escape becomes harmless text.
+        value = _C0_CONTROL_RE.sub("", value)
+        return value
 
 
 @app.post(
@@ -1825,8 +2030,12 @@ async def kill_agent(
 # ---------------------------------------------------------------------------
 # New endpoint: Event stats
 # ---------------------------------------------------------------------------
-@app.get("/api/events/stats", dependencies=[Depends(authenticate)])
-async def event_stats() -> dict[str, Any]:
+@app.get(
+    "/api/events/stats",
+    dependencies=[Depends(authenticate), Depends(rate_limit_per_user)],
+    response_model=EventStatsResponse,
+)
+async def event_stats() -> EventStatsResponse:
     """Event counts for the last hour, grouped by kind.
 
     Returns total_last_hour, per_kind_counts, events_per_minute (rolling 5 min).
@@ -1857,11 +2066,11 @@ async def event_stats() -> dict[str, Any]:
             )
             five_min_row = res2.first()
             five_min_count = int(five_min_row[0]) if five_min_row else 0
-        return {
-            "total_last_hour": sum(per_kind.values()),
-            "per_kind_counts": per_kind,
-            "events_per_minute": five_min_count / 5.0,
-        }
+        return EventStatsResponse(
+            total_last_hour=sum(per_kind.values()),
+            per_kind_counts=per_kind,
+            events_per_minute=five_min_count / 5.0,
+        )
     except Exception:
         _logger.warning("console.event_stats_failed", exc_info=False)
         raise HTTPException(503, "Event stats temporarily unavailable.") from None
@@ -1869,8 +2078,12 @@ async def event_stats() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # New endpoint: Gate rich context
 # ---------------------------------------------------------------------------
-@app.get("/api/gates/{request_id}/context", dependencies=[Depends(authenticate)])
-async def gate_context(request_id: UUID) -> dict[str, Any]:
+@app.get(
+    "/api/gates/{request_id}/context",
+    dependencies=[Depends(authenticate)],
+    response_model=GateContextResponse,
+)
+async def gate_context(request_id: UUID) -> GateContextResponse:
     """Rich context for an approval decision.
 
     Returns gate record, agent presence, recent agent events (last 10),
@@ -1911,10 +2124,7 @@ async def gate_context(request_id: UUID) -> dict[str, Any]:
             {"aid": agent_id},
         )
         recent_events = [
-            {
-                "kind": r["kind"],
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-            }
+            GateRecentEvent(kind=r["kind"], created_at=r["created_at"])
             for r in events_res.mappings()
         ]
 
@@ -1930,36 +2140,47 @@ async def gate_context(request_id: UUID) -> dict[str, Any]:
     payload = row["payload_json"] or {}
     risk = payload.get("risk", "UNKNOWN") if isinstance(payload, dict) else "UNKNOWN"
 
-    return {
-        "request_id": str(row["request_id"]),
-        "agent_id": agent_id,
-        "kind": row["kind"],
-        "action_hash": row["action_hash"],
-        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-        "expires_at": row["expires_at"].isoformat() if row["expires_at"] else None,
-        "resolved_at": row["resolved_at"].isoformat() if row["resolved_at"] else None,
-        "resolution": row["resolution"],
-        "reviewer_id": str(row["reviewer_id"]) if row["reviewer_id"] else None,
-        "reviewing_since": row["reviewing_since"].isoformat()
-        if row.get("reviewing_since") else None,
-        "rationale": row.get("rationale"),
-        "payload": _redact_metadata(payload if isinstance(payload, dict) else {}),
-        "risk": risk,
-        "agent_presence": {
-            "status": pres_row["status"],
-            "last_heartbeat": pres_row["last_heartbeat"].isoformat()
-            if pres_row["last_heartbeat"] else None,
-        } if pres_row else None,
-        "recent_agent_events": recent_events,
-        "agent_cost_today_usd": float(cost_row[0]) if cost_row else None,
-    }
+    # Redact by key name (existing) and by value shape (F3).
+    redacted_payload = redact_secrets(
+        _redact_metadata(payload if isinstance(payload, dict) else {})
+    )
+
+    gate_presence: GateAgentPresence | None = None
+    if pres_row is not None:
+        gate_presence = GateAgentPresence(
+            status=pres_row["status"],
+            last_heartbeat=pres_row["last_heartbeat"],
+        )
+
+    return GateContextResponse(
+        request_id=str(row["request_id"]),
+        agent_id=agent_id,
+        kind=row["kind"],
+        action_hash=row["action_hash"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        resolved_at=row["resolved_at"],
+        resolution=row["resolution"],
+        reviewer_id=str(row["reviewer_id"]) if row["reviewer_id"] else None,
+        reviewing_since=row.get("reviewing_since"),
+        rationale=row.get("rationale"),
+        payload=redacted_payload,
+        risk=risk,
+        agent_presence=gate_presence,
+        recent_agent_events=recent_events,
+        agent_cost_today_usd=float(cost_row[0]) if cost_row else None,
+    )
 
 
 # ---------------------------------------------------------------------------
 # New endpoint: Reviewer claim
 # ---------------------------------------------------------------------------
-@app.post("/api/gates/{request_id}/claim", dependencies=[Depends(authenticate)])
-async def claim_gate(request_id: UUID, request: Request) -> dict[str, Any]:
+@app.post(
+    "/api/gates/{request_id}/claim",
+    dependencies=[Depends(authenticate)],
+    response_model=GateClaimResponse,
+)
+async def claim_gate(request_id: UUID, request: Request) -> GateClaimResponse:
     """Claim a pending gate for review. Atomic: only succeeds if unclaimed.
 
     Uses UPDATE ... WHERE reviewer_id IS NULL to prevent double-claim
@@ -2007,12 +2228,12 @@ async def claim_gate(request_id: UUID, request: Request) -> dict[str, Any]:
             if not update_res.first():
                 raise HTTPException(409, "Gate is already claimed by another reviewer.")
 
-    return {
-        "ok": True,
-        "request_id": str(request_id),
-        "reviewer_id": str(reviewer_uuid) if reviewer_uuid else user_id,
-        "reviewing_since": now.isoformat(),
-    }
+    return GateClaimResponse(
+        ok=True,
+        request_id=str(request_id),
+        reviewer_id=str(reviewer_uuid) if reviewer_uuid else user_id,
+        reviewing_since=now,
+    )
 
 # ---------------------------------------------------------------------------
 # New endpoint: Escalate gate
@@ -2027,10 +2248,14 @@ class EscalateRequest(BaseModel):
     )
 
 
-@app.post("/api/gates/{request_id}/escalate", dependencies=[Depends(authenticate)])
+@app.post(
+    "/api/gates/{request_id}/escalate",
+    dependencies=[Depends(authenticate)],
+    response_model=GateEscalateResponse,
+)
 async def escalate_gate(
     request_id: UUID, body: EscalateRequest, request: Request
-) -> dict[str, Any]:
+) -> GateEscalateResponse:
     """Escalate a pending gate to another reviewer.
 
     Releases the current claim and records escalation metadata in payload_json.
@@ -2079,12 +2304,12 @@ async def escalate_gate(
         escalated_by=user_id,
         escalated_to=body.escalate_to,
     )
-    return {
-        "ok": True,
-        "request_id": str(request_id),
-        "escalated_to": body.escalate_to,
-        "escalated_at": now.isoformat(),
-    }
+    return GateEscalateResponse(
+        ok=True,
+        request_id=str(request_id),
+        escalated_to=body.escalate_to,
+        escalated_at=now,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2108,8 +2333,11 @@ class BatchApproveRequest(BaseModel):
 @app.post(
     "/api/gates/batch-approve",
     dependencies=[Depends(authenticate), require_role("admin")],
+    response_model=BatchApproveResponse,
 )
-async def batch_approve(body: BatchApproveRequest, request: Request) -> dict[str, Any]:
+async def batch_approve(
+    body: BatchApproveRequest, request: Request
+) -> BatchApproveResponse:
     """Batch approve up to 50 LOW-risk gates. Admin only.
 
     Security: hard cap 50, server-side risk re-verify, individual audit events,
@@ -2124,7 +2352,7 @@ async def batch_approve(body: BatchApproveRequest, request: Request) -> dict[str
 
     user_id = getattr(request.state, "user_id", None)
     approved: list[str] = []
-    failed: list[dict[str, str]] = []
+    failed: list[BatchApproveFailure] = []
 
     for rid in body.request_ids:
         try:
@@ -2139,32 +2367,44 @@ async def batch_approve(body: BatchApproveRequest, request: Request) -> dict[str
                 )
                 row = res.mappings().first()
                 if not row:
-                    failed.append({"request_id": str(rid), "reason": "not_found"})
+                    failed.append(BatchApproveFailure(request_id=str(rid), reason="not_found"))
                     continue
                 if row["resolved_at"] is not None:
-                    failed.append({"request_id": str(rid), "reason": "already_resolved"})
+                    failed.append(
+                        BatchApproveFailure(request_id=str(rid), reason="already_resolved")
+                    )
                     continue
 
                 payload = row["payload_json"] or {}
                 risk = payload.get("risk", "UNKNOWN") if isinstance(payload, dict) else "UNKNOWN"
                 if risk != "LOW":
-                    failed.append({
-                        "request_id": str(rid),
-                        "reason": f"risk_{risk}_not_eligible_for_batch",
-                    })
+                    failed.append(
+                        BatchApproveFailure(
+                            request_id=str(rid),
+                            reason=f"risk_{risk}_not_eligible_for_batch",
+                        )
+                    )
                     continue
 
                 if user_id is not None:
                     try:
                         await _check_self_approval(conn, row["agent_id"], user_id, rid)
                     except HTTPException:
-                        failed.append({"request_id": str(rid), "reason": "self_approval_blocked"})
+                        failed.append(
+                            BatchApproveFailure(
+                                request_id=str(rid), reason="self_approval_blocked"
+                            )
+                        )
                         continue
 
                 reviewer_id = row.get("reviewer_id")
                 if reviewer_id is not None and user_id is not None:
                     if str(reviewer_id) != user_id:
-                        failed.append({"request_id": str(rid), "reason": "claimed_by_other_reviewer"})
+                        failed.append(
+                            BatchApproveFailure(
+                                request_id=str(rid), reason="claimed_by_other_reviewer"
+                            )
+                        )
                         continue
 
                 now = datetime.now(timezone.utc)
@@ -2202,12 +2442,445 @@ async def batch_approve(body: BatchApproveRequest, request: Request) -> dict[str
                 request_id=str(rid),
                 exc_type=type(exc).__name__,
             )
-            failed.append({"request_id": str(rid), "reason": "internal_error"})
+            failed.append(
+                BatchApproveFailure(request_id=str(rid), reason="internal_error")
+            )
+
+    return BatchApproveResponse(
+        ok=True,
+        approved=approved,
+        failed=failed,
+        approved_count=len(approved),
+        failed_count=len(failed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# F2 P0: single-event fetch for SSE hydration
+# ---------------------------------------------------------------------------
+# Common secret-bearing patterns to strip from any string value before we
+# serialize it back to the console. This is a belt-and-suspenders layer on
+# top of `_redact_metadata` (which redacts by KEY NAME) — here we redact by
+# VALUE SHAPE so a stray prefix that lands under a non-obvious key name
+# (e.g. `notes="here's my sk-ant-abc123"`) is still caught.
+_SECRET_VALUE_RE = re.compile(
+    r"("
+    r"sk-ant-[A-Za-z0-9_\-]{10,}"   # Anthropic
+    r"|sk-[A-Za-z0-9]{20,}"          # OpenAI
+    r"|xoxb-[A-Za-z0-9\-]{10,}"      # Slack bot token
+    r"|gh[ps]_[A-Za-z0-9]{20,}"      # GitHub PAT
+    r"|AKIA[0-9A-Z]{16}"             # AWS access key
+    r")"
+)
+
+
+def _scrub_secrets(value: Any) -> Any:
+    """Recursively replace secret-shaped substrings with ``[REDACTED]``.
+
+    Runs on dict values and list items; non-str leaves pass through.
+    """
+    if isinstance(value, str):
+        return _SECRET_VALUE_RE.sub("[REDACTED]", value)
+    if isinstance(value, dict):
+        return {k: _scrub_secrets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_secrets(item) for item in value]
+    return value
+
+
+@app.get(
+    "/api/events/{event_id}",
+    dependencies=[Depends(authenticate)],
+)
+async def get_audit_event(event_id: str) -> dict[str, Any]:
+    """Return a single audit-event row for SSE stream hydration.
+
+    The NOTIFY payload emitted by the governance_audit_events trigger
+    carries only a minimal envelope (event_id, agent_id, kind, chain_seq,
+    created_at) to keep WAL small. The frontend calls this endpoint on
+    first access of a stream row to lazy-hydrate the remaining fields.
+
+    Returns 404 if the event does not exist. The response passes through
+    both the key-based `_redact_metadata` filter and the value-shape
+    `_scrub_secrets` filter before serialization.
+
+    The response shape matches
+    :class:`codeatelier_governance.console.models.responses.AuditEventView`.
+    That model enforces ``extra='forbid'`` per F3; callers that bypass it
+    still get the same field set because this function constructs the dict
+    explicitly.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+
+    # Validate event_id is a UUID; refuse anything else up-front so the SQL
+    # layer never sees hand-rolled values. Prevents parser-level surprises
+    # on non-UUID input and avoids leaking SQLSTATE errors to the client.
+    try:
+        parsed_id = UUID(event_id)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(400, "Invalid event_id") from exc
+
+    async with engine.connect() as conn:
+        res = await conn.execute(
+            text(
+                "SELECT event_id, chain_seq, agent_id, kind, model, "
+                "metadata_json, hmac_value, prev_hash, created_at "
+                "FROM governance_audit_events "
+                "WHERE event_id = :eid"
+            ),
+            {"eid": str(parsed_id)},
+        )
+        row = res.mappings().first()
+
+    if row is None:
+        raise HTTPException(404, "Event not found")
+
+    raw_meta = row["metadata_json"] or {}
+    # Two-pass scrub: key-name redaction, then value-shape redaction.
+    scrubbed_meta = _scrub_secrets(_redact_metadata(raw_meta))
+
+    # `tool` and `request_id` live inside metadata for current schema; surface
+    # them at the top level for the typed response, but keep them as str-or-None.
+    meta_dict = scrubbed_meta if isinstance(scrubbed_meta, dict) else {}
+    tool_val = meta_dict.get("tool")
+    req_id_val = meta_dict.get("request_id")
 
     return {
-        "ok": True,
-        "approved": approved,
-        "failed": failed,
-        "approved_count": len(approved),
-        "failed_count": len(failed),
+        "event_id": str(row["event_id"]),
+        "chain_seq": int(row["chain_seq"]),
+        "agent_id": row["agent_id"],
+        "kind": row["kind"],
+        "model": row["model"],
+        "tool": tool_val if isinstance(tool_val, str) else None,
+        "request_id": req_id_val if isinstance(req_id_val, str) else None,
+        "metadata": meta_dict,
+        "hmac_value": row["hmac_value"],
+        "prev_hash": row["prev_hash"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# F9 Wrapper Coverage
+# ---------------------------------------------------------------------------
+@app.get("/api/coverage", dependencies=[Depends(authenticate)])
+async def wrapper_coverage(
+    agent_id: str | None = Query(default=None, max_length=256),
+    active_window_days: int = Query(default=7, ge=1, le=90),
+) -> dict[str, Any]:
+    """Return F9 wrapper coverage snapshot.
+
+    Shape matches ``console.models.responses.WrapperCoverageView``.
+
+    Returns 503 when the governance DB is unreachable — the cross-process
+    mirror is the entire point of this endpoint, so answering from
+    in-memory state alone would be misleading.
+
+    Returns 200 with ``coverage_pct: null`` and
+    ``coverage_pct_reason: "no_scope_policies_registered"`` when the
+    denominator is zero — explicit discriminator per the F9 design doc
+    (DA blocker fix #1).
+    """
+    if engine is None:
+        raise HTTPException(
+            503,
+            "Console backend is starting up or the governance DB is "
+            "unreachable. The wrapper coverage view requires Postgres.",
+        )
+
+    async with engine.connect() as conn:
+        # Denominator: distinct agent_ids with a scope policy declared.
+        total_res = await conn.execute(
+            text(
+                "SELECT COUNT(DISTINCT agent_id) FROM governance_policies "
+                "WHERE policy_type = 'scope'"
+            )
+        )
+        total_row = total_res.first()
+        total_wrappers = int(total_row[0]) if total_row and total_row[0] else 0
+
+        window = f"{active_window_days} days"
+        params: dict[str, Any] = {"window": window}
+        agent_where = ""
+        if agent_id is not None:
+            agent_where = " AND agent_id = :agent_id"
+            params["agent_id"] = agent_id
+
+        # Active wrappers: distinct agents with a heartbeat in the window.
+        active_res = await conn.execute(
+            text(
+                "SELECT COUNT(DISTINCT agent_id) FROM "
+                "governance_wrapper_registrations "
+                "WHERE last_seen_at >= NOW() - CAST(:window AS INTERVAL)"
+                f"{agent_where}"
+            ),
+            params,
+        )
+        active_row = active_res.first()
+        active_wrappers = (
+            int(active_row[0]) if active_row and active_row[0] else 0
+        )
+
+        # by_agent breakdown: one row per (agent_id, provider) with the
+        # most recent heartbeat.
+        by_agent_res = await conn.execute(
+            text(
+                "SELECT agent_id, provider, "
+                "MAX(last_seen_at) AS last_seen_at, "
+                "BOOL_OR(last_seen_at >= NOW() - CAST(:window AS INTERVAL)) "
+                "AS active "
+                "FROM governance_wrapper_registrations "
+                + (
+                    "WHERE agent_id = :agent_id "
+                    if agent_id is not None
+                    else ""
+                )
+                + "GROUP BY agent_id, provider "
+                "ORDER BY agent_id, provider"
+            ),
+            params,
+        )
+        by_agent = [
+            {
+                "agent_id": row["agent_id"],
+                "provider": row["provider"],
+                "active": bool(row["active"]),
+                "last_seen_at": (
+                    row["last_seen_at"].isoformat()
+                    if row["last_seen_at"]
+                    else None
+                ),
+            }
+            for row in by_agent_res.mappings()
+        ]
+
+        # Unwrapped agents: seen in recent audit events but not in the
+        # registry. Helpful for operator drill-down.
+        unwrapped_res = await conn.execute(
+            text(
+                "SELECT DISTINCT e.agent_id "
+                "FROM governance_audit_events e "
+                "WHERE e.created_at >= NOW() - CAST(:window AS INTERVAL) "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM governance_wrapper_registrations r "
+                "  WHERE r.agent_id = e.agent_id "
+                "  AND r.last_seen_at >= NOW() - CAST(:window AS INTERVAL)"
+                ") "
+                "ORDER BY e.agent_id LIMIT 200"
+            ),
+            {"window": window},
+        )
+        unwrapped = [r["agent_id"] for r in unwrapped_res.mappings()]
+
+    now = datetime.now(timezone.utc)
+
+    if total_wrappers == 0:
+        return {
+            "as_of": now.isoformat(),
+            "active_wrappers": active_wrappers,
+            "total_wrappers": 0,
+            "coverage_pct": None,
+            "coverage_pct_reason": "no_scope_policies_registered",
+            "by_agent": by_agent,
+            "unwrapped_agents_seen_in_audit": unwrapped,
+            "active_window_days": active_window_days,
+        }
+
+    if agent_id is not None:
+        coverage_pct: float | None = 1.0 if active_wrappers > 0 else 0.0
+    else:
+        coverage_pct = min(1.0, active_wrappers / total_wrappers)
+
+    return {
+        "as_of": now.isoformat(),
+        "active_wrappers": active_wrappers,
+        "total_wrappers": total_wrappers,
+        "coverage_pct": coverage_pct,
+        "coverage_pct_reason": "ok",
+        "by_agent": by_agent,
+        "unwrapped_agents_seen_in_audit": unwrapped,
+        "active_window_days": active_window_days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F7 Governance Health Endpoint
+# ---------------------------------------------------------------------------
+#
+# Two response shapes on a single path (``GET /health/governance``):
+#
+# * Unauthenticated (K8s liveness, anonymous probes): returns the minimal
+#   ``{"status": "ok"}`` and nothing else. Per the Cybersec MED ruling in
+#   the F7 review, latency numbers and chain-integrity signals leak load
+#   patterns and operational state to anyone who can hit the pod, so we
+#   hard-cap the anonymous response surface.
+# * Authenticated (valid session cookie, legacy bearer token, or dev
+#   mode): returns the full ``GovernanceHealthView`` with DB reachability,
+#   last chain verification timestamp, append-only grant status, audit
+#   write latency percentiles, chain integrity state, and the
+#   resolved/unresolved HMAC key fingerprint lists. The ``unresolved``
+#   list is the LOUD signal that F6 Track B deferred to F7.
+#
+# Auth detection is opt-in: we do NOT use the ``authenticate`` dependency
+# because this endpoint must answer ``200 {"status": "ok"}`` to unauthed
+# callers (K8s liveness compatibility). Instead we inline a lightweight
+# session lookup that mirrors ``authenticate`` but returns ``None`` on any
+# failure instead of raising 401.
+async def _health_authenticated(request: Request) -> bool:
+    """Return True iff the request carries valid session/token/dev auth.
+
+    Must not raise. Any failure (bad cookie, expired session, DB down,
+    missing token) returns ``False`` — the caller will fall through to
+    the unauthenticated minimal response shape. This intentionally does
+    NOT mutate ``request.state``; the health endpoint does not need
+    ``user_id`` or ``role`` for its branch decision.
+    """
+    if DEV_MODE:
+        return True
+
+    session_cookie = request.cookies.get("governance_session")
+    if session_cookie and engine is not None:
+        try:
+            sid = UUID(session_cookie)
+        except ValueError:
+            return False
+        try:
+            async with engine.connect() as conn:
+                res = await conn.execute(
+                    text(
+                        "SELECT s.expires_at, s.revoked "
+                        "FROM governance_console_sessions s "
+                        "JOIN governance_console_users u "
+                        "  ON s.user_id = u.user_id "
+                        "WHERE s.session_id = :sid "
+                        "AND u.disabled = FALSE"
+                    ),
+                    {"sid": str(sid)},
+                )
+                row = res.mappings().first()
+        except Exception:
+            return False
+        if row is None or row["revoked"]:
+            return False
+        expires = row["expires_at"]
+        if expires.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            return False
+        return True
+
+    auth_header = request.headers.get("Authorization", "")
+    if CONSOLE_TOKEN and auth_header == f"Bearer {CONSOLE_TOKEN}":
+        return True
+
+    return False
+
+
+@app.get("/health/governance")
+async def governance_health(request: Request) -> dict[str, Any]:
+    """Governance health endpoint with two response shapes.
+
+    Unauthenticated callers receive ``{"status": "ok"}`` only — K8s
+    liveness probes and anonymous monitors get a liveness signal without
+    leaking internal state. Authenticated callers receive the full
+    ``GovernanceHealthView`` shape.
+
+    The authenticated view reports DB reachability, last chain
+    verification timestamp, append-only grant status, audit write
+    latency percentiles, chain integrity state, and the resolved /
+    unresolved HMAC key fingerprint lists. A non-empty
+    ``chain_keys_unresolved`` list is the LOUD missing-key signal
+    deferred from F6 Track B.
+    """
+    # Local import to avoid colliding with F3's in-place edits to the
+    # top-level ``from .models.responses import (...)`` block.
+    from .models.responses import GovernanceHealthView
+
+    authed = await _health_authenticated(request)
+    if not authed:
+        # Minimal shape — K8s liveness only. Do NOT add fields here.
+        return {"status": "ok"}
+
+    # ------------------------------------------------------------------
+    # Authenticated shape. Each probe is wrapped so a single failure
+    # cannot knock the whole endpoint offline: if we cannot reach the DB
+    # we still return a structured response with ``db_reachable: False``
+    # and ``chain_integrity_status: "unverified"``.
+    # ------------------------------------------------------------------
+    db_reachable = False
+    append_only_grants_ok = False
+    last_chain_verify_ts: datetime | None = None
+    chain_integrity_status = "unverified"
+    chain_keys_resolved: list[str] = []
+    chain_keys_unresolved: list[str] = []
+    audit_write_p50_ms: float | None = None
+    audit_write_p95_ms: float | None = None
+
+    if engine is not None:
+        try:
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+                db_reachable = True
+
+                # Append-only grants check: confirm that UPDATE/DELETE
+                # privileges on the audit table are not granted to the
+                # current application role. Defence-in-depth probe —
+                # the migration revokes these grants, and this endpoint
+                # surfaces drift.
+                try:
+                    grants_res = await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM "
+                            "information_schema.table_privileges "
+                            "WHERE table_name = 'governance_audit_events' "
+                            "AND privilege_type IN ('UPDATE', 'DELETE') "
+                            "AND grantee = CURRENT_USER"
+                        )
+                    )
+                    grants_row = grants_res.first()
+                    append_only_grants_ok = (
+                        grants_row is not None and int(grants_row[0]) == 0
+                    )
+                except Exception:
+                    append_only_grants_ok = False
+        except Exception:
+            db_reachable = False
+
+    # Audit module: last verify ts, chain integrity, key fingerprints,
+    # latency histogram. All reads are best-effort — a missing attribute
+    # means the feature is disabled or still being wired by #19 Track A,
+    # not a bug.
+    if audit_module is not None:
+        try:
+            last_chain_verify_ts = getattr(
+                audit_module, "last_chain_verify_ts", None
+            )
+            chain_integrity_status = getattr(
+                audit_module, "chain_integrity_status", "unverified"
+            )
+            chain_keys_resolved = list(
+                getattr(audit_module, "chain_keys_resolved", []) or []
+            )
+            chain_keys_unresolved = list(
+                getattr(audit_module, "chain_keys_unresolved", []) or []
+            )
+            audit_write_p50_ms = getattr(
+                audit_module, "write_latency_p50_ms", None
+            )
+            audit_write_p95_ms = getattr(
+                audit_module, "write_latency_p95_ms", None
+            )
+        except Exception:
+            pass
+
+    view = GovernanceHealthView(
+        status="ok" if db_reachable else "degraded",
+        db_reachable=db_reachable,
+        last_chain_verify_ts=last_chain_verify_ts,
+        append_only_grants_ok=append_only_grants_ok,
+        audit_write_p50_ms=audit_write_p50_ms,
+        audit_write_p95_ms=audit_write_p95_ms,
+        chain_integrity_status=chain_integrity_status,
+        chain_keys_resolved=chain_keys_resolved,
+        chain_keys_unresolved=chain_keys_unresolved,
+    )
+    return view.model_dump(mode="json")

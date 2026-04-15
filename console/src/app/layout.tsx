@@ -4,6 +4,7 @@ import "./globals.css";
 import { Providers } from "./providers";
 import { WalkthroughProvider } from "@/components/Walkthrough";
 import { AppShell } from "@/components/AppShell";
+import { V3DeprecationBanner } from "@/components/V3DeprecationBanner";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -50,6 +51,7 @@ export default function RootLayout({
       <body className="min-h-screen antialiased">
         <Providers>
           <WalkthroughProvider>
+            <V3DeprecationBanner />
             <AppShell>{children}</AppShell>
           </WalkthroughProvider>
         </Providers>

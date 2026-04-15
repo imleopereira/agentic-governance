@@ -320,6 +320,78 @@ async def _run_budget(database_url: str, agent_id: str) -> None:
         await engine.dispose()
 
 
+async def _run_rotate_chain_key(
+    *,
+    database_url: str,
+    new_key_uri: str,
+    operator_id: str,
+    reason: str,
+) -> None:
+    """Execute an HMAC chain key rotation via the rotation.py procedure.
+
+    Resolves the outgoing key from ``GOVERNANCE_AUDIT_SECRET`` and the
+    incoming key from ``--new-key-uri``. Prints a prominent warning
+    telling the operator which env var every verifier instance must be
+    updated to set — see design doc section 14.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from codeatelier_governance.audit.keys import _resolve_uri  # type: ignore
+    from codeatelier_governance.audit.rotation import rotate_chain_key
+
+    outgoing = os.environ.get("GOVERNANCE_AUDIT_SECRET")
+    if not outgoing:
+        sys.stderr.write(
+            "Error: GOVERNANCE_AUDIT_SECRET must be set to the CURRENT "
+            "(outgoing) key before rotating.\n"
+        )
+        sys.exit(2)
+    outgoing_bytes = outgoing.encode("utf-8")
+
+    incoming_bytes = _resolve_uri(new_key_uri)
+    if incoming_bytes is None:
+        sys.stderr.write(
+            f"Error: could not resolve --new-key-uri {new_key_uri!r}. "
+            f"Check that the env var is set or the file exists and is readable.\n"
+        )
+        sys.exit(2)
+
+    engine = create_async_engine(_normalize_url_sync(database_url))
+    try:
+        result = await rotate_chain_key(
+            engine,
+            outgoing_secret=outgoing_bytes,
+            incoming_secret=incoming_bytes,
+            operator_id=operator_id,
+            rotation_reason=reason,
+        )
+    finally:
+        await engine.dispose()
+
+    # Flush the bounded LRU negative-result cache so the verifier picks
+    # up the freshly-provisioned incoming key on the next ``resolve_key``
+    # call. Without this, an operator who ran a verify BEFORE rotating
+    # (seeding the cache with ``UNAVAILABLE`` for the new fingerprint)
+    # would continue seeing ``unverified`` rows until the process
+    # restarted. POLISH 2 DA fix.
+    from codeatelier_governance.audit.keys import clear_key_cache
+    clear_key_cache()
+
+    sys.stdout.write(
+        "Chain key rotation complete.\n"
+        f"  marker chain_seq : {result.marker_chain_seq}\n"
+        f"  outgoing version : {result.outgoing_key_version}\n"
+        f"  incoming version : {result.incoming_key_version}\n"
+        f"  outgoing fp      : {result.outgoing_fingerprint[:16]}...\n"
+        f"  incoming fp      : {result.incoming_fingerprint[:16]}...\n"
+        "\n"
+        "ACTION REQUIRED: every verifier instance must be configured to "
+        "resolve the incoming fingerprint via a URI map entry pointing at "
+        f"the same key bytes used above ({new_key_uri}). Until this is done, "
+        "rows past the marker will verify as 'unverified' (not 'failed').\n"
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -416,6 +488,33 @@ def _build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument(
         "--output", type=str, default=None,
         help="Output file path (default: stdout)",
+    )
+
+    # rotate-chain-key (F6 Track B)
+    rotate_parser = subparsers.add_parser(
+        "rotate-chain-key",
+        help="Rotate the HMAC chain key (F6 Track B: dual-signed marker row)",
+    )
+    rotate_parser.add_argument(
+        "--database-url", type=str, default=None,
+        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
+    )
+    rotate_parser.add_argument(
+        "--new-key-uri", type=str, required=True,
+        help="URI of the incoming key material: env://NAME or file:///path",
+    )
+    rotate_parser.add_argument(
+        "--operator-id", type=str, default="cli",
+        help="Operator identifier recorded in marker metadata",
+    )
+    rotate_parser.add_argument(
+        "--reason", type=str, default="scheduled",
+        choices=["scheduled", "incident", "policy"],
+        help="Rotation reason (default: scheduled)",
+    )
+    rotate_parser.add_argument(
+        "--confirm", action="store_true", default=False,
+        help="Confirm the rotation (required — prevents accidental rotations)",
     )
 
     # console (user management subcommands)
@@ -739,6 +838,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 date_from_str=getattr(args, "date_from", None),
                 date_to_str=getattr(args, "date_to", None),
                 output_path=getattr(args, "output", None),
+            )
+        )
+
+    elif args.command == "rotate-chain-key":
+        database_url = _resolve_database_url(args)
+        if not args.confirm:
+            sys.stderr.write(
+                "rotate-chain-key: add --confirm to proceed. "
+                "Rotation writes a marker row and updates the key registry.\n"
+            )
+            sys.exit(2)
+        asyncio.run(
+            _run_rotate_chain_key(
+                database_url=database_url,
+                new_key_uri=args.new_key_uri,
+                operator_id=args.operator_id,
+                reason=args.reason,
             )
         )
 

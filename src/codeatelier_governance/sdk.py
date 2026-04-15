@@ -23,6 +23,7 @@ import structlog
 
 from .audit.jsonl_store import JsonlFallbackStore
 from .audit.module import AuditModule
+from .coverage.registry import WrapperRegistry
 from .audit.store import AuditStore, BatchingWriter, InMemoryAuditStore  # noqa: F401
 from .contracts.module import ContractsModule
 from .cost.module import CostModule
@@ -102,6 +103,13 @@ class GovernanceConfig:
     # "max_tokens_not_declared" warning for projects that always use the same cap.
     # Must be >= 1 when provided; negative values would corrupt budget gate projection.
     default_max_tokens: int | None = None
+    # F9: wrapper coverage tracking. OFF by default — opt-in per CLAUDE.md
+    # "every module is opt-in via config, not code changes". When False, no
+    # WrapperRegistry is instantiated, wrap_openai / wrap_anthropic skip
+    # registration, and compliance reports return
+    # coverage_pct_reason='registry_disabled'. Set True to enable the
+    # F9 wrapper coverage table (requires the F9 migration to be applied).
+    enable_coverage: bool = False
 
     def __post_init__(self) -> None:
         """Validate field constraints that cannot be expressed as dataclass defaults."""
@@ -143,6 +151,7 @@ class GovernanceSDK:
         loop_policies: list[Any] | None = None,
         hot_reload: bool = False,
         hot_reload_interval: int = 30,
+        agent_identity_config: Any = None,
         **kwargs: Any,
     ) -> None:
         if not database_url and not api_key:
@@ -166,6 +175,15 @@ class GovernanceSDK:
         # Registry of wrapper labels recorded by wrap_anthropic() / wrap_openai().
         # Used at start() to warn operators when zero enforcement wrappers are active.
         self._registered_wrappers: list[str] = []
+        # F9: in-process wrapper coverage registry. Opt-in via
+        # ``enable_coverage=True``. When disabled (the default), remains
+        # ``None`` so wrap_openai / wrap_anthropic skip registration and
+        # no Postgres flush attempt is made at start() time — existing
+        # v0.5 users upgrading to v0.6 see no behavior change and no
+        # warning unless they explicitly opt in.
+        self._wrapper_registry: WrapperRegistry | None = (
+            WrapperRegistry() if self.config.enable_coverage else None
+        )
 
         resolved_secret_str = audit_secret or self._resolve_audit_secret()
         resolved_secret = (
@@ -198,6 +216,31 @@ class GovernanceSDK:
         # working, but a loud warning is logged at init so operators know
         # audit persistence is off.
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # F6 Track A: build the Ed25519 signer (may be None in production
+        # when the operator has not opted in). Constraints #3 and #5: in
+        # test mode default to an EphemeralKeyStore so GovernanceSDK() works
+        # zero-config; in production default to None (unsigned rows) unless
+        # the caller explicitly passes an AgentIdentityConfig.
+        # ------------------------------------------------------------------
+        self._identity_signer: Any = None
+        self._identity_registry: Any = None
+        self._identity_revocations: Any = None
+        try:
+            self._identity_signer, self._identity_registry, self._identity_revocations = (
+                self._build_identity(agent_identity_config)
+            )
+        except Exception as exc:  # noqa: BLE001 — constraint #1
+            logger.warning(
+                "sdk.identity_bootstrap_failed",
+                error_type=type(exc).__name__,
+                detail=(
+                    "Agent identity init failed; audit rows will be written "
+                    "with signature_status='unsigned_local_failure'. Host "
+                    "call path is unaffected."
+                ),
+            )
+
         if self.config.enable_audit:
             store = self._build_audit_store(database_url, self._shared_engine)
             # Durable fallback: when the primary is down, audit events spill
@@ -211,6 +254,7 @@ class GovernanceSDK:
                 secret=resolved_secret,
                 writer=writer,
                 verify_chain_on_read=self.config.verify_chain_on_read,
+                signer=self._identity_signer,
             )
         else:
             logger.warning(
@@ -226,6 +270,7 @@ class GovernanceSDK:
             self.audit = AuditModule(
                 InMemoryAuditStore(max_events=64),
                 secret=resolved_secret,
+                signer=self._identity_signer,
             )
 
         # ------------------------------------------------------------------
@@ -380,6 +425,118 @@ class GovernanceSDK:
                     database_url=database_url,
                     engine=self._shared_engine,
                 )
+
+    # ------------------------------------------------------------------
+    # F6 Track A: agent identity bootstrap
+    # ------------------------------------------------------------------
+
+    def _build_identity(
+        self, agent_identity_config: Any
+    ) -> tuple[Any, Any, Any]:
+        """Build ``(signer, registry, revocations)`` per constraints #1/#3/#5.
+
+        Returns ``(None, None, None)`` when identity is disabled and not in
+        test mode. In test mode (``is_test_mode()`` True) and with no
+        explicit config, defaults to ``EphemeralKeyStore`` so
+        ``GovernanceSDK()`` is zero-config per invariant #5.
+
+        NEVER raises into caller: any error is logged and the tuple is
+        ``(None, None, None)`` — the audit path then writes
+        ``signature_status='unsigned'`` (or ``'unsigned_local_failure'`` if
+        a signer was built but fails at sign time).
+        """
+        # Local imports keep the identity subsystem off the import path for
+        # pure in-memory SDK uses that have not opted in.
+        from .identity.config import AgentIdentityConfig
+        from .identity.keystore import (
+            EphemeralKeyStore,
+            build_keystore,
+            is_test_mode,
+        )
+        from .identity.registry import AgentKeyRegistry
+        from .identity.revocation import RevocationStore
+        from .identity.signer import Ed25519Signer
+
+        cfg: AgentIdentityConfig | None = agent_identity_config
+        if cfg is None and is_test_mode():
+            # Constraint #3/#5: zero-config test mode auto-enables ephemeral
+            # signing so GovernanceSDK() works in any test without fixtures.
+            cfg = AgentIdentityConfig(enabled=True, key_source="ephemeral")
+
+        if cfg is None or not cfg.enabled:
+            return (None, None, None)
+
+        if cfg.key_source == "ephemeral":
+            keystore: Any = EphemeralKeyStore(agent_id="governance.default")
+        else:
+            keystore = build_keystore(
+                agent_id="governance.default",
+                key_source=cfg.key_source,
+                key_uri=cfg.key_uri,
+            )
+            keystore.bootstrap_if_allowed(cfg.allow_bootstrap)
+
+        private_key = keystore.load_private_key()
+        signer = Ed25519Signer.from_private_key(private_key)
+
+        registry = AgentKeyRegistry(engine=self._shared_engine)
+        revocations = RevocationStore(engine=self._shared_engine)
+
+        # NOTE: DO NOT register the public key here. Registration is
+        # deferred to ``start()`` so we can stamp
+        # ``activated_at_chain_seq`` with the CURRENT chain head rather
+        # than a hardcoded 0. With a non-zero head, lookups by seq-range
+        # (Track B overlapping-rotation path) find this key correctly.
+        # See blocker fix note in ``_register_identity_key``.
+        return (signer, registry, revocations)
+
+    async def _register_identity_key(self) -> None:
+        """Register the signer's public key at the CURRENT chain head.
+
+        Best-effort: if the audit store cannot be queried (DB down,
+        in-memory store, missing method) we fall back to 0 — which is
+        correct for an empty chain AND for any in-memory substrate.
+        On any unexpected failure we log WARN and continue: invariant
+        #1 (host application must survive governance DB unreachability).
+        """
+        signer = self._identity_signer
+        registry = self._identity_registry
+        if signer is None or registry is None:
+            return
+        current_seq = 0
+        store = getattr(self.audit, "_store", None)
+        getter = getattr(store, "get_current_chain_seq", None)
+        if getter is not None:
+            try:
+                current_seq = int(await getter())
+            except Exception as exc:  # noqa: BLE001 — invariant #1
+                logger.warning(
+                    "sdk.identity_key_seq_lookup_failed",
+                    error_type=type(exc).__name__,
+                    detail=(
+                        "Could not query current chain head; key "
+                        "registration deferred with activated_at_chain_seq=0. "
+                        "This is safe for an empty chain but may cause "
+                        "Track B lookups to miss keys registered after "
+                        "rotation. Re-run start() once the DB is reachable."
+                    ),
+                )
+                return
+        try:
+            registry.register(
+                key_fingerprint=signer.fingerprint,
+                agent_id="governance.default",
+                public_key_pem=signer.public_key_pem,
+                activated_at_chain_seq=current_seq,
+            )
+        except ValueError:
+            # Already registered under the same key — idempotent.
+            pass
+        except Exception as exc:  # noqa: BLE001 — invariant #1
+            logger.warning(
+                "sdk.identity_key_register_failed",
+                error_type=type(exc).__name__,
+            )
 
     # ------------------------------------------------------------------
     # Audit secret resolution
@@ -581,6 +738,26 @@ class GovernanceSDK:
         # so .log() calls from dependent modules handle their own buffer
         # state correctly.
         await self.audit.start()
+
+        # F6 Track A: register the Ed25519 public key at the CURRENT chain
+        # head. Deferred from __init__ so we can stamp
+        # ``activated_at_chain_seq`` with MAX(chain_seq) instead of 0. Any
+        # failure is swallowed (invariant #1).
+        await self._register_identity_key()
+
+        # F9: flush in-memory wrapper registry to Postgres mirror.
+        # Fire-and-forget — any exception is swallowed inside the registry
+        # so host apps keep working when the governance DB is unreachable
+        # (invariant #1). Opportunistic 30-day prune runs inline.
+        # Only runs when enable_coverage=True at SDK construction time.
+        if self._wrapper_registry is not None:
+            try:
+                await self._wrapper_registry.flush_to_postgres(self._shared_engine)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "wrapper_registry.flush_failed",
+                    error_type=type(exc).__name__,
+                )
 
         if self.config.warn_on_no_wrappers and not self._registered_wrappers:
             logger.warning(

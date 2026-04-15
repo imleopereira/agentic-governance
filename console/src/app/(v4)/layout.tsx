@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { notFound } from "next/navigation";
 
 import { ErrorBoundary } from "@/components/v4/ErrorBoundary";
-import { DisconnectBanner } from "@/components/v4/DisconnectBanner";
+import { DisconnectBanner } from "@/components/DisconnectBanner";
 
 /**
  * v4 console shell layout boundary.
