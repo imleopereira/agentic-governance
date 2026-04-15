@@ -344,7 +344,6 @@ async def test_db_error_bumps_cache_timestamp(
 
     # Immediate next call should NOT trigger another connect (within TTL)
     connect_attempts = 0
-    original_engine = presence._engine
 
     class _CountingEngine:
         def connect(self) -> None:
