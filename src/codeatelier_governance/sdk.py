@@ -306,12 +306,19 @@ class GovernanceSDK:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
             )
+            # v0.5.4 kill switch wiring: scope.check() will fail-closed
+            # with AgentKilledError when an operator clicks "Kill" in the
+            # console. Setter is no-op if scope is also disabled.
+            if hasattr(self, "scope") and hasattr(self.scope, "set_presence_module"):
+                self.scope.set_presence_module(self.presence)
         else:
             logger.warning(
                 "sdk.presence_disabled",
                 detail=(
-                    "enable_presence=False — sdk.presence is not constructed.  "
-                    "Agent heartbeat tracking is off."
+                    "enable_presence=False — sdk.presence is not constructed. "
+                    "Agent heartbeat tracking AND the v0.5.4 kill switch are off. "
+                    "Console kill clicks will record audit events but will NOT "
+                    "halt agents at the SDK enforcement boundary."
                 ),
             )
 

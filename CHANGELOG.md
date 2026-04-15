@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.5.4 (2026-04-14) — kill switch enforcement hotfix
+
+Emergency P0 hotfix. Closes a shipped production bug in v0.5.3 where the console
+"Halt" button (backend route `/api/agents/{agent_id}/kill`) wrote a kill marker
+into `governance_agent_presence.metadata_json` and emitted an `agent.killed`
+audit event, but the SDK enforcement path **never read the kill marker**. Result:
+operators clicking Halt saw an audit log entry and a status badge change while
+the agent kept running. The CLAUDE.md kill-switch requirement was violated for
+every v0.5.3 deployment.
+
+### Security
+
+- **Kill switch now actually halts the agent.** `sdk.scope.check()` calls
+  `presence.assert_alive(agent_id)` first, raising `AgentKilledError` if the
+  agent has been killed by an operator via the console. The check reads from a
+  5-second TTL in-memory cache backed by `governance_agent_presence`, so the hot
+  path stays fast (one dict lookup + one timestamp comparison) and the worst-case
+  delay between kill click and enforcement is bounded by the cache TTL.
+- **Detection uses metadata, not status.** Kill state derives from
+  `metadata_json->>'_killed_by' IS NOT NULL`, NOT from `status='unresponsive'`.
+  The status column is overloaded by `check_stale()` (heartbeat timeouts), so
+  gating on it would also block agents that simply went idle. The metadata
+  marker is the unambiguous kill signal.
+- **Invariant #1 preserved.** When the governance DB is unreachable, the kill
+  cache holds the last known state and a warning is logged — already-killed
+  agents stay killed, live agents stay live, and the host application keeps
+  running. The refresh path never raises out to the caller.
+
+### What's new
+
+- `codeatelier_governance.presence.AgentKilledError` — raised by the SDK when
+  an action is attempted by a killed agent. Distinct exception type so callers
+  can differentiate from `ScopeViolation`, `PolicyNotRegistered`, etc.
+- `PresenceModule.is_killed(agent_id) -> bool`
+- `PresenceModule.assert_alive(agent_id) -> None`
+- `PresenceModule.force_refresh_killed_cache()` — bypass TTL (used by tests
+  and by future LISTEN/NOTIFY-driven invalidation in v0.6)
+- `ScopeModule.set_presence_module(presence)` — wired automatically by
+  `GovernanceSDK.__init__` when `enable_presence=True` AND `enable_scope=True`
+
+### Tests
+
+`tests/presence/test_kill_switch.py` — 28 tests covering happy path, cache
+TTL behaviour (including 50-concurrent-call double-checked-locking under load),
+Invariant #1 DB-outage resilience, in-memory mode, edge cases (unicode IDs,
+500-agent scaling, partial metadata, un-kill via metadata removal, idempotent
+re-kill), and ScopeModule integration with ordering checks (kill check fires
+BEFORE PolicyNotRegistered and BEFORE the tool/api ValueError).
+
+### What is NOT in this hotfix (intentional)
+
+- **Only `scope.check()` is patched.** `cost.check_budget()` and `gates.check()`
+  should also call `assert_alive()`. v0.5.4 ships scope only because it's the
+  most-called gate; cost+gates land in v0.6.
+- **No LLM-wrapper enforcement.** `wrap_anthropic()` / `wrap_openai()` should
+  call `assert_alive()` before send. Same v0.6 deferral.
+- **No "un-kill" admin endpoint.** Restore by clearing `_killed_by`/`_killed_at`/
+  `_kill_reason` from `governance_agent_presence.metadata_json`. v0.6 console
+  gets a "Restore" button.
+- **Cache invalidation is TTL-only.** No Postgres LISTEN/NOTIFY. 5-second
+  worst-case delay between kill click and enforcement. v0.6 adds push-based
+  invalidation if needed.
+- **Naming kept as `kill` everywhere.** Per memory `project_v05_prd.md` the
+  product name was approved as "halt" in the v0.5 PRD, but renaming the wire,
+  audit-event-kind, metadata fields, exception class, and SDK methods in a
+  hotfix would be a chain-history breaking change. The full `kill` → `halt`
+  rename is documented in the v0.6 PRD as F2.5 with a migration script for
+  the `agent.killed` → `agent.halted` audit event kind. v0.5.4 keeps the old
+  names for hotfix safety; v0.6 ships the rename with backward-compat aliases.
+
+### Migration
+
+None required. Drop-in upgrade from v0.5.3:
+
+```bash
+pip install --upgrade code-atelier-governance==0.5.4
+```
+
+The cache TTL constant `_KILL_CACHE_TTL_SECONDS = 5.0` is module-level and
+not yet runtime-configurable; v0.6 will expose it via `GovernanceSDK.config`.
+
 ## v0.5.1 (2026-04-12)
 
 Hotfix release covering four findings from a product-wide DX audit: three systemic

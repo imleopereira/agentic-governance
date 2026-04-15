@@ -10,14 +10,22 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 import structlog
 
+from .errors import AgentKilledError
 from .models import AgentStatus
 
 logger = structlog.get_logger(__name__)
+
+# Kill-switch cache TTL: 5 seconds.
+# Trade-off: bounds DB load (max 1 query per 5s per host process) at the cost
+# of a worst-case 5-second delay between an operator clicking Kill in the
+# console and the SDK fail-closing on that agent. Hotfix v0.5.4 default.
+_KILL_CACHE_TTL_SECONDS = 5.0
 
 
 class PresenceModule:
@@ -35,6 +43,14 @@ class PresenceModule:
         # In-memory fallback: {agent_id: {status, last_heartbeat, started_at, metadata}}
         self._agents: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
+        # Kill-switch cache: agent_id -> kill metadata dict.
+        # Refreshed from DB on stale read. See _refresh_killed_cache below.
+        # Designed for Invariant #1: if the DB is unreachable, _killed_cache
+        # holds the last known good state so already-killed agents stay killed
+        # and live agents stay live, instead of crashing the host application.
+        self._killed_cache: dict[str, dict[str, Any]] = {}
+        self._killed_cache_at: float = 0.0
+        self._killed_lock = asyncio.Lock()
 
     def _get_engine(self) -> Any:
         """Return the shared engine, or lazily create one if no shared engine was provided."""
@@ -305,6 +321,165 @@ class PresenceModule:
                 "presence.check_stale_failed",
                 error_type=type(exc).__name__,
             )
+
+    # ------------------------------------------------------------------
+    # Kill switch (v0.5.4 hotfix)
+    # ------------------------------------------------------------------
+    #
+    # The kill switch is the single fail-closed control an operator has over
+    # a running agent. When an operator clicks "Kill" in the console
+    # (POST /api/agents/{agent_id}/kill), the console writes a marker into
+    # `governance_agent_presence.metadata_json` containing `_killed_by`,
+    # `_killed_at`, `_kill_reason`. THIS module is the SDK-side enforcement
+    # of that marker.
+    #
+    # IMPORTANT: as of v0.5.4 we do NOT use `status='unresponsive'` to detect
+    # kills, because `check_stale()` also writes that status for heartbeat
+    # timeouts. Conflating the two would block agents that simply went idle.
+    # The metadata marker is the unambiguous kill signal.
+    #
+    # Cache strategy: 5-second TTL in-memory dict. On every is_killed() /
+    # assert_alive() call, if the cache is older than TTL, refresh from DB.
+    # If the DB is unreachable (Invariant #1), the cache holds the last known
+    # state — already-killed agents stay killed, live agents stay live, and
+    # the host application keeps running. A WARNING is logged on DB error
+    # but no exception propagates.
+    #
+    # Why on PresenceModule and not a separate KillSwitchModule: presence
+    # already owns `governance_agent_presence` and has the engine wiring.
+    # Adding a second module for one column-read would double the DB-engine
+    # lifecycle surface area for zero gain.
+
+    async def is_killed(self, agent_id: str) -> bool:
+        """Return True if the agent has been killed by an operator.
+
+        Reads from a 5-second TTL cache. On cache miss or stale, refreshes
+        from `governance_agent_presence` looking for any row where
+        `metadata_json->>'_killed_by'` IS NOT NULL. On DB error, falls back
+        to the existing cache (Invariant #1: never crashes the host).
+
+        This method is the source of truth for kill state inside the SDK.
+        Called by:
+          * scope.check() top-of-function
+          * cost.check_budget() top-of-function
+          * gates.check() top-of-function
+          * any wrapped LLM client (wrap_anthropic / wrap_openai) before send
+        """
+        await self._maybe_refresh_killed_cache()
+        return agent_id in self._killed_cache
+
+    async def assert_alive(self, agent_id: str) -> None:
+        """Raise AgentKilledError if the agent has been killed.
+
+        Convenience wrapper over is_killed() that includes the kill metadata
+        in the exception so callers don't have to look it up separately.
+
+        Raises:
+            AgentKilledError: the agent is in the killed-cache.
+        """
+        await self._maybe_refresh_killed_cache()
+        kill_meta = self._killed_cache.get(agent_id)
+        if kill_meta is not None:
+            raise AgentKilledError(
+                agent_id,
+                killed_by=kill_meta.get("killed_by"),
+                killed_at=kill_meta.get("killed_at"),
+                reason=kill_meta.get("reason"),
+            )
+
+    async def _maybe_refresh_killed_cache(self) -> None:
+        """Refresh the killed-agent cache from DB if older than TTL.
+
+        Locked so concurrent callers only trigger one DB query per refresh.
+        Best-effort: on DB error, leaves the existing cache in place and
+        logs. Never raises (Invariant #1).
+        """
+        now = time.monotonic()
+        if (now - self._killed_cache_at) < _KILL_CACHE_TTL_SECONDS:
+            return
+        async with self._killed_lock:
+            # Double-check after acquiring the lock — another coroutine may
+            # have refreshed while we were waiting.
+            now = time.monotonic()
+            if (now - self._killed_cache_at) < _KILL_CACHE_TTL_SECONDS:
+                return
+            engine = self._get_engine()
+            if engine is None:
+                # No DB configured (in-memory mode for tests). Use the
+                # in-memory _agents dict as the source of truth.
+                self._killed_cache = self._derive_killed_from_memory()
+                self._killed_cache_at = now
+                return
+            try:
+                fresh = await self._fetch_killed_from_postgres(engine)
+            except Exception as exc:
+                logger.warning(
+                    "presence.killed_cache_refresh_failed",
+                    error_type=type(exc).__name__,
+                    cached_count=len(self._killed_cache),
+                )
+                # Keep the existing cache. Bump the timestamp so we don't
+                # hammer the DB during an outage; we'll retry next TTL.
+                self._killed_cache_at = now
+                return
+            self._killed_cache = fresh
+            self._killed_cache_at = now
+
+    def _derive_killed_from_memory(self) -> dict[str, dict[str, Any]]:
+        """Extract kill markers from the in-memory _agents fallback."""
+        out: dict[str, dict[str, Any]] = {}
+        for aid, data in self._agents.items():
+            meta = data.get("metadata") or {}
+            killed_by = meta.get("_killed_by")
+            if killed_by is None:
+                continue
+            out[aid] = {
+                "killed_by": killed_by,
+                "killed_at": meta.get("_killed_at"),
+                "reason": meta.get("_kill_reason"),
+            }
+        return out
+
+    async def _fetch_killed_from_postgres(
+        self, engine: Any
+    ) -> dict[str, dict[str, Any]]:
+        """Query DB for all currently-killed agents.
+
+        SELECT agent_id + the three kill metadata fields. Filters on
+        metadata_json->>'_killed_by' IS NOT NULL — the marker the console
+        writes in `kill_agent` (app.py:1788-1802).
+        """
+        from sqlalchemy import text
+
+        async with engine.connect() as conn:
+            res = await conn.execute(
+                text(
+                    "SELECT agent_id, "
+                    "       metadata_json->>'_killed_by' AS killed_by, "
+                    "       metadata_json->>'_killed_at' AS killed_at, "
+                    "       metadata_json->>'_kill_reason' AS reason "
+                    "FROM governance_agent_presence "
+                    "WHERE metadata_json->>'_killed_by' IS NOT NULL"
+                )
+            )
+            rows = list(res.mappings())
+        return {
+            row["agent_id"]: {
+                "killed_by": row["killed_by"],
+                "killed_at": row["killed_at"],
+                "reason": row["reason"],
+            }
+            for row in rows
+        }
+
+    async def force_refresh_killed_cache(self) -> None:
+        """Force an immediate refresh of the killed-cache, bypassing TTL.
+
+        Used by tests and by future LISTEN/NOTIFY-driven invalidation
+        (out of scope for v0.5.4 — that's v0.6 work).
+        """
+        self._killed_cache_at = 0.0
+        await self._maybe_refresh_killed_cache()
 
     async def close(self) -> None:
         """Release resources. Disposes the engine only if this module owns it."""
