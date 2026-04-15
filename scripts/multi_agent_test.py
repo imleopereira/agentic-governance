@@ -36,10 +36,12 @@ from codeatelier_governance import (
 )
 from codeatelier_governance.integrations.openai_wrap import wrap_openai
 
-DB_URL = os.environ.get(
-    "GOVERNANCE_DATABASE_URL",
-    "postgresql://governance:governance@localhost:5435/governance_qa",
-)
+DB_URL = os.environ.get("GOVERNANCE_DATABASE_URL")
+if not DB_URL:
+    raise SystemExit(
+        "GOVERNANCE_DATABASE_URL is not set. "
+        "This script no longer falls back to a hardcoded credential."
+    )
 SESSION_ID = uuid.uuid4()
 
 # The customer ticket we're processing

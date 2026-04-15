@@ -46,3 +46,6 @@ console/package-lock.json
 scripts/automation/logs/
 scripts/automation/*.sh
 scripts/automation/install-cron.sh
+
+# Internal planning docs (PRDs, strategy, roadmaps) — never commit to this repo
+decisions/

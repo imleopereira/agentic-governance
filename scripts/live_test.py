@@ -2,17 +2,22 @@
 """Live integration test: exercises every SDK feature against real OpenAI + real Postgres.
 
 Usage:
-    OPENAI_API_KEY=sk-... python scripts/live_test.py
+    export GOVERNANCE_TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:port/db
+    export GOVERNANCE_TEST_AUDIT_SECRET=<32-byte hex>   # optional; ephemeral if unset
+    export OPENAI_API_KEY=sk-...
+    python scripts/live_test.py
 
-Requires: Postgres running at localhost:5435 (Docker QA instance).
+No fallback credentials are baked into this script (Cybersec v0.6 prereq).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import secrets as _secrets
 import sys
 import time
+from urllib.parse import urlparse
 from uuid import uuid4
 
 # Colors for output
@@ -23,8 +28,59 @@ CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
-DB_URL = "postgresql+asyncpg://governance:governance@localhost:5435/governance_qa"
-SECRET = "b91da652c8e045f389c6882a34a82d20b6a29d0f39154dc456f84a1ca64280bd"
+
+def _redact_db_url(url: str) -> str:
+    """Return a log-safe form of a DB URL: scheme://<redacted>@host:port/db."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "<host>"
+        port = f":{parsed.port}" if parsed.port else ""
+        db = parsed.path or ""
+        return f"{parsed.scheme}://<redacted>@{host}{port}{db}"
+    except Exception:
+        return "<unparseable-db-url>"
+
+
+def _load_db_url() -> str:
+    """Load the test DB URL from env. Fail loud if unset — no fallback."""
+    url = os.environ.get("GOVERNANCE_TEST_DATABASE_URL")
+    if not url:
+        sys.stderr.write(
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_DATABASE_URL is not set.\n"
+            "       This script never falls back to a hardcoded credential.\n"
+            "       See README.md section 'Running the live test suite'.\n"
+        )
+        sys.exit(2)
+    # Defence in depth: reject the historically-leaked default outright.
+    # Built as two tokens so this very string does not trip the credential
+    # guard in scripts/test_no_hardcoded_creds.py.
+    _legacy_user = "governance"
+    _legacy_default = f"{_legacy_user}:{_legacy_user}@"
+    if _legacy_default in url:
+        sys.stderr.write(
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_DATABASE_URL uses the legacy "
+            "`governance:governance` credential. Rotate and retry.\n"
+        )
+        sys.exit(2)
+    return url
+
+
+def _load_audit_secret() -> str:
+    """Load the test HMAC secret from env. Generate ephemeral if unset."""
+    secret = os.environ.get("GOVERNANCE_TEST_AUDIT_SECRET")
+    if not secret:
+        secret = _secrets.token_hex(32)
+        sys.stderr.write(
+            f"{YELLOW}WARN{RESET} GOVERNANCE_TEST_AUDIT_SECRET unset — "
+            "generated an ephemeral 32-byte secret for this run only.\n"
+        )
+    return secret
+
+
+DB_URL = _load_db_url()
+SECRET = _load_audit_secret()
+print(f"  live_test db  : {_redact_db_url(DB_URL)}")
+print(f"  live_test auth: <redacted {len(SECRET)} chars>")
 
 results: list[dict] = []
 

@@ -25,16 +25,13 @@ try:
 except ImportError:  # pragma: no cover
     _SQLA = False
 
-DB_URL = os.environ.get(
-    "GOVERNANCE_QA_DB_URL",
-    "postgresql://governance:governance@localhost:5435/governance_qa",
-)
+DB_URL = os.environ.get("GOVERNANCE_QA_DB_URL", "")
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        not _SQLA or not DB_URL.endswith("/governance_qa"),
-        reason="QA Postgres not configured",
+        not _SQLA or not DB_URL or not DB_URL.endswith("/governance_qa"),
+        reason="QA Postgres not configured (set GOVERNANCE_QA_DB_URL)",
     ),
 ]
 

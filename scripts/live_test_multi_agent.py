@@ -21,7 +21,7 @@ What it covers:
     mock data already registered by earlier automation runs.
 
 Usage:
-    GOVERNANCE_DATABASE_URL=postgresql://governance:governance@localhost:5435/governance_qa \\
+    GOVERNANCE_DATABASE_URL=postgresql://<user>:<pass>@<host>:<port>/<db> \\
     GOVERNANCE_AUDIT_SECRET=... \\
     OPENAI_API_KEY=sk-proj-... \\
     .venv/bin/python scripts/live_test_multi_agent.py
