@@ -1,5 +1,119 @@
 # Changelog
 
+## v0.6.0 (2026-04-15) — Ed25519, HMAC rotation, wrapper coverage, backend wiring
+
+Major release implementing F2–F9 of the v0.6 PRD across the SDK and console.
+
+### ⚠️ Required upgrade step
+
+**Run `alembic upgrade head` before starting the v0.6 SDK in any environment
+that has v0.5.x audit data.** The v0.6 `PostgresAuditStore` writes to the new
+`signature`, `signing_key_fingerprint`, and `signature_status` columns on
+`governance_audit_events`. Against a pre-migration v0.5.x schema those columns
+do not exist and `AuditModule.log()` degrades to `StoreUnavailableError` —
+audit rows are silently dropped until the migration is applied.
+
+The `[migrations]` extra is required to run alembic against Postgres because
+the SDK's runtime driver is `asyncpg` (async-only), and alembic's sync env.py
+needs a sync driver:
+
+```
+pip install code-atelier-governance[migrations]
+alembic upgrade head    # singular — a merge migration unifies the v0.6 heads
+```
+
+A pre-existing append-only grants gap on `governance_audit_events` is also
+closed in this release (CLAUDE.md invariant 2). After upgrading, the
+`/health/governance` endpoint should report `append_only_grants_ok: true`.
+
+### Added
+
+- **F6 Track A — Ed25519 agent identity** with three keystore backends
+  (`file://`, `env://`, `ephemeral`), per-row signatures over the HMAC chain,
+  append-only key registry and revocation tables, and graceful degradation
+  to `signature_status='unsigned_local_failure'` if the signer cannot load
+  its private key (host call path never raises).
+- **F6 Track B — HMAC chain key rotation** with dual-signed rotation marker
+  rows (outgoing + incoming MAC), salted fingerprint construction
+  (`HMAC-SHA256(key, 'codeatelier.fingerprint.v1')`), bounded LRU resolution
+  cache (max 64 entries), and a `rotate-chain-key` CLI command. Missing key
+  material resolves to `chain_integrity_status='unverified'`, surfaced via
+  `/health/governance`.
+- **F6#4 per-user rate limiting** on `/api/policies`, `/api/policies/{id}`,
+  `/api/events/stats`, `/api/agents/presence`, `/api/gates/pending`, and
+  `/api/gates/recent`. Default 60 req/min/user, configurable via
+  `GOVERNANCE_CONSOLE_USER_RATE_LIMIT`.
+- **F9 wrapper coverage registry** (opt-in via `enable_coverage=True` in
+  `GovernanceConfig`). New `governance_wrapper_registrations` table
+  (mutable state, NOT audit), in-memory primary + Postgres mirror, hostname
+  PII removal via salted hashing, instance UUID PK to defeat PID reuse,
+  opportunistic 30-day prune, and a new `GET /api/coverage` endpoint.
+- **F3 backend endpoint wiring** — all 9 prior orphan endpoints now use
+  Pydantic response models with `extra="forbid"` and pass through a
+  recursive secret-redaction layer (`sk-ant-`, `sk-`, `xoxb-`, `gh[ps]_`,
+  AWS keys). Session DELETE now emits a `pipeline.session_revoked`
+  audit event.
+- **F2 P0 console fixes** — halt 404 fixed, SSE ghost-field hydration via
+  lazy `GET /api/events/{event_id}` with typed `AuditEventView`, truncation
+  bucket relabel, DisconnectBanner consolidation with `rankWorst()`,
+  `KillRequest.reason` validator (NFC normalize, 512-char cap, escape
+  `\\` first then `\n\r\t`, strip C0 controls).
+- **F6#5 sanitizer hardening** — `sanitizeErrorMessage` now strips DSNs,
+  Unix and Windows filesystem paths, IPv4 and IPv6 addresses in addition
+  to the existing auth-keyword patterns.
+- **F7 pipeline hygiene** — new `GET /health/governance` (anon: status only;
+  authed: chain-integrity + key resolution state + p50/p95 latency),
+  `automation/lib/validate_cron_artifacts.py` (CI not cron), pre-commit
+  TODO gate at `.githooks/pre-commit-todo-gate.sh` (allows version-tagged
+  `TODO(vN.M.P):`), `Makefile install-hooks` target, `CODEOWNERS` at repo
+  root, `V3DeprecationBanner` mounted in the v3 root layout, and CI jobs
+  for `tsc --noEmit`, `validate-cron-artifacts`, `console-version-parity`.
+- **Migrations runbook** at `docs/migrations.md`.
+- **Integration test** at `tests/integration/test_migration_against_seeded_db.py`
+  that spins up a real Postgres in Docker, seeds v0.5.x-shaped audit rows,
+  runs `alembic upgrade head`, and asserts the migration backfill, the
+  append-only enforcement, and the post-migration default behavior. Marked
+  `@pytest.mark.integration` so it is skipped by default.
+
+### Changed
+
+- Console version bumped from `0.4.0` to `0.5.0` (`app.py` + `package.json`).
+- `compliance/models.py::ComplianceReport` now carries
+  `coverage_pct_reason: Literal["no_scope_policies_registered","registry_disabled","ok"] | None`
+  to disambiguate `coverage_pct=None` between "registry disabled" and
+  "denominator is zero."
+- `migrations/env.py` now coerces `postgresql://` and `postgresql+asyncpg://`
+  URLs to `postgresql+psycopg://` at runtime so alembic can run with the
+  optional `[migrations]` extra installed.
+
+### Security
+
+- New tables `governance_agent_keys`, `governance_agent_key_revocations`,
+  `governance_audit_chain_keys` are append-only at the grant level
+  (`REVOKE UPDATE, DELETE FROM PUBLIC`).
+- New migration `978884c6b7f1_revoke_audit_grants.py` closes a pre-existing
+  gap on `governance_audit_events`: the append-only trigger has been in
+  place since v0.1, but the role-level grants were never revoked. v0.6
+  brings the original audit table to parity with the new identity tables.
+- `cryptography>=42.0,<46.0` added as a direct runtime dependency
+  (Cybersecurity-approved, see `.agent-outputs/cybersecurity/`).
+
+### Known limitations
+
+- 6 v0.6 PRD features remain pending and ship in v0.6.1: F1 console
+  honesty pass, F2.5 full `kill`→`halt` rename, F4 compliance console
+  surface, F5 HITL approval queue panel, F8 code quality remainder
+  (TS literal narrowing, hand-rolled SSE validator, 4 critical v4 tests),
+  and F6 bundle items 3 (audit write rate limiting) and 6 (tenant-scoped
+  query keys).
+- The v3 console remains the default. The v4 IA shell exists under
+  `console/src/app/(v4)/` and is opt-in via
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION=v4`. The default flips to v4 once F1
+  wires the F3 backend consumers and un-stubs `useAgentPolicy`.
+- `JsonlFallbackStore` does not yet round-trip the new signature columns;
+  rows recovered from the disk fallback degrade to `signature_status='unsigned'`
+  (constraint #7: not a chain break).
+
 ## v0.5.4 (2026-04-14) — kill switch enforcement hotfix
 
 Emergency P0 hotfix. Closes a shipped production bug in v0.5.3 where the console

@@ -75,6 +75,18 @@ publish = [
     "build",
     "twine",
 ]
+# Alembic's migrations/env.py runs in sync mode (Alembic has no async
+# runner). The SDK's runtime path uses asyncpg, but asyncpg cannot be
+# used as a SQLAlchemy sync driver, so migration runs need a sync
+# Postgres driver. psycopg3 is the actively-maintained successor to
+# psycopg2 and ships a smaller wheel. Install with:
+#     pip install "code-atelier-governance[migrations]"
+# See docs/migrations.md for details. Do NOT add psycopg to the core
+# runtime dependencies — that would pull ~3MB into every install just
+# to cover a one-shot `alembic upgrade head` operation.
+migrations = [
+    "psycopg[binary]>=3.1,<4.0",
+]
 
 [project.scripts]
 governance = "codeatelier_governance.cli:main"

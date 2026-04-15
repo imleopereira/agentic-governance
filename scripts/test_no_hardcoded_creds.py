@@ -110,10 +110,22 @@ def _is_placeholder(token: str) -> bool:
     return False
 
 # Allowlist: this guard script itself contains the patterns by design.
+#
+# scripts/automation/deprecated/console-redesign-*.sh — the v0.6 F7 quick
+# wins moved 4 superseded console-redesign pipeline scripts into the
+# deprecated/ subdir as historical reference. They contain hardcoded dev
+# DB URLs from the v0.5.x era. They are git-tracked (intentionally, per
+# the deprecation README), but they are no longer executed and should
+# not block the credential guard. If they are ever resurrected, the
+# credentials must be sourced from env vars first.
 ALLOW_SUFFIXES: tuple[str, ...] = (
     "scripts/test_no_hardcoded_creds.py",
     "scripts/test_no_hardcoded_creds.sh",
     "tests/test_scripts_no_hardcoded_creds.py",
+    "scripts/automation/deprecated/console-redesign-backend.sh",
+    "scripts/automation/deprecated/console-redesign-frontend.sh",
+    "scripts/automation/deprecated/console-redesign-pipeline.sh",
+    "scripts/automation/deprecated/console-redesign-review.sh",
 )
 
 

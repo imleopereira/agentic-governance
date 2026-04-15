@@ -17,9 +17,15 @@ REVOKEd from PUBLIC on both new tables.  This matches the existing audit
 events append-only convention.
 
 Backfill: existing ``governance_audit_events`` rows predate Ed25519
-signing, so their ``signature_status`` is set to ``'legacy_unsigned'``
-by an UPDATE immediately after the column is added.  Constraint #7 of the
-design: legacy rows are NOT a chain break.
+signing, so their ``signature_status`` must land as ``'legacy_unsigned'``.
+**This cannot be done with an UPDATE** — ``governance_audit_events`` has
+a row-level append-only trigger that blocks every UPDATE regardless of
+column.  Instead we use a DDL-only backfill: ``ADD COLUMN ... DEFAULT
+'legacy_unsigned'`` (Postgres writes the default into every existing
+row as part of the DDL itself, without firing row triggers), then
+``ALTER COLUMN ... SET DEFAULT 'unsigned'`` so future INSERTs get the
+live default.  Constraint #7 of the design: legacy rows are NOT a chain
+break.
 """
 from typing import Sequence, Union
 
@@ -121,25 +127,41 @@ def upgrade() -> None:
             ),
         ),
     )
+    # !!! DO NOT "SIMPLIFY" THIS INTO AN UPDATE !!!
+    # DDL-only backfill via column DEFAULT — UPDATE is forbidden by the
+    # append-only trigger on governance_audit_events (ddl.sql installs
+    # trg_audit_no_update which RAISEs on every UPDATE regardless of
+    # column). Postgres ADD COLUMN with DEFAULT performs an in-place
+    # backfill of existing rows as part of the DDL itself, without
+    # firing row triggers. Then ALTER COLUMN SET DEFAULT switches
+    # future INSERTs to 'unsigned'. Existing rows keep 'legacy_unsigned';
+    # new rows start as 'unsigned' until the signer path overwrites
+    # them with 'signed' or 'unsigned_local_failure'.
+    #
+    # Regression history: the first draft of this migration used an
+    # UPDATE and crashed against a real Postgres with 243 existing
+    # audit rows (v0.6 pre-release, 2026-04-15). Tests passed because
+    # the test DB was empty. The integration test at
+    # tests/integration/test_migration_against_seeded_db.py now seeds
+    # real rows before running `alembic upgrade head` to catch any
+    # future regression.
     op.add_column(
         "governance_audit_events",
         sa.Column(
             "signature_status",
             sa.Text(),
             nullable=False,
-            server_default=sa.text("'unsigned'"),
+            server_default=sa.text("'legacy_unsigned'"),
             comment=(
                 "Allowed values: signed | unsigned | unsigned_local_failure "
                 "| legacy_unsigned | revoked_key | invalid_signature | unknown_key"
             ),
         ),
     )
-
-    # Constraint #7 backfill: every existing row is legacy_unsigned.
-    op.execute(
-        "UPDATE governance_audit_events "
-        "SET signature_status = 'legacy_unsigned' "
-        "WHERE signature IS NULL"
+    op.alter_column(
+        "governance_audit_events",
+        "signature_status",
+        server_default=sa.text("'unsigned'"),
     )
 
 
