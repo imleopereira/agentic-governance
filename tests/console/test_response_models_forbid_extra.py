@@ -75,6 +75,24 @@ def test_unexpected_field_raises_validation_error() -> None:
         )
 
 
+def test_subclass_with_extra_allow_raises_at_class_creation() -> None:
+    """``StrictResponse.__init_subclass__`` fires at ``class`` statement time.
+
+    This is the belt half of the belt-and-suspenders: even if a model is
+    defined in a module the conftest lint doesn't scan (e.g. a dynamically
+    imported plugin), the base class refuses to let ``extra='allow'``
+    land. The error fires at import time, not at first-use time.
+    """
+    from pydantic import ConfigDict
+
+    from codeatelier_governance.console.models.responses import PolicyRow
+
+    with pytest.raises(TypeError, match="extra='forbid'"):
+
+        class Evil(PolicyRow):  # type: ignore[misc]
+            model_config = ConfigDict(extra="allow")
+
+
 def test_nested_unexpected_field_raises_validation_error() -> None:
     """Nested shapes must also reject unknown keys."""
     with pytest.raises(ValidationError):

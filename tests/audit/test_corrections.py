@@ -5,6 +5,8 @@ Each test here maps back to one cell in the threat matrix in that docstring.
 """
 from __future__ import annotations
 
+import secrets
+
 import pytest
 
 from codeatelier_governance.audit import (
@@ -18,7 +20,12 @@ from codeatelier_governance.audit.corrections import (
     hash_commit_sha,
 )
 
-_HMAC_KEY = b"k" * 32
+# Deterministic but high-entropy key. The corrections module rejects keys
+# with < 8 distinct bytes (e.g. ``b"k" * 32``) to catch placeholder-secret
+# leaks; the test suite uses ``secrets.token_bytes`` so every run gets a
+# real key that passes the entropy floor.
+_HMAC_KEY = secrets.token_bytes(32)
+_HMAC_KEY_ALT = secrets.token_bytes(32)
 
 
 def _base_payload(**overrides: object) -> dict[str, object]:
@@ -303,7 +310,7 @@ def test_hash_commit_sha_deterministic_for_same_key() -> None:
 
 def test_hash_commit_sha_varies_with_key() -> None:
     a = hash_commit_sha("81b5912", _HMAC_KEY)
-    b = hash_commit_sha("81b5912", b"x" * 32)
+    b = hash_commit_sha("81b5912", _HMAC_KEY_ALT)
     assert a != b
 
 
@@ -337,3 +344,94 @@ def test_exception_exposes_field_reason_and_hint() -> None:
         assert exc.operator_hint
     else:
         pytest.fail("CorrectionValidationError not raised")
+
+
+def test_exception_str_contains_operator_hint() -> None:
+    """A refactor must not silently drop operator_hint from ``__str__``.
+
+    The CLI surfaces ``str(exc)`` to the operator — losing the hint there
+    would turn a fix-in-30-seconds error into a pager ping.
+    """
+    with pytest.raises(CorrectionValidationError) as exc_info:
+        validate_correction_payload({"kind": "wrong.kind"}, hmac_key=_HMAC_KEY)
+    assert exc_info.value.operator_hint in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# H1 — SHA look-behind hardening
+# ---------------------------------------------------------------------------
+def test_xsha256_prefix_bypass_is_rejected() -> None:
+    """A raw SHA glued to a non-word prefix (``xsha256-...``) must fail.
+
+    The earlier look-behind accepted any character before ``sha256-`` as
+    "not hex, therefore sanctioned hashed token", which let real hex
+    payloads slip through if an attacker prepended a single character.
+    The tightened pattern requires ``sha256-`` to sit at a word boundary.
+    """
+    with pytest.raises(CorrectionValidationError) as exc:
+        validate_correction_payload(
+            _base_payload(note="see commit xsha256-deadbeef1234"),
+            _HMAC_KEY,
+        )
+    assert exc.value.field == "note"
+
+
+# ---------------------------------------------------------------------------
+# H2 — HMAC key entropy floor
+# ---------------------------------------------------------------------------
+def test_low_entropy_hmac_key_rejected_in_validate() -> None:
+    with pytest.raises(CorrectionValidationError) as exc:
+        validate_correction_payload(_base_payload(), b"k" * 32)
+    assert exc.value.field == "hmac_key"
+    assert "low_entropy" in exc.value.reason or "entropy" in exc.value.operator_hint.lower()
+
+
+def test_low_entropy_hmac_key_rejected_in_hash_commit_sha() -> None:
+    with pytest.raises(CorrectionValidationError) as exc:
+        hash_commit_sha("81b5912", b"\x00" * 32)
+    assert exc.value.field == "hmac_key"
+
+
+# ---------------------------------------------------------------------------
+# B3 — Second-layer guard on AuditModule.log for audit.correction
+# ---------------------------------------------------------------------------
+async def test_direct_sdk_audit_log_correction_raises(audit: object) -> None:
+    """``sdk.audit.log(AuditEvent(kind='audit.correction'))`` must be refused.
+
+    The first-layer allowlist is only invoked by code paths that choose
+    to call it. Any code path that constructs an ``AuditEvent`` directly
+    would otherwise bypass every field / reason / pattern check. The
+    second-layer guard in ``AuditModule.log`` raises RuntimeError to
+    prevent that.
+    """
+    from codeatelier_governance.audit.models import AuditEvent
+
+    with pytest.raises(RuntimeError, match="log_validated_correction"):
+        await audit.log(  # type: ignore[attr-defined]
+            AuditEvent(
+                agent_id="sneaky",
+                kind="audit.correction",
+                metadata={"note": "/Users/leo/secret.py"},
+            )
+        )
+
+
+async def test_log_validated_correction_happy_path(audit: object) -> None:
+    """The sanctioned path writes a correction event successfully."""
+    sanitized = validate_correction_payload(_base_payload(), _HMAC_KEY)
+    record = await audit.log_validated_correction(  # type: ignore[attr-defined]
+        sanitized, _HMAC_KEY
+    )
+    assert record.kind == "audit.correction"
+    assert record.metadata["reason"] == "operator_marked_erroneous"
+    assert record.metadata["operator_id"] == "leo@codeatelier"
+
+
+async def test_log_validated_correction_rejects_unsanitized_kind(
+    audit: object,
+) -> None:
+    """A raw dict with a non-correction kind is rejected before reaching log."""
+    with pytest.raises(RuntimeError, match="allowlist"):
+        await audit.log_validated_correction(  # type: ignore[attr-defined]
+            {"kind": "system.override"}, _HMAC_KEY
+        )

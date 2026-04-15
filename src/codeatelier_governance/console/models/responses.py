@@ -21,7 +21,7 @@ class of bugs at the serialization boundary. The collection-time lint in
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Union
+from typing import Any, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,10 +32,38 @@ MetadataValue = Union[str, int, float, bool, None]
 _STRICT = ConfigDict(extra="forbid", strict=True)
 
 
+class StrictResponse(BaseModel):
+    """Base class for every console response model.
+
+    Enforces ``extra='forbid'`` and ``strict=True`` at class-creation time
+    via ``__init_subclass__``. This closes a gap that the collection-time
+    conftest lint cannot cover: a rogue subclass defined anywhere in the
+    codebase (not just in this module) that silently relaxes the config is
+    rejected the moment Python evaluates the ``class`` statement.
+
+    The conftest lint still runs as a belt-and-suspenders check.
+    """
+
+    model_config = _STRICT
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        cfg = getattr(cls, "model_config", {}) or {}
+        extra = cfg.get("extra") if isinstance(cfg, dict) else None
+        strict = cfg.get("strict") if isinstance(cfg, dict) else None
+        if extra != "forbid" or strict is not True:
+            raise TypeError(
+                f"{cls.__name__} must declare "
+                f"model_config=ConfigDict(extra='forbid', strict=True); "
+                f"got extra={extra!r}, strict={strict!r}. Response models "
+                f"leak internal state when extras are permitted."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Policies
 # ---------------------------------------------------------------------------
-class PolicyRow(BaseModel):
+class PolicyRow(StrictResponse):
     """Single row from governance_policies."""
 
     model_config = _STRICT
@@ -48,7 +76,7 @@ class PolicyRow(BaseModel):
     updated_at: datetime | None = None
 
 
-class PolicyListResponse(BaseModel):
+class PolicyListResponse(StrictResponse):
     """GET /api/policies — all policies, sorted by (agent_id, policy_type)."""
 
     model_config = _STRICT
@@ -56,7 +84,7 @@ class PolicyListResponse(BaseModel):
     policies: list[PolicyRow]
 
 
-class AgentPoliciesResponse(BaseModel):
+class AgentPoliciesResponse(StrictResponse):
     """GET /api/policies/{agent_id} — scope + budget for one agent."""
 
     model_config = _STRICT
@@ -68,7 +96,7 @@ class AgentPoliciesResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Agent presence
 # ---------------------------------------------------------------------------
-class AgentPresenceRow(BaseModel):
+class AgentPresenceRow(StrictResponse):
     """Single row from governance_agent_presence."""
 
     model_config = _STRICT
@@ -83,7 +111,7 @@ class AgentPresenceRow(BaseModel):
     )
 
 
-class AgentPresenceResponse(BaseModel):
+class AgentPresenceResponse(StrictResponse):
     """GET /api/agents/presence — all agents with presence status."""
 
     model_config = _STRICT
@@ -94,7 +122,7 @@ class AgentPresenceResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Event stats
 # ---------------------------------------------------------------------------
-class EventStatsResponse(BaseModel):
+class EventStatsResponse(StrictResponse):
     """GET /api/events/stats — rolling counts for the last hour / 5 min."""
 
     model_config = _STRICT
@@ -107,7 +135,7 @@ class EventStatsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Gate context
 # ---------------------------------------------------------------------------
-class GateAgentPresence(BaseModel):
+class GateAgentPresence(StrictResponse):
     """Presence snapshot embedded in GET /api/gates/{id}/context."""
 
     model_config = _STRICT
@@ -116,7 +144,7 @@ class GateAgentPresence(BaseModel):
     last_heartbeat: datetime | None = None
 
 
-class GateRecentEvent(BaseModel):
+class GateRecentEvent(StrictResponse):
     """One row in the recent-agent-events list on gate context."""
 
     model_config = _STRICT
@@ -125,7 +153,7 @@ class GateRecentEvent(BaseModel):
     created_at: datetime | None = None
 
 
-class GateContextResponse(BaseModel):
+class GateContextResponse(StrictResponse):
     """GET /api/gates/{request_id}/context — rich approval context."""
 
     model_config = _STRICT
@@ -154,7 +182,7 @@ class GateContextResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Gate claim
 # ---------------------------------------------------------------------------
-class GateClaimResponse(BaseModel):
+class GateClaimResponse(StrictResponse):
     """POST /api/gates/{request_id}/claim — reviewer claim response."""
 
     model_config = _STRICT
@@ -168,7 +196,7 @@ class GateClaimResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Gate escalate
 # ---------------------------------------------------------------------------
-class GateEscalateResponse(BaseModel):
+class GateEscalateResponse(StrictResponse):
     """POST /api/gates/{request_id}/escalate — escalation response."""
 
     model_config = _STRICT
@@ -182,7 +210,7 @@ class GateEscalateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Batch approve
 # ---------------------------------------------------------------------------
-class BatchApproveFailure(BaseModel):
+class BatchApproveFailure(StrictResponse):
     """One failed item inside the batch-approve response."""
 
     model_config = _STRICT
@@ -191,7 +219,7 @@ class BatchApproveFailure(BaseModel):
     reason: str
 
 
-class BatchApproveResponse(BaseModel):
+class BatchApproveResponse(StrictResponse):
     """POST /api/gates/batch-approve — batch approval response."""
 
     model_config = _STRICT
@@ -206,7 +234,7 @@ class BatchApproveResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Session revoke
 # ---------------------------------------------------------------------------
-class SessionRevokeResponse(BaseModel):
+class SessionRevokeResponse(StrictResponse):
     """DELETE /api/auth/sessions/{session_id} — revoke a session."""
 
     model_config = _STRICT

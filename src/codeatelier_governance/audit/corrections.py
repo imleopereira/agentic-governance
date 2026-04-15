@@ -18,6 +18,21 @@ This module is the single enforcement point for every correction event the
 SDK ever writes. No correction may be appended to the audit chain without
 passing ``validate_correction_payload`` first.
 
+Sanctioned write path
+---------------------
+The ONLY sanctioned way to append an ``audit.correction`` event to the
+chain is::
+
+    sanitized = validate_correction_payload(raw_payload, hmac_key)
+    await sdk.audit.log_validated_correction(sanitized, hmac_key)
+
+Direct calls to ``sdk.audit.log(AuditEvent(kind="audit.correction", ...))``
+are refused at the top of ``AuditModule.log`` with a ``RuntimeError``.
+This second-layer guard exists because the allowlist below only protects
+operators who remember to call it — an adversarial or buggy code path
+that constructs the ``AuditEvent`` directly would otherwise bypass every
+field / reason / pattern check. The ``log`` guard closes that gap.
+
 Threat model
 ------------
 1. Kind smuggling — attacker sends a payload with ``kind="system.override"``
@@ -73,6 +88,38 @@ from typing import Any
 
 PERMITTED_KINDS: frozenset[str] = frozenset({"audit.correction"})
 
+# Minimum distinct byte count required in an HMAC key. Catches the
+# ``b"k" * 32`` / ``b"\x00" * 32`` class of placeholder-secret bugs that
+# pass the length check but are trivially guessable. Mirrors the check
+# in ``codeatelier_governance.audit.module._check_secret_strength`` but
+# inlined here to avoid an import cycle (module → corrections → module).
+_MIN_HMAC_KEY_UNIQUE_BYTES = 8
+
+
+def _check_hmac_key_strength(hmac_key: bytes | bytearray) -> None:
+    """Reject HMAC keys that are too short or have trivial entropy.
+
+    Called from ``hash_commit_sha`` and ``validate_correction_payload``
+    so every correction-path HMAC consumer inherits the same floor.
+    """
+    if not isinstance(hmac_key, (bytes, bytearray)) or len(hmac_key) < 16:
+        raise CorrectionValidationError(
+            field="hmac_key",
+            reason="key_too_short",
+            operator_hint="Pass the audit HMAC key (>= 16 bytes).",
+        )
+    if len(set(bytes(hmac_key))) < _MIN_HMAC_KEY_UNIQUE_BYTES:
+        raise CorrectionValidationError(
+            field="hmac_key",
+            reason="key_low_entropy",
+            operator_hint=(
+                f"HMAC key has < {_MIN_HMAC_KEY_UNIQUE_BYTES} distinct "
+                "bytes. This usually means a placeholder like b'k' * 32 "
+                "leaked into production. Generate a real key with "
+                "secrets.token_bytes(32)."
+            ),
+        )
+
 NOTE_MAX_CHARS: int = 256
 
 ALLOWED_FIELDS: frozenset[str] = frozenset(
@@ -116,10 +163,23 @@ FORBIDDEN_NOTE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bcron(?:job)?\b", re.IGNORECASE),
     re.compile(r"\bbranch\b", re.IGNORECASE),
     re.compile(r"console-redesign", re.IGNORECASE),
-    # Raw git SHAs: 7+ hex chars as a standalone token. The look-behind
-    # excludes hex that is part of a ``sha256-<hex>`` hashed-token produced
-    # by hash_commit_sha(), which IS the allowed provenance format.
-    re.compile(r"(?<![0-9a-fA-F])(?<!sha256-)[0-9a-fA-F]{7,40}(?![0-9a-fA-F])"),
+    # Raw git SHAs: 7+ hex chars as a standalone token. A ``sha256-<hex>``
+    # hashed token produced by ``hash_commit_sha`` is the sanctioned
+    # provenance format and is excluded via the ``(?<!<WB>sha256-)`` guard,
+    # where ``<WB>`` means a word boundary or start-of-string before
+    # ``sha256-``. The earlier ``(?<!sha256-)`` look-behind was too loose:
+    # ``xsha256-deadbeef`` satisfied it because ``x`` does not break the
+    # fixed-width look-behind, which meant a raw SHA glued onto a harmless
+    # prefix slipped through. The stricter form below requires the literal
+    # ``sha256-`` to start at a word boundary (or at the beginning of the
+    # note), matching the exact output format of ``hash_commit_sha`` and
+    # nothing else.
+    re.compile(
+        r"(?<![0-9a-fA-F])"
+        r"(?<!(?:^|\b)sha256-)"
+        r"[0-9a-fA-F]{7,40}"
+        r"(?![0-9a-fA-F])"
+    ),
     # IPv4 addresses
     re.compile(
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b",
@@ -161,12 +221,7 @@ def hash_commit_sha(sha: str, hmac_key: bytes) -> str:
             reason="empty_or_non_string",
             operator_hint="Pass the full commit SHA as a non-empty string.",
         )
-    if not isinstance(hmac_key, (bytes, bytearray)) or len(hmac_key) < 16:
-        raise CorrectionValidationError(
-            field="hmac_key",
-            reason="key_too_short",
-            operator_hint="Pass the audit HMAC key (>= 16 bytes).",
-        )
+    _check_hmac_key_strength(hmac_key)
     digest = hmac.new(bytes(hmac_key), sha.encode("utf-8"), sha256).hexdigest()
     return f"sha256-{digest[:12]}"
 
@@ -321,12 +376,7 @@ def validate_correction_payload(
             operator_hint="payload must include kind, reason, operator_id, "
             "ref_chain_seq_start, ref_chain_seq_end.",
         )
-    if not isinstance(hmac_key, (bytes, bytearray)) or len(hmac_key) < 16:
-        raise CorrectionValidationError(
-            field="hmac_key",
-            reason="key_too_short",
-            operator_hint="Pass the audit HMAC key (>= 16 bytes).",
-        )
+    _check_hmac_key_strength(hmac_key)
 
     # Unknown-field rejection first: fail before we touch any value.
     for key in payload.keys():

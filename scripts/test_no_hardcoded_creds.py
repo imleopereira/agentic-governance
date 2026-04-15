@@ -14,17 +14,24 @@ Exit 0 on clean scan. Exit 1 with a line-by-line report on any match.
 """
 from __future__ import annotations
 
+import fnmatch
 import pathlib
 import re
+import subprocess
 import sys
 from collections.abc import Iterable
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 SCAN_GLOBS: tuple[str, ...] = (
-    "scripts/*.py",
-    "scripts/*.sh",
+    "scripts/**/*.py",
+    "scripts/**/*.sh",
     "tests/**/*.py",
+    "src/**/*.py",
+    "README.md",
+    "pyproject.toml",
+    "**/*.yaml",
+    "**/*.toml",
 )
 
 # Each entry: (regex, human description).
@@ -49,7 +56,58 @@ PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"""AUDIT_SECRET\s*=\s*['"][0-9a-fA-F]{8,}['"]"""),
         "AUDIT_SECRET hex literal",
     ),
+    # Generic URL with embedded userinfo (e.g. postgres://user:password@host).
+    # Catches hardcoded credentials inside any protocol URL, not just the
+    # governance:governance default. Anything matching ``://u:p@`` in any
+    # scanned file trips the guard, UNLESS both the user and password are
+    # obvious placeholders (``user``, ``pass``, ``password``, ``fake``,
+    # ``x``, ``<user>``, ``<pass>``, ``...``) — those belong in docstrings
+    # and READMEs. The check happens in ``_line_trips_userinfo_pattern``
+    # below because a pure regex cannot express "reject only real-looking
+    # credentials".
+    (
+        re.compile(r"://(?P<user>[^:/\s]+):(?P<pw>[^@/\s]+)@"),
+        "URL with embedded userinfo credentials",
+    ),
 )
+
+# Lowercase tokens that mean "this is a placeholder, not a real credential".
+# If BOTH halves of a userinfo pair are in this set (or look like a
+# ``<bracketed>`` / ``${var}`` / all-punct placeholder), we don't flag it.
+_PLACEHOLDER_USERINFO: frozenset[str] = frozenset(
+    {
+        "user",
+        "username",
+        "pass",
+        "password",
+        "passwd",
+        "fake",
+        "x",
+        "u",
+        "p",
+        "admin",
+        "me",
+        "you",
+        "test",
+        "example",
+        "changeme",
+        "secret",
+        "s3cret",
+        "...",
+    }
+)
+
+
+def _is_placeholder(token: str) -> bool:
+    t = token.strip().lower()
+    if not t:
+        return True
+    if t in _PLACEHOLDER_USERINFO:
+        return True
+    # ``<user>`` / ``<pass>`` / ``${VAR}`` / ``%VAR%`` — templating syntax.
+    if t.startswith(("<", "${", "%")) and t.endswith((">", "}", "%")):
+        return True
+    return False
 
 # Allowlist: this guard script itself contains the patterns by design.
 ALLOW_SUFFIXES: tuple[str, ...] = (
@@ -59,13 +117,40 @@ ALLOW_SUFFIXES: tuple[str, ...] = (
 )
 
 
+def _git_tracked_files() -> list[pathlib.Path]:
+    """Return every file tracked by git at the repo root.
+
+    Using git as the source of truth means gitignored agent-scratch files
+    (under ``scripts/automation/``, etc.) are never scanned. If git isn't
+    available we fall back to a filesystem walk.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return [p for p in REPO_ROOT.rglob("*") if p.is_file()]
+    paths: list[pathlib.Path] = []
+    for chunk in out.stdout.split(b"\x00"):
+        if not chunk:
+            continue
+        paths.append(REPO_ROOT / chunk.decode("utf-8", errors="replace"))
+    return paths
+
+
 def _iter_files() -> Iterable[pathlib.Path]:
     seen: set[pathlib.Path] = set()
-    for pattern in SCAN_GLOBS:
-        for p in REPO_ROOT.glob(pattern):
-            if p.is_file() and p not in seen:
-                seen.add(p)
-                yield p
+    tracked = _git_tracked_files()
+    for path in tracked:
+        if not path.is_file():
+            continue
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if any(fnmatch.fnmatch(rel, pat) for pat in SCAN_GLOBS):
+            if path not in seen:
+                seen.add(path)
+                yield path
 
 
 def _is_allowlisted(path: pathlib.Path) -> bool:
@@ -85,11 +170,19 @@ def scan() -> list[str]:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             for regex, description in PATTERNS:
-                if regex.search(line):
-                    rel = path.relative_to(REPO_ROOT)
-                    offenses.append(
-                        f"{rel}:{lineno}: {description}: {line.strip()[:160]}"
-                    )
+                match = regex.search(line)
+                if not match:
+                    continue
+                # Placeholder exemption for the URL-userinfo pattern.
+                if "user" in match.groupdict() and "pw" in match.groupdict():
+                    if _is_placeholder(match.group("user")) and _is_placeholder(
+                        match.group("pw")
+                    ):
+                        continue
+                rel = path.relative_to(REPO_ROOT)
+                offenses.append(
+                    f"{rel}:{lineno}: {description}: {line.strip()[:160]}"
+                )
     return offenses
 
 

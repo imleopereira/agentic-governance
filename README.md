@@ -247,6 +247,49 @@ GovernanceSDK(
 )
 ```
 
+## Running the live test suite
+
+`scripts/live_test.py` exercises every SDK feature against a real Postgres
+instance and a real OpenAI endpoint. It is the authoritative pre-release
+check: unit tests alone will not catch packaging, pool-lifecycle, or
+chain-integrity regressions that only surface end-to-end.
+
+Two environment variables are **required**. The script has no fallbacks:
+it fails loud if either is missing. This is a deliberate security
+property — hardcoded credentials have leaked into CI logs historically,
+so the guard in `scripts/test_no_hardcoded_creds.py` scans the tree and
+fails CI on any literal secret.
+
+```bash
+# Required: a throwaway Postgres the test owns end-to-end.
+# Spin one up locally if you don't have one:
+#     docker run --rm -d -p 5435:5432 \
+#       -e POSTGRES_USER=livetest \
+#       -e POSTGRES_PASSWORD="$(python -c 'import secrets; print(secrets.token_hex(16))')" \
+#       -e POSTGRES_DB=governance postgres:16
+export GOVERNANCE_TEST_DATABASE_URL=postgresql+asyncpg://<user>:<pass>@localhost:5435/governance
+
+# Required: a stable 32-byte HMAC key. The ephemeral-per-run path was
+# removed because chain-integrity bugs that only reproduce across runs
+# with the same key are invisible if the key rotates every run.
+export GOVERNANCE_TEST_AUDIT_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+
+# Required: OpenAI credentials. Test 4 makes a real API call.
+export OPENAI_API_KEY=sk-...
+
+python scripts/live_test.py
+```
+
+The run exercises audit (HMAC chain verification), scope, cost (with
+auto-pricing), budget gates, a real wrapped OpenAI call, loop detection,
+agent presence, behavioral contracts, built-in model pricing, per-model
+cost breakdowns, hot-reload config, and an Article 12 compliance report.
+Exit code is `0` on full pass, `1` on any failure.
+
+If you see `FATAL GOVERNANCE_TEST_DATABASE_URL is not set` or
+`FATAL GOVERNANCE_TEST_AUDIT_SECRET is not set`, export the missing env
+var and retry — the script never falls back to a default.
+
 ## Documentation
 
 Full documentation, quickstart guide, API reference, and concepts:

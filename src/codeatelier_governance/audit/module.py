@@ -124,6 +124,11 @@ class AuditModule:
         # additional ``chain.degraded_start`` event so the discontinuity is
         # visible to auditors.
         self._degraded_starts: set[UUID] = set()
+        # Sentinel for the audit-correction second-layer guard. Set by
+        # ``log_validated_correction`` to the ``id()`` of the event it just
+        # constructed; cleared immediately after the call. Any other caller
+        # that reaches ``log`` with ``kind='audit.correction'`` is refused.
+        self._sanctioned_correction_event_id: int | None = None
 
     def subscribe(
         self,
@@ -156,6 +161,71 @@ class AuditModule:
         return context.session(session_id)
 
     # --- core API -----------------------------------------------------------
+    async def log_validated_correction(
+        self,
+        validated_payload: dict[str, Any],
+        hmac_key: bytes,
+    ) -> AuditEventRecord:
+        """Append a validated audit-correction event to the chain.
+
+        This is the ONLY sanctioned path for writing ``audit.correction``
+        events. ``validated_payload`` MUST be the return value of
+        ``codeatelier_governance.audit.corrections.validate_correction_payload``
+        — no other dict shape is accepted. Direct calls to ``log`` with
+        ``kind='audit.correction'`` are refused at the top of ``log``.
+
+        The second-layer guard exists because the first-layer allowlist
+        (the ``corrections`` module) only protects operators who remember
+        to call it. A malicious or buggy code path that constructs an
+        ``AuditEvent(kind='audit.correction', metadata={...})`` directly
+        would otherwise bypass every field / reason / pattern check. This
+        entry point requires a sanitized dict that can only come from the
+        allowlist validator.
+        """
+        # Import inside the method to break an import cycle: corrections
+        # does not depend on module, and module does not need to hold a
+        # package-level reference.
+        from . import corrections as _corrections
+
+        if not isinstance(validated_payload, dict):
+            raise RuntimeError(
+                "log_validated_correction: payload must be a dict returned "
+                "by validate_correction_payload()."
+            )
+        if validated_payload.get("kind") not in _corrections.PERMITTED_KINDS:
+            raise RuntimeError(
+                "log_validated_correction: payload.kind is not in the "
+                "correction allowlist. Run validate_correction_payload() first."
+            )
+        # Re-validate as a defense in depth: if anything mutated the dict
+        # between the allowlist call and here, the second pass will catch
+        # it. This also enforces the entropy check on hmac_key via H2.
+        sanitized = _corrections.validate_correction_payload(
+            validated_payload, hmac_key
+        )
+
+        metadata: dict[str, Any] = {
+            "reason": sanitized["reason"],
+            "operator_id": sanitized["operator_id"],
+            "ref_chain_seq_start": sanitized["ref_chain_seq_start"],
+            "ref_chain_seq_end": sanitized["ref_chain_seq_end"],
+            "note": sanitized["note"],
+        }
+        event = AuditEvent(
+            agent_id="governance.operator",
+            kind=sanitized["kind"],
+            metadata=metadata,
+        )
+        # Mark the event as sanctioned so the guard in ``log`` lets it
+        # through. The flag is cleared immediately after the call returns
+        # so a stray subsequent ``log(AuditEvent(kind='audit.correction'))``
+        # still raises.
+        self._sanctioned_correction_event_id = id(event)
+        try:
+            return await self.log(event)
+        finally:
+            self._sanctioned_correction_event_id = None
+
     async def log(self, event: AuditEvent) -> AuditEventRecord:
         """Log an audit event. Returns the stored record with chain fields.
 
@@ -181,6 +251,26 @@ class AuditModule:
         marker on the next successful primary log so auditors can find
         every gap.
         """
+        # Second-layer guard: audit.correction events must flow through
+        # ``log_validated_correction``. The corrections module is the
+        # first-layer allowlist; this check catches any code path that
+        # constructs an AuditEvent with kind='audit.correction' directly
+        # and tries to bypass the field / reason / pattern allowlist.
+        from . import corrections as _corrections
+
+        if event.kind in _corrections.PERMITTED_KINDS and (
+            self._sanctioned_correction_event_id is None
+            or self._sanctioned_correction_event_id != id(event)
+        ):
+            raise RuntimeError(
+                "audit.correction events must go through "
+                "AuditModule.log_validated_correction(validate_correction_payload(...), "
+                "hmac_key) — direct sdk.audit.log(AuditEvent(kind='audit.correction')) "
+                "is not permitted. See the docstring in "
+                "codeatelier_governance.audit.corrections for the rationale and "
+                "the full allowlist."
+            )
+
         if not self._started and not self._start_warned:
             self._start_warned = True
             logger.warning(

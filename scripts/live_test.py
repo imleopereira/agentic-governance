@@ -3,18 +3,25 @@
 
 Usage:
     export GOVERNANCE_TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:port/db
-    export GOVERNANCE_TEST_AUDIT_SECRET=<32-byte hex>   # optional; ephemeral if unset
+    export GOVERNANCE_TEST_AUDIT_SECRET=<32-byte hex>
     export OPENAI_API_KEY=sk-...
     python scripts/live_test.py
 
-No fallback credentials are baked into this script (Cybersec v0.6 prereq).
+Both env vars are required. No fallback credentials, no ephemeral secret
+generation: a chain-integrity bug that only reproduces across runs with a
+stable HMAC key must be observable, which is impossible if the secret is
+regenerated every run.
+
+This module is importable with no side effects. All env-var loading and
+configuration printing happens inside ``run_all_tests`` — ``import
+scripts.live_test`` never touches ``os.environ`` and never calls
+``sys.exit``. See README.md 'Running the live test suite'.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import secrets as _secrets
 import sys
 import time
 from urllib.parse import urlparse
@@ -66,21 +73,41 @@ def _load_db_url() -> str:
 
 
 def _load_audit_secret() -> str:
-    """Load the test HMAC secret from env. Generate ephemeral if unset."""
+    """Load the test HMAC secret from env. Fail loud if unset — no fallback.
+
+    The ephemeral-secret path was removed: a chain-integrity regression that
+    only reproduces across two runs with a stable key is invisible if the
+    key rotates every run. The test must prove the attack fails, not
+    generate a fresh key and hope.
+    """
     secret = os.environ.get("GOVERNANCE_TEST_AUDIT_SECRET")
     if not secret:
-        secret = _secrets.token_hex(32)
         sys.stderr.write(
-            f"{YELLOW}WARN{RESET} GOVERNANCE_TEST_AUDIT_SECRET unset — "
-            "generated an ephemeral 32-byte secret for this run only.\n"
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_AUDIT_SECRET is not set.\n"
+            "       Generate one with:\n"
+            "           python -c 'import secrets; print(secrets.token_hex(32))'\n"
+            "       Export it and retry. See README.md section 'Running the\n"
+            "       live test suite' for the rationale (stable key is required\n"
+            "       to observe chain-integrity regressions across runs).\n"
         )
+        sys.exit(2)
     return secret
 
 
-DB_URL = _load_db_url()
-SECRET = _load_audit_secret()
-print(f"  live_test db  : {_redact_db_url(DB_URL)}")
-print(f"  live_test auth: <redacted {len(SECRET)} chars>")
+def _load_config() -> tuple[str, str]:
+    """Load all env-driven config. Called from the main entry point only.
+
+    Keeping this out of module scope means ``import scripts.live_test`` is
+    a pure, side-effect-free operation: no env reads, no prints, no exits.
+    Any tool that imports this module (pytest --collect-only, importlib,
+    IDE indexers) will not trip FATAL errors mid-collection.
+    """
+    db_url = _load_db_url()
+    secret = _load_audit_secret()
+    print(f"  live_test db  : {_redact_db_url(db_url)}")
+    print(f"  live_test auth: <redacted {len(secret)} chars>")
+    return db_url, secret
+
 
 results: list[dict] = []
 
@@ -94,6 +121,8 @@ def log_result(test: str, passed: bool, detail: str = "") -> None:
 
 
 async def run_all_tests() -> None:
+    DB_URL, SECRET = _load_config()
+
     from openai import AsyncOpenAI
 
     from codeatelier_governance import (
@@ -108,7 +137,6 @@ async def run_all_tests() -> None:
     from codeatelier_governance.scope.models import ScopePolicy
     from codeatelier_governance.cost.models import BudgetPolicy
     from codeatelier_governance.scope.errors import ScopeViolation
-    from codeatelier_governance.cost.errors import BudgetExceeded
     from codeatelier_governance.integrations.openai_wrap import wrap_openai
 
     print(f"\n{BOLD}{CYAN}{'='*60}{RESET}")
