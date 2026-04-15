@@ -61,8 +61,24 @@ class ScopeModule:
         # violated invariant #3 ("SDK MUST NOT hold long-running
         # connections in the user's request path") during sync startup.
         self._pending_upsert_policies: list[ScopePolicy] = []
+        # Optional reference to PresenceModule for the v0.5.4 kill switch.
+        # Wired by GovernanceSDK after construction via set_presence_module().
+        # If None, scope.check() runs without a kill check (degrades to v0.5.3
+        # behaviour). This is a deliberate optional dependency: ScopeModule
+        # can still be constructed and tested in isolation.
+        self._presence: Any = None
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
+
+    def set_presence_module(self, presence: Any) -> None:
+        """Wire the PresenceModule for kill-switch enforcement (v0.5.4).
+
+        Called by GovernanceSDK during start() after both modules exist.
+        Once set, every scope.check() call will first call
+        presence.assert_alive(agent_id) and fail-closed with AgentKilledError
+        if the agent has been killed by an operator via the console.
+        """
+        self._presence = presence
 
     def _get_engine(self) -> Any:
         """Return the shared engine, or lazily create one if no shared engine was provided."""
@@ -272,9 +288,21 @@ class ScopeModule:
         """Check whether ``agent_id`` is permitted to call ``tool`` or ``api``.
 
         Raises:
+            AgentKilledError: an operator has killed this agent via the
+                console kill switch (v0.5.4 hotfix). Fail-closed before
+                any other check. The kill check is fast (5-second TTL cache,
+                no DB query on the hot path) and degrades gracefully if the
+                governance DB is unreachable (Invariant #1).
             PolicyNotRegistered: no policy exists for ``agent_id``.
             ScopeViolation: the action is outside the registered scope.
         """
+        # v0.5.4 kill switch — first thing in the check.
+        # If presence module is wired, fail-closed on killed agents BEFORE
+        # any policy lookup. Skipped silently if no presence module is
+        # configured (back-compat with v0.5.3 SDK construction).
+        if self._presence is not None:
+            await self._presence.assert_alive(agent_id)
+
         if tool is None and api is None:
             raise ValueError(
                 "scope.check: pass either tool=... or api=... (or both). "
