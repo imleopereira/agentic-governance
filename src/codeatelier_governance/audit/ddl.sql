@@ -23,16 +23,13 @@ CREATE TABLE IF NOT EXISTS governance_audit_events (
     metadata_json   JSONB        NOT NULL DEFAULT '{}'::jsonb,
     prev_hash       VARCHAR(128) NULL,
     hmac_value      VARCHAR(128) NOT NULL,
-    created_at      TIMESTAMPTZ  NOT NULL,
-    -- v0.6 Ed25519 signing columns. Mirrors alembic migration
-    -- f6a1_ed25519_agent_identity.py so that fresh installs via `cga migrate`
-    -- (which runs this DDL only, NOT alembic) produce the same schema as a
-    -- migrated v0.5 -> v0.6 database. Fresh rows default to 'unsigned'; the
-    -- 'legacy_unsigned' value is reserved for rows inserted before v0.6 and
-    -- backfilled by the alembic migration.
-    signature               BYTEA NULL,
-    signing_key_fingerprint TEXT  NULL,
-    signature_status        TEXT  NOT NULL DEFAULT 'unsigned'
+    created_at      TIMESTAMPTZ  NOT NULL
+    -- NOTE: v0.6+ columns (signature, signing_key_fingerprint,
+    -- signature_status) are ADDED by alembic migrations, not by this DDL.
+    -- `cga migrate` now runs alembic after DDL so fresh installs end up
+    -- with the current schema; the upgrade path (v0.5 -> v0.6) also goes
+    -- through alembic. Keeping new columns in migrations (not DDL) means
+    -- the migration idempotency test can seed a real v0.5-shape schema.
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_session     ON governance_audit_events (session_id);

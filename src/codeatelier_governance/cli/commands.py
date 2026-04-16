@@ -115,7 +115,22 @@ def _split_sql_statements(sql: str) -> list[str]:
 
 
 async def _run_migrate(database_url: str) -> None:
-    """Apply all DDL files to the database. Idempotent (IF NOT EXISTS)."""
+    """Apply all DDL files, then run alembic upgrade head.
+
+    Idempotent: DDL files use ``CREATE TABLE IF NOT EXISTS`` and alembic
+    tracks applied revisions in ``alembic_version``. Running twice is a
+    no-op.
+
+    Why both: the DDL files own the base v0.5 schema (``CREATE TABLE``);
+    alembic owns all additive changes after that (v0.6 Ed25519 signing
+    columns, v0.6 agent-key tables, rotation markers, revocation chain
+    rows, etc.). A fresh install runs DDL + alembic to reach HEAD; an
+    upgrade runs alembic only. Shipping DDL without alembic meant every
+    fresh v0.6 install ended up on v0.5 schema and silently dropped
+    audit rows as ``StoreUnavailableError`` against the missing
+    ``signature_status`` column — latent P0, fixed by invoking alembic
+    from this entry point.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(_normalize_url_sync(database_url))
@@ -137,6 +152,35 @@ async def _run_migrate(database_url: str) -> None:
             sys.stdout.write(f"Applied: {ddl_path.name}\n")
     finally:
         await engine.dispose()
+
+    # Run alembic upgrade head to apply all additive migrations (v0.6
+    # signature columns, agent-key tables, rotation markers, etc.).
+    # Import lazily — alembic + a sync driver live behind the optional
+    # ``[migrations]`` extra to keep asyncpg-only runtime installs slim.
+    try:
+        from alembic import command as _alembic_command
+        from alembic.config import Config as _AlembicConfig
+    except ImportError:
+        sys.stderr.write(
+            "Warning: alembic not installed. Fresh installs require the "
+            "[migrations] extra: pip install codeatelier-governance[migrations]. "
+            "Audit writes will degrade to StoreUnavailableError against the "
+            "v0.5 schema until alembic is run.\n"
+        )
+        return
+
+    _alembic_ini = Path(__file__).resolve().parent.parent.parent.parent / "alembic.ini"
+    if not _alembic_ini.is_file():
+        sys.stderr.write(
+            f"Warning: alembic.ini not found at {_alembic_ini}; "
+            "skipping post-DDL migrations.\n"
+        )
+        return
+
+    cfg = _AlembicConfig(str(_alembic_ini))
+    cfg.set_main_option("sqlalchemy.url", _normalize_url_sync(database_url))
+    _alembic_command.upgrade(cfg, "head")
+    sys.stdout.write("Applied: alembic upgrade head\n")
     sys.stdout.write("Migration complete.\n")
 
 
