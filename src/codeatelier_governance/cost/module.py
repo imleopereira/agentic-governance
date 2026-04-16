@@ -70,8 +70,26 @@ class CostModule:
         # by ``flush_pending_upserts()`` at SDK start().  Replaces the
         # v0.5.0 inline ``asyncio.run()`` anti-pattern.
         self._pending_upsert_policies: list[BudgetPolicy] = []
+        # Optional reference to PresenceModule for the v0.5.4 halt switch.
+        # Wired by GovernanceSDK after construction via set_presence_module().
+        # If None, check_or_raise() runs without a halt check (back-compat with
+        # v0.5.3 SDK construction). This is a deliberate optional dependency:
+        # CostModule can still be constructed and tested in isolation.
+        self._presence: Any = None
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
+
+    def set_presence_module(self, presence: Any) -> None:
+        """Wire the PresenceModule for halt-switch enforcement (v0.6.2 P0).
+
+        Called by GovernanceSDK during construction after both modules exist.
+        Once set, every check_or_raise() call will first call
+        presence.assert_not_halted(agent_id) and fail-closed with
+        AgentHaltedError if the agent has been halted by an operator via
+        the console. Closes the v0.5.4 bypass where only scope.check
+        dispatched the halt check.
+        """
+        self._presence = presence
 
     def _get_engine(self) -> Any:
         """Return the shared engine, or lazily create one if no shared engine was provided."""
@@ -344,6 +362,15 @@ class CostModule:
                 When provided, the check projects current + projected against
                 all token caps before allowing the call.
         """
+        # v0.6.2 P0 halt switch — first thing in the gate.
+        # If presence module is wired, fail-closed on halted agents BEFORE any
+        # budget lookup so halted agents cannot keep burning budget. Skipped
+        # silently if no presence module is configured (back-compat with v0.5.3
+        # SDK construction). Closes the v0.5.4 bypass where only scope.check
+        # dispatched the halt check.
+        if self._presence is not None:
+            await self._presence.assert_not_halted(agent_id)
+
         policy = self._policies.get(agent_id)
         if policy is None:
             if agent_id not in self._no_policy_warned:

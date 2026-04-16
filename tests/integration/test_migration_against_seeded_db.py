@@ -37,7 +37,11 @@ import pytest
 pytestmark = pytest.mark.integration
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ALEMBIC_INI = REPO_ROOT / "alembic.ini"
+# v0.6.2 relocated ``alembic.ini`` into the package (P1 wheel-packaging
+# fix) so ``pip install`` users get the file under
+# ``site-packages/codeatelier_governance/``. The repo-root copy is gone;
+# integration tests resolve the file via the src-layout path instead.
+ALEMBIC_INI = REPO_ROOT / "src" / "codeatelier_governance" / "alembic.ini"
 # v0.5.x bootstrap DDL set — all files the SDK applies at install time
 # BEFORE any Alembic migration runs. The base Alembic revision
 # ``a1b2c3d4e5f6`` assumes these tables already exist (it adds columns

@@ -4,7 +4,6 @@ import type { ReactNode } from "react";
 import { notFound } from "next/navigation";
 
 import { ErrorBoundary } from "@/components/v4/ErrorBoundary";
-import { DisconnectBanner } from "@/components/DisconnectBanner";
 import { ComplianceHeaderPill } from "@/components/v4/ComplianceHeaderPill";
 
 /**
@@ -34,17 +33,26 @@ export default function V4Layout({ children }: { children: ReactNode }) {
     notFound();
   }
 
+  // v0.6.2 bug fix: AppShell (root layout) already renders DisconnectBanner,
+  // so rendering it again here produced two stacked banners on every v4
+  // route. Dropped from the v4 layout.
+  //
+  // v0.6.2 bug fix: the pill used to be zIndex: 50 which floated above
+  // the agent drill-drawer (parallel route, z-10 in DrillPanel's sticky
+  // header). Dropped to zIndex: 20 — still above normal page content,
+  // but below an open drawer so it doesn't cover the drawer's close
+  // button / status dot. The drawer's header gets an explicit z-30 in
+  // DrillPanel to stack above the pill when the drawer is open.
   return (
     <ErrorBoundary>
       <div className="v4-shell">
-        <DisconnectBanner />
         <div
           className="v4-header-pill-slot"
           style={{
             position: "fixed",
             top: 12,
             right: 16,
-            zIndex: 50,
+            zIndex: 20,
           }}
         >
           <ComplianceHeaderPill />

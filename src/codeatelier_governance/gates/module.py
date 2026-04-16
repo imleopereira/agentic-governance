@@ -86,6 +86,29 @@ class GatesModule:
         self._default_expires_in = default_expires_in
         self._store: GatesStore = store or InMemoryGatesStore()
         self._poll_interval_s = poll_interval_s
+        # Optional reference to PresenceModule for the v0.5.4 halt switch.
+        # Wired by GovernanceSDK after construction via set_presence_module().
+        # If None, the agent-facing gate methods (request / wait_for) run
+        # without a halt check (back-compat). Operator-facing methods
+        # (grant / deny / _resolve) DELIBERATELY skip the halt check so that
+        # operators can still resolve gates issued BEFORE the halt — the
+        # reviewer, not the agent, is the principal for grant/deny.
+        self._presence: Any = None
+
+    def set_presence_module(self, presence: Any) -> None:
+        """Wire the PresenceModule for halt-switch enforcement (v0.6.2 P0).
+
+        Called by GovernanceSDK during construction after both modules exist.
+        Once set, ``request()`` and ``wait_for()`` — the agent-driven entry
+        points — fail-closed with ``AgentHaltedError`` for a halted agent.
+
+        ``grant()`` and ``deny()`` intentionally DO NOT call
+        ``assert_not_halted``: those are operator-facing and need to remain
+        usable on gates that were issued BEFORE the halt so that pending
+        human-review work can still be resolved. The reviewer is the
+        principal for grant/deny, not the halted agent.
+        """
+        self._presence = presence
 
     async def close(self) -> None:
         await self._store.close()
@@ -108,7 +131,18 @@ class GatesModule:
         The caller is responsible for surfacing the request to a human (UI,
         Slack, email, etc.). The human's tool calls ``grant(token)`` or
         ``deny(token)`` with the token field of the returned request.
+
+        Raises:
+            AgentHaltedError: the agent has been halted by an operator.
+                Fail-closed before any token is minted so halted agents cannot
+                keep issuing new HITL gates (v0.6.2 P0).
         """
+        # v0.6.2 P0 halt switch — first thing in the agent-facing gate path.
+        # If presence is wired, block halted agents from minting new approval
+        # tokens. grant/deny deliberately skip this check — see set_presence_module.
+        if self._presence is not None:
+            await self._presence.assert_not_halted(agent_id)
+
         request_id = uuid4()
         action_hash = _hash_action_payload(payload)
         expires_at = datetime.now(timezone.utc) + (

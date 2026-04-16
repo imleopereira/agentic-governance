@@ -1,10 +1,14 @@
 # Changelog
 
-## v0.6.2 (unreleased) — v4 console default flip
+## v0.6.2 (unreleased) — v4 console default flip + 3 P0 enforcement fixes
 
-Console-only release. No SDK API changes, no wire-contract changes, no
-migrations. Lands the four parked Wave 1.5 worktrees from the v0.6.1
-polish sprint and flips the default console UI from v3 to v4.
+Patch release. Lands the four parked Wave 1.5 worktrees from the v0.6.1
+polish sprint, flips the default console UI from v3 to v4, and bundles
+three P0 fixes uncovered during the v0.6.1 post-ship team review:
+wheel-packaged migrations, grant/deny TOCTOU hardening, and expanded
+halt enforcement across cost + gates + LLM wrappers. No public SDK API
+changes and no new migrations — the fixes change internal behaviour,
+not signatures or schema.
 
 > **BREAKING DEFAULT**: The console now loads v4 on first visit. Set
 > `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` before upgrading if your team
@@ -17,6 +21,36 @@ polish sprint and flips the default console UI from v3 to v4.
 
 ### Added
 
+- **Wheel-packaged migrations (P0).** `alembic.ini` and the full
+  `migrations/` tree now ship inside the `codeatelier_governance`
+  package and are resolved via `importlib.resources` at
+  `governance migrate` time. v0.6.0 and v0.6.1 wheels omitted these
+  files — fresh `pip install` users ran the base DDL, the alembic step
+  silently no-op'd, the schema stayed on v0.5, and the first audit
+  write raised `StoreUnavailableError` against the missing
+  `signature_status` column. Anyone who already ran `governance migrate`
+  on v0.6.0/0.6.1 against a live DB is unaffected (alembic is
+  idempotent); fresh installs and test fixtures are the ones the fix
+  unblocks.
+- **Grant/deny TOCTOU closed (P0).** `POST /api/gates/:id/grant` and
+  `/deny` now pin the UPDATE to the `reviewer_id` read during the
+  authz check (`IS NOT DISTINCT FROM` handles the unclaimed case) and
+  use `RETURNING` to detect a racing claim. A lost race now returns
+  409 instead of silently granting/denying on a claim owned by a
+  different reviewer. Admins bypass the reviewer pin so
+  incident-response flows still work when a gate is claimed
+  mid-request. Mirrors the v0.6.1 escalate hardening to the remaining
+  two resolution paths; `approval.granted` / `approval.denied` audit
+  rows are emitted only on a successful UPDATE.
+- **Halt enforcement expanded.** `sdk.presence.halt()` now fail-closes
+  every SDK enforcement path — scope, cost, gates, and the
+  `wrap_openai` / `wrap_anthropic` wrappers. v0.5.4 shipped scope-only;
+  the other paths retained a gap where halted agents could keep burning
+  budget, claiming gates, and making LLM calls. Closes that gap.
+  `AgentHaltedError` raised on any enforcement call against a halted
+  agent. Exception: operator-facing `gates.grant()` / `gates.deny()` on
+  tokens minted BEFORE the halt still resolve, because the reviewer —
+  not the agent — is the principal on grant/deny.
 - **v4 is the default console UI.** `next.config.ts`, middleware, and
   the v4 layout all fall through to `v4` when
   `NEXT_PUBLIC_CONSOLE_UI_VERSION` is unset. `/` rewrites to `/agents`

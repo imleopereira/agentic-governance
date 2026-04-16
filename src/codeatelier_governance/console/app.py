@@ -1458,6 +1458,7 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     user_id = getattr(request.state, "user_id", None)
+    user_role = getattr(request.state, "role", None)
     async with engine.begin() as conn:
         # Read the pending gate row
         res = await conn.execute(
@@ -1477,14 +1478,19 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
             await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
         # Claim enforcement: if claimed, acting user must be the claimant
+        # or an admin (admin-override preserves incident-response path).
         reviewer_id = row.get("reviewer_id")
-        if reviewer_id is not None and user_id is not None:
-            if str(reviewer_id) != user_id:
-                raise HTTPException(
-                    403,
-                    "Gate is claimed by another reviewer. "
-                    "Wait for the reviewer to act or for the claim to expire.",
-                )
+        if (
+            reviewer_id is not None
+            and user_id is not None
+            and str(reviewer_id) != user_id
+            and user_role != "admin"
+        ):
+            raise HTTPException(
+                403,
+                "Gate is claimed by another reviewer. "
+                "Wait for the reviewer to act or for the claim to expire.",
+            )
 
         # Verify the HMAC signature on the token
         token_value = row["token"]
@@ -1496,17 +1502,58 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
-        # Resolve the gate as granted
-        await conn.execute(
-            text(
-                "UPDATE governance_gates_pending "
-                "SET resolved_at = :now, resolution = :resolution "
-                "WHERE request_id = :rid AND resolved_at IS NULL"
-            ),
-            {"now": now, "resolution": "granted", "rid": str(request_id)},
-        )
+        # v0.6.2 P0: close the TOCTOU between the SELECT-for-authz and the
+        # UPDATE. At default READ COMMITTED isolation a racing ``claim``
+        # could mutate ``reviewer_id`` between the two statements — the
+        # authz check would pass on stale state (reviewer_id=NULL) and
+        # the UPDATE would commit anyway, emitting a bogus
+        # ``approval.granted`` audit row on a claim owned by another
+        # reviewer. Mitigation mirrors ``escalate_gate``:
+        #   * Pin the UPDATE to the reviewer_id we read with
+        #     ``IS NOT DISTINCT FROM`` (handles the NULL-unclaimed case).
+        #   * Use RETURNING + a .first()-is-None check to detect the race.
+        #   * Admins bypass the pin so incident-response flows still work
+        #     when a reviewer is claimed between SELECT and UPDATE.
+        # A lost race → 409, NOT silent success.
+        if user_role == "admin":
+            update_res = await conn.execute(
+                text(
+                    "UPDATE governance_gates_pending "
+                    "SET resolved_at = :now, resolution = :resolution "
+                    "WHERE request_id = :rid AND resolved_at IS NULL "
+                    "RETURNING request_id"
+                ),
+                {
+                    "now": now,
+                    "resolution": "granted",
+                    "rid": str(request_id),
+                },
+            )
+        else:
+            update_res = await conn.execute(
+                text(
+                    "UPDATE governance_gates_pending "
+                    "SET resolved_at = :now, resolution = :resolution "
+                    "WHERE request_id = :rid AND resolved_at IS NULL "
+                    "AND reviewer_id IS NOT DISTINCT FROM :expected_reviewer "
+                    "RETURNING request_id"
+                ),
+                {
+                    "now": now,
+                    "resolution": "granted",
+                    "rid": str(request_id),
+                    "expected_reviewer": str(reviewer_id) if reviewer_id else None,
+                },
+            )
+        if update_res.first() is None:
+            raise HTTPException(
+                409,
+                "Gate was claimed by another reviewer mid-request; "
+                "refresh and try again.",
+            )
 
-    # Audit event via SDK — part of the HMAC chain
+    # Audit event via SDK — part of the HMAC chain. Emitted ONLY on
+    # success (the RETURNING row above confirms the UPDATE committed).
     if audit_module is not None:
         # Deterministic session_id derived from request_id for traceability
         session_id = UUID(
@@ -1563,6 +1610,7 @@ async def deny_gate(
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     user_id = getattr(request.state, "user_id", None)
+    user_role = getattr(request.state, "role", None)
     async with engine.begin() as conn:
         res = await conn.execute(
             text(
@@ -1579,14 +1627,20 @@ async def deny_gate(
         if user_id is not None:
             await _check_self_approval(conn, row["agent_id"], user_id, request_id)
 
+        # Claim enforcement: if claimed, acting user must be the claimant
+        # or an admin (admin-override preserves incident-response path).
         reviewer_id = row.get("reviewer_id")
-        if reviewer_id is not None and user_id is not None:
-            if str(reviewer_id) != user_id:
-                raise HTTPException(
-                    403,
-                    "Gate is claimed by another reviewer. "
-                    "Wait for the reviewer to act or for the claim to expire.",
-                )
+        if (
+            reviewer_id is not None
+            and user_id is not None
+            and str(reviewer_id) != user_id
+            and user_role != "admin"
+        ):
+            raise HTTPException(
+                403,
+                "Gate is claimed by another reviewer. "
+                "Wait for the reviewer to act or for the claim to expire.",
+            )
 
         token_value = row["token"]
         if token_value:
@@ -1597,21 +1651,56 @@ async def deny_gate(
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
-        await conn.execute(
-            text(
-                "UPDATE governance_gates_pending "
-                "SET resolved_at = :now, resolution = :resolution, "
-                "rationale = :rationale "
-                "WHERE request_id = :rid AND resolved_at IS NULL"
-            ),
-            {
-                "now": now,
-                "resolution": "denied",
-                "rationale": body.rationale,
-                "rid": str(request_id),
-            },
-        )
+        # v0.6.2 P0: close the TOCTOU between the SELECT-for-authz and
+        # the UPDATE. See ``grant_gate`` for the full rationale — same
+        # race, same mitigation. Admins bypass the reviewer pin so
+        # incident-response flows still work when a gate is claimed
+        # between SELECT and UPDATE; non-admins get the pin, a lost
+        # race 409s without emitting a bogus ``approval.denied`` audit
+        # row on a claim owned by another reviewer.
+        if user_role == "admin":
+            update_res = await conn.execute(
+                text(
+                    "UPDATE governance_gates_pending "
+                    "SET resolved_at = :now, resolution = :resolution, "
+                    "rationale = :rationale "
+                    "WHERE request_id = :rid AND resolved_at IS NULL "
+                    "RETURNING request_id"
+                ),
+                {
+                    "now": now,
+                    "resolution": "denied",
+                    "rationale": body.rationale,
+                    "rid": str(request_id),
+                },
+            )
+        else:
+            update_res = await conn.execute(
+                text(
+                    "UPDATE governance_gates_pending "
+                    "SET resolved_at = :now, resolution = :resolution, "
+                    "rationale = :rationale "
+                    "WHERE request_id = :rid AND resolved_at IS NULL "
+                    "AND reviewer_id IS NOT DISTINCT FROM :expected_reviewer "
+                    "RETURNING request_id"
+                ),
+                {
+                    "now": now,
+                    "resolution": "denied",
+                    "rationale": body.rationale,
+                    "rid": str(request_id),
+                    "expected_reviewer": str(reviewer_id) if reviewer_id else None,
+                },
+            )
+        if update_res.first() is None:
+            raise HTTPException(
+                409,
+                "Gate was claimed by another reviewer mid-request; "
+                "refresh and try again.",
+            )
 
+    # Audit event — emitted ONLY on success (the RETURNING row above
+    # confirms the UPDATE committed).
     if audit_module is not None:
         session_id = UUID(
             hashlib.md5(str(request_id).encode("utf-8")).hexdigest()

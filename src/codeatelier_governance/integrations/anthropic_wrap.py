@@ -46,6 +46,22 @@ logger = structlog.get_logger(__name__)
 _MESSAGES_CREATE_SENTINEL = "messages.create"
 
 
+async def _halt_check_if_wired(sdk: Any, agent_id: str) -> None:
+    """Fail-closed halt check, run before every enforcement gate (v0.6.2 P0).
+
+    If the SDK has a PresenceModule wired, call ``assert_not_halted(agent_id)``
+    so an operator halt blocks the LLM call BEFORE it touches the network.
+    Silent no-op if presence is not configured (back-compat with SDKs built
+    without ``enable_presence``). Closes the v0.5.4 bypass where halt only
+    fired via scope.check and therefore only hit agents with a registered
+    scope policy.
+    """
+    presence = getattr(sdk, "presence", None)
+    if presence is None:
+        return
+    await presence.assert_not_halted(agent_id)
+
+
 async def _scope_check_if_registered(sdk: Any, agent_id: str, tool_name: str) -> None:
     """Run scope.check() only when a policy is registered for this agent.
 
@@ -291,6 +307,11 @@ def _wrap_sync_create(
                 kwargs["model"] = _suggested
                 model = _suggested
 
+        # Enforcement gate 0: halt switch (v0.6.2 P0).
+        # Runs BEFORE scope/cost so a halted agent's LLM call never fires,
+        # even when no scope or budget policy is registered.
+        asyncio.run(_halt_check_if_wired(sdk, agent_id))
+
         # Enforcement gate 1: scope
         asyncio.run(_scope_check_if_registered(sdk, agent_id, _MESSAGES_CREATE_SENTINEL))
 
@@ -386,6 +407,11 @@ def _wrap_async_create(
             if _suggested != str(model):
                 kwargs["model"] = _suggested
                 model = _suggested
+
+        # Enforcement gate 0: halt switch (v0.6.2 P0). Fires BEFORE scope/cost
+        # so a halted agent's LLM call never fires, even when no scope or
+        # budget policy is registered. Closes the v0.5.4 bypass.
+        await _halt_check_if_wired(sdk, agent_id)
 
         # Enforcement gate 1: scope — raises ScopeViolation if denied.
         # Fires before cost so a scope denial never touches the budget counter.

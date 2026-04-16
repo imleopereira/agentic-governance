@@ -351,12 +351,19 @@ class GovernanceSDK:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
             )
-            # v0.5.4 halt switch wiring (renamed from "kill" in v0.6):
-            # scope.check() will fail-closed with AgentHaltedError when an
-            # operator clicks "Halt" in the console. Setter is no-op if
-            # scope is also disabled.
+            # v0.5.4 halt switch wiring (renamed from "kill" in v0.6),
+            # expanded in v0.6.2 P0 to every enforcement module. When an
+            # operator clicks "Halt" in the console, scope.check(),
+            # cost.check_or_raise(), and gates.request() all fail-closed
+            # with AgentHaltedError. wrap_anthropic / wrap_openai read
+            # sdk.presence directly and fail-close before the LLM call.
+            # Setters are no-op if the target module is also disabled.
             if hasattr(self, "scope") and hasattr(self.scope, "set_presence_module"):
                 self.scope.set_presence_module(self.presence)
+            if hasattr(self, "cost") and hasattr(self.cost, "set_presence_module"):
+                self.cost.set_presence_module(self.presence)
+            if hasattr(self, "gates") and hasattr(self.gates, "set_presence_module"):
+                self.gates.set_presence_module(self.presence)
         else:
             logger.warning(
                 "sdk.presence_disabled",

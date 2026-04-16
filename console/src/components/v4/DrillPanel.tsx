@@ -161,7 +161,7 @@ export function DrillPanel({
     >
       {/* Header */}
       <div
-        className="sticky top-0 z-10 flex items-start justify-between px-5 py-4 border-b"
+        className="sticky top-0 z-30 flex items-start justify-between px-5 py-4 border-b"
         style={{
           background: "var(--bg)",
           borderColor: "var(--border)",
