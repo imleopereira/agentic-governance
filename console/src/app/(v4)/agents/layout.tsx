@@ -57,8 +57,8 @@ export default function AgentsLayout({
       </div>
       {hasDrill && (
         <aside
-          className="w-[440px] shrink-0 overflow-hidden"
-          style={{ borderLeft: "1px solid var(--border)" }}
+          className="w-[440px] shrink-0 overflow-hidden relative z-40"
+          style={{ borderLeft: "1px solid var(--border)", background: "var(--bg)" }}
           aria-label="Agent detail"
         >
           {drill}
