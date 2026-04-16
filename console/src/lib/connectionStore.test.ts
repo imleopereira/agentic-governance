@@ -120,6 +120,7 @@ describe("sanitizeErrorMessage — infra leak redaction (F6 item 5)", () => {
 
   it("redacts a postgres DSN with credentials", () => {
     const out = sanitizeErrorMessage(
+      // ggignore — xkcd fixture (hunter2), not a real credential
       "could not connect: postgres://alice:hunter2@db.internal:5432/prod",
     );
     expect(out).not.toContain("alice");
@@ -144,6 +145,7 @@ describe("sanitizeErrorMessage — infra leak redaction (F6 item 5)", () => {
 
   it("redacts a mongodb:// DSN with credentials", () => {
     const out = sanitizeErrorMessage(
+      // ggignore — test fixture, not a real credential
       "MongoServerError mongodb://root:rootpw@mongo:27017/admin",
     );
     expect(out).not.toContain("rootpw");
@@ -153,6 +155,7 @@ describe("sanitizeErrorMessage — infra leak redaction (F6 item 5)", () => {
 
   it("redacts a mysql:// DSN", () => {
     const out = sanitizeErrorMessage(
+      // ggignore — test fixture, not a real credential
       "ER_ACCESS_DENIED mysql://app:appsecret@10.0.0.5/orders",
     );
     expect(out).not.toContain("appsecret");

@@ -131,6 +131,8 @@ class TestRedactSecrets:
         assert secret not in out
 
     def test_recursive_dict(self) -> None:
+        # ggignore-block — every secret-shaped string below is an
+        # alphabet/AWS-example fixture for the redactor, not a real credential.
         out = redact_secrets(
             {
                 "note": "my key is sk-ant-abcdefghijklmnopqrstuv",
@@ -148,6 +150,8 @@ class TestRedactSecrets:
         assert out["list"][3] is True
 
     def test_all_six_patterns_in_one_blob(self) -> None:
+        # ggignore-block — every secret-shaped string below is an
+        # alphabet/AWS-example fixture for the redactor, not a real credential.
         blob = (
             "sk-ant-api03-abcdefghijklmnopqrstuv "
             "sk-proj-abcdefghijklmnopqrstuvwx1234 "
