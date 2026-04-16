@@ -48,6 +48,9 @@ export function middleware(req: NextRequest) {
       path: "/",
       sameSite: "lax",
       maxAge: COOKIE_MAX_AGE_SECONDS,
+      // Security v0.6.2: Secure in production so the UI-version cookie
+      // cannot ride a plaintext request. Dev over HTTP still works.
+      secure: process.env.NODE_ENV === "production",
     });
     return response;
   }

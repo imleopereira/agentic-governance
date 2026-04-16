@@ -26,7 +26,7 @@ export const EMPTY_STATES: EmptyStates = {
   scopePanel: {
     title: "No scope policy set for this agent",
     description:
-      "Until a policy is defined, every tool call is denied by default. A developer can set allowed tools via the governance SDK or from the Gates console.",
+      "Until a policy is defined, every tool call is denied by default. A developer can set allowed tools via the governance SDK or from the Approvals page.",
   },
   sessionsPanel: {
     title: "No sessions yet",

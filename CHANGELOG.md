@@ -9,7 +9,11 @@ polish sprint and flips the default console UI from v3 to v4.
 > **BREAKING DEFAULT**: The console now loads v4 on first visit. Set
 > `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` before upgrading if your team
 > has existing documentation or training materials that reference the
-> v3 layout. v3 is removed in v0.7.
+> v3 layout. **Note: `NEXT_PUBLIC_*` variables are inlined at build
+> time; set before `next build`, not at container run time.** For a
+> run-time-configurable opt-out, use the `?ui=v3` URL override — it
+> persists via a `console_ui_version` cookie (SameSite=Lax, Secure in
+> production, 30-day max-age). v3 is removed in v0.7.
 
 ### Added
 
