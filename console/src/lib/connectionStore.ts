@@ -43,6 +43,18 @@ import { create } from "zustand";
  *      `Bearer`), leaving the actual secret dangling.
  *   6. Strip `keyword[=:\s]+value` patterns for common secret-bearing
  *      parameter names (token=, api_key=, password:, etc.).
+ *   7. Strip bare long-hex runs (32+ hex chars). Covers 32-byte HMAC
+ *      keys / AUDIT_SECRET / SHA256 digests / Ed25519 fingerprints that
+ *      a server could echo into an error body without a surrounding
+ *      `token=` keyword. Runs AFTER the named passes so a DSN or Bearer
+ *      header still gets its contextual `[REDACTED]` form instead of
+ *      collapsing to the catch-all.
+ *   8. Strip bare long-base64 runs (40+ chars, optional `=` padding).
+ *      Covers Ed25519 signatures (88 chars base64), base64-encoded raw
+ *      keys, JWT payload/signature chunks. Word-boundary anchored on
+ *      both sides so short tokens, URL hostnames (dot-terminated), and
+ *      hyphen-bearing identifiers (Tailwind classes like `bg-neutral-900`)
+ *      are preserved.
  *
  * Truncation runs after every pass so a secret near the 120-char
  * boundary can never be partially exposed by the cut.
@@ -66,11 +78,16 @@ export function sanitizeErrorMessage(raw: string): string {
   // chunk like ::ffff:192.0.2.1 that we want consumed as a single unit).
   // Loose but bounded: 2+ hex groups joined by `:`, optional `::`
   // collapse, optional trailing dotted-quad.
-  // Match any run of hex-quartets joined by `:` (with optional `::`
-  // collapse) that has at least 2 colons — covers full and shortened
-  // forms without trying to be fully RFC-correct.
+  //
+  // v0.6.1 DA fix: the match MUST contain EITHER a hex letter (a-f)
+  // OR a `::` shorthand. Without this the pattern matches pure-digit
+  // line:col references like `ErrorBoundary.tsx:93:15`, which are
+  // common in React stack frames and debug output. Real IPv6
+  // addresses either carry hex letters (the vast majority) or use
+  // the `::` collapse (e.g. ``::1``); a bare ``a.b.c.d.e`` run of
+  // short digit groups is almost certainly not an IP.
   s = s.replace(
-    /(?<![0-9a-f:])(?:[0-9a-f]{1,4}:|:){2,}[0-9a-f]{1,4}(?:(?::|\.)[0-9a-f.]+)*/gi,
+    /(?<![0-9a-f:])(?=[0-9a-f:.]*(?:[a-f]|::))(?:[0-9a-f]{1,4}:|:){2,}[0-9a-f]{1,4}(?:(?::|\.)[0-9a-f.]+)*/gi,
     "[REDACTED]",
   );
   // Pass 4: IPv4 dotted quad with each octet 0-255.
@@ -87,6 +104,36 @@ export function sanitizeErrorMessage(raw: string): string {
   s = s.replace(
     /(bearer|token|key|secret|password|authorization)[=:\s]+\S+/gi,
     "$1=[redacted]",
+  );
+  // Pass 7: bare long-hex catch-all (32+ hex chars). Must run AFTER the
+  // named passes so DSN/Bearer/keyword redactions keep their contextual
+  // `[REDACTED]` label. Word-boundary anchored on both sides so a short
+  // `#deadbe` CSS color (6 chars) or a git short SHA doesn't match. The
+  // entropy lookaheads require at least one hex-letter AND one digit so
+  // mono-character runs (`aaa...`, `111...`) used as sentinel/filler in
+  // test fixtures pass through untouched — real AUDIT_SECRETs mix both.
+  // 32 chars is the MD5/AES-128 threshold and stays well clear of common
+  // 7/8/10-char alnum identifiers in URL paths.
+  s = s.replace(
+    /\b(?=[a-fA-F0-9]*[a-fA-F])(?=[a-fA-F0-9]*[0-9])[a-fA-F0-9]{32,}\b/g,
+    "[REDACTED]",
+  );
+  // Pass 8: bare long-base64 catch-all (40+ base64 alphabet chars, up to
+  // 2 `=` padding chars). Word-boundary anchored on both sides so a
+  // hyphen-bearing Tailwind class (`bg-neutral-900`) or a dotted domain
+  // (`docs.example.com`) doesn't match — the hyphen / dot acts as an
+  // external word boundary that splits the run into sub-40 fragments.
+  // Trailing boundary is `(?!\w)` rather than `\b` so the `=` padding is
+  // consumed cleanly (a real `\b` would leave `==` dangling because `=`
+  // is itself non-word). The entropy lookaheads require at least one
+  // letter AND one digit in the run so filler sequences like
+  // `"a".repeat(500)` don't redact. 40 chars is ~30 bytes of entropy,
+  // well below Ed25519's 64-byte signature (88 base64 chars) and
+  // comfortably above typical URL path segments and React stack-frame
+  // identifiers.
+  s = s.replace(
+    /\b(?=[A-Za-z0-9+/]*[A-Za-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{40,}={0,2}(?!\w)/g,
+    "[REDACTED]",
   );
   return s.length > 120 ? s.slice(0, 117) + "..." : s;
 }

@@ -16,7 +16,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from codeatelier_governance.audit.sanitization import sanitize_metadata
+from codeatelier_governance.audit.sanitization import sanitize_metadata, sanitize_string
 
 # --- Size caps (security: DoS prevention at the SDK boundary) -----------------
 MAX_KIND_LEN = 128
@@ -103,6 +103,33 @@ class AuditEvent(BaseModel):
         _validate_metadata(self.metadata)
         sanitized = sanitize_metadata(self.metadata)
         object.__setattr__(self, "metadata", sanitized)
+        # S5 P1 #1: every caller-controllable string field must flow through
+        # the same NFC-normalize + C0/ANSI-strip sanitizer as metadata.
+        # Without this, an insider with SDK creds could forge ANSI escapes
+        # into kind / agent_id / model / input_hash / output_hash. Those
+        # bytes then land in AuditEventView responses, operator CLI tails,
+        # and compliance exports — anywhere an audit row gets rendered.
+        # Pydantic's max_length check has already run on the raw input, so
+        # the sanitizer's internal cap is a belt-and-suspenders on the NFC
+        # expansion case only; the field cap is the real ceiling.
+        object.__setattr__(
+            self, "agent_id", sanitize_string(self.agent_id, max_len=MAX_AGENT_ID_LEN)
+        )
+        object.__setattr__(
+            self, "kind", sanitize_string(self.kind, max_len=MAX_KIND_LEN)
+        )
+        if self.model is not None:
+            object.__setattr__(self, "model", sanitize_string(self.model, max_len=128))
+        if self.input_hash is not None:
+            object.__setattr__(
+                self, "input_hash", sanitize_string(self.input_hash, max_len=MAX_HASH_LEN)
+            )
+        if self.output_hash is not None:
+            object.__setattr__(
+                self,
+                "output_hash",
+                sanitize_string(self.output_hash, max_len=MAX_HASH_LEN),
+            )
 
 
 PLACEHOLDER_HMAC = "0" * 64

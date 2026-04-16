@@ -335,6 +335,11 @@ async def test_escalate_gate_returns_gate_escalate_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rid = uuid4()
+    # v0.6.1: the UPDATE uses ``RETURNING request_id`` to close the TOCTOU
+    # between SELECT-for-authz and UPDATE. The happy-path mock therefore
+    # returns one row on UPDATE so the endpoint proceeds; a 0-row UPDATE
+    # now legitimately 409s. See TestEscalateRaceCondition in
+    # tests/console/test_gates_escalate.py for the race-win branch.
     _install_engine(
         monkeypatch,
         [
@@ -343,9 +348,10 @@ async def test_escalate_gate_returns_gate_escalate_response(
                     "request_id": rid,
                     "resolved_at": None,
                     "payload_json": {"risk": "LOW"},
+                    "reviewer_id": None,
                 }
             ],
-            None,  # UPDATE
+            [{"request_id": rid}],  # UPDATE ... RETURNING request_id
         ],
     )
     request = MagicMock()

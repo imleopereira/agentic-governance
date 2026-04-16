@@ -466,8 +466,21 @@ class ComplianceBundleSignature(StrictResponse):
 
     Holds the algorithm, the salted fingerprint of the signing key
     (reusing :func:`codeatelier_governance.audit.keys.fingerprint_key`),
-    and the hex-encoded HMAC signature over the canonical JSON of the
-    surrounding bundle with ``bundle_signature`` field removed.
+    and the hex-encoded HMAC signature.
+
+    v0.6.1 signature scheme (algorithm-pinned): the signature covers the
+    canonical JSON of the ENTIRE bundle with only
+    ``bundle_signature.signature`` blanked to ``""`` (can't sign
+    yourself). ``bundle_signature.algorithm`` and
+    ``bundle_signature.key_fingerprint`` are therefore bound by the
+    signature, blocking a version-confusion downgrade where a holder of
+    an old HMAC secret could re-label a bundle under a future signature
+    scheme (e.g. Ed25519) and a lax verifier would accept it.
+
+    v0.6.0 used a weaker scheme — the whole ``bundle_signature``
+    sub-object was excluded from both hash and signature — and is NOT
+    compatible with v0.6.1 verifiers. No production bundles exist under
+    the old scheme; v0.6.0 shipped ~1 hour before v0.6.1.
     """
 
     model_config = _STRICT
@@ -506,11 +519,24 @@ class ComplianceBundleResponse(StrictResponse):
 
     Packages the output of ``compliance_report`` and
     ``compliance_verify_chain`` into a single JSON document that an
-    auditor can archive and later re-verify offline: the bundle hash is
-    the sha256 of the canonical serialization of the body without its
-    ``bundle_signature`` field, and ``bundle_signature.signature`` is
-    the HMAC-SHA256 of that same canonical body under the current
-    ``AUDIT_SECRET``.
+    auditor can archive and later re-verify offline.
+
+    v0.6.1 signature scheme (algorithm-pinned):
+
+    * ``bundle_hash`` = sha256 of the canonical serialization of the
+      body with ``bundle_hash`` removed AND
+      ``bundle_signature.signature`` blanked to ``""``. The hash binds
+      both ``bundle_signature.algorithm`` and
+      ``bundle_signature.key_fingerprint``.
+    * ``bundle_signature.signature`` = HMAC-SHA256 under the current
+      ``AUDIT_SECRET`` over the canonical body with only
+      ``bundle_signature.signature`` blanked. The signature therefore
+      commits to every other field including ``bundle_hash``,
+      ``bundle_signature.algorithm``, and
+      ``bundle_signature.key_fingerprint``.
+
+    See :class:`ComplianceBundleSignature` for the version-confusion
+    attack this closes.
 
     If the internal ``verify_chain`` call raises or times out, the
     ``verify_chain`` field is ``None`` and ``chain_verification_error``

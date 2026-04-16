@@ -37,6 +37,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from ..security.redaction import redact_secrets
 from .models import AuditEventRecord
 
 try:
@@ -112,10 +113,19 @@ class OTelExporter:
             attrs[f"{GEN_AI_NS}.output_hash"] = record.output_hash
         if record.prev_hash is not None:
             attrs[f"{GEN_AI_NS}.prev_hash"] = record.prev_hash
+        # Redact secret-shaped substrings BEFORE flattening. ``sanitize_metadata``
+        # already ran upstream (NFC/ANSI-strip/size caps) but does NOT scrub
+        # ``sk-ant-...`` / ``AKIA...`` / DSN-embedded credentials. Without this
+        # step any raw secret that accidentally landed in a stack trace or
+        # error message in ``metadata`` would leak out of the audit substrate
+        # over the host's OTel pipe (Datadog, Honeycomb, etc.).
+        # ``redact_secrets`` is recursive — it walks nested dicts/lists — so
+        # we call it once on the top-level ``metadata`` dict and then flatten.
+        redacted_metadata: dict[str, Any] = redact_secrets(record.metadata)
         # Stringify metadata. OTel attribute values must be primitives;
         # nested dicts and lists are flattened with str() to keep the
         # implementation tiny and predictable.
-        for key, value in record.metadata.items():
+        for key, value in redacted_metadata.items():
             if value is None:
                 continue
             attrs[f"{GEN_AI_NS}.metadata.{key}"] = (

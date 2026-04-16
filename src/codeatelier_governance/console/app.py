@@ -2394,16 +2394,25 @@ async def escalate_gate(
 
     Releases the current claim and records escalation metadata in payload_json.
     The resulting UPDATE fires gate_change_notify, broadcasting to SSE clients.
+
+    v0.6.1 S3 P1 #1 — claimant check: a gate claimed by reviewer A can
+    only be escalated by reviewer A or by an admin. Without this check
+    any authenticated user (including viewers) could iterate pending
+    gates and release every active claim, continuously griefing the
+    admin review workflow. An audit row ``gates.escalated`` records who
+    did the escalation and the reviewer_id that was released.
     """
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
     user_id = getattr(request.state, "user_id", "unknown")
+    user_role = getattr(request.state, "role", None)
     now = datetime.now(timezone.utc)
 
     async with engine.begin() as conn:
         res = await conn.execute(
             text(
-                "SELECT request_id, resolved_at, payload_json "
+                "SELECT request_id, agent_id, kind, resolved_at, "
+                "payload_json, reviewer_id "
                 "FROM governance_gates_pending WHERE request_id = :rid"
             ),
             {"rid": str(request_id)},
@@ -2414,6 +2423,24 @@ async def escalate_gate(
         if row["resolved_at"] is not None:
             raise HTTPException(409, "Gate is already resolved.")
 
+        # Claimant check. If the gate is claimed by someone OTHER than
+        # the caller, only an admin can release the claim. An unclaimed
+        # gate (reviewer_id IS NULL) preserves the previous behavior:
+        # any authenticated user can escalate it.
+        reviewer_id = row.get("reviewer_id")
+        if (
+            reviewer_id is not None
+            and str(reviewer_id) != str(user_id)
+            and user_role != "admin"
+        ):
+            raise HTTPException(
+                403,
+                "Only the current reviewer or an admin can escalate a "
+                "claimed gate.",
+            )
+
+        reviewer_id_before = str(reviewer_id) if reviewer_id else None
+
         existing_payload = row["payload_json"] or {}
         if not isinstance(existing_payload, dict):
             existing_payload = {}
@@ -2421,22 +2448,77 @@ async def escalate_gate(
         existing_payload["escalated_to"] = body.escalate_to
         existing_payload["escalated_at"] = now.isoformat()
 
+        # v0.6.1 DA P1: close the TOCTOU between the SELECT-for-authz and the
+        # UPDATE. At default READ COMMITTED isolation a second writer could
+        # mutate reviewer_id between the two statements — the authz check
+        # would pass on stale state. We pin the UPDATE to the reviewer_id we
+        # read (``IS NOT DISTINCT FROM`` handles the NULL-unclaimed case) and
+        # use RETURNING to detect the race. A lost race → 409, NOT silent
+        # success + a bogus gates.escalated audit row.
         import json as _json
-        await conn.execute(
+        update_res = await conn.execute(
             text(
                 "UPDATE governance_gates_pending "
                 "SET payload_json = :payload::jsonb, "
                 "    reviewer_id = NULL, reviewing_since = NULL "
-                "WHERE request_id = :rid AND resolved_at IS NULL"
+                "WHERE request_id = :rid AND resolved_at IS NULL "
+                "AND reviewer_id IS NOT DISTINCT FROM :expected_reviewer "
+                "RETURNING request_id"
             ),
-            {"payload": _json.dumps(existing_payload), "rid": str(request_id)},
+            {
+                "payload": _json.dumps(existing_payload),
+                "rid": str(request_id),
+                "expected_reviewer": str(reviewer_id) if reviewer_id else None,
+            },
         )
+        if update_res.first() is None:
+            raise HTTPException(
+                409,
+                "Gate state changed during escalation; retry.",
+            )
+
+    # Audit row — best-effort. A failed audit write MUST NOT fail the
+    # escalation (consistent with grant_gate/deny_gate).
+    if audit_module is not None:
+        try:
+            # TODO(v0.6.2): MD5 used only as a deterministic 128-bit UUID
+            # derivation from ``request_id``; not security-sensitive here
+            # (no collision-resistance requirement — request_id is already
+            # the primary key). Migrate to UUID5(namespace, request_id)
+            # for codebase-wide "no MD5" hygiene.
+            session_id = UUID(
+                hashlib.md5(str(request_id).encode("utf-8")).hexdigest()
+            )
+            await audit_module.log(
+                AuditEvent(
+                    agent_id=row["agent_id"],
+                    session_id=session_id,
+                    kind="gates.escalated",
+                    metadata={
+                        "request_id": str(request_id),
+                        "gate_kind": row["kind"],
+                        "reviewer_id_before": reviewer_id_before,
+                        "reviewer_id_after": None,
+                        "by_user_id": str(user_id),
+                        "role": user_role,
+                        "escalated_to": body.escalate_to,
+                    },
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — audit MUST NOT break the API
+            _logger.warning(
+                "console.gate_escalated_audit_failed",
+                request_id=str(request_id),
+                error_type=type(exc).__name__,
+            )
 
     _logger.info(
         "console.gate_escalated",
         request_id=str(request_id),
         escalated_by=user_id,
         escalated_to=body.escalate_to,
+        reviewer_id_before=reviewer_id_before,
+        role=user_role,
     )
     return GateEscalateResponse(
         ok=True,
@@ -3698,18 +3780,32 @@ async def compliance_export(
         known_fingerprints_in_window=unresolved_in_window,
     )
 
-    # Two-step content binding:
-    #   1. ``bundle_hash`` = sha256 over the canonical body WITHOUT
-    #      ``bundle_hash`` and ``bundle_signature``. This closes the
-    #      chicken-and-egg of "field that includes its own digest".
-    #   2. ``bundle_signature.signature`` = HMAC-SHA256 over the
-    #      canonical body WITHOUT ``bundle_signature`` (i.e. the body
-    #      that the caller receives, minus the signature envelope). The
-    #      signature therefore covers the bundle_hash too.
+    # Two-step content binding (v0.6.1: algorithm-pinned):
+    #   1. ``bundle_hash`` = sha256 over the canonical body with ONLY
+    #      ``bundle_hash`` removed AND ``bundle_signature.signature``
+    #      cleared to empty string. The hash therefore commits to
+    #      ``bundle_signature.algorithm`` and ``bundle_signature.key_fingerprint``,
+    #      closing a version-confusion attack where an attacker with an
+    #      old secret could re-label an HMAC bundle as Ed25519 (or vice
+    #      versa) and a verifier without strict algorithm pinning would
+    #      accept it.
+    #   2. ``bundle_signature.signature`` = HMAC-SHA256 over the same
+    #      canonical body (``bundle_signature.signature`` cleared, every
+    #      other field — including ``bundle_hash`` and
+    #      ``bundle_signature.algorithm`` — present). You can't sign
+    #      yourself, so only the ``signature`` hex itself is blanked
+    #      before hashing.
     #
-    # Verifier recipe (mirrored in the round-trip test):
-    #   signature_ok  = HMAC(secret, canonical(body \ bundle_signature))
-    #   bundle_hash_ok = sha256(canonical(body \ bundle_hash \ bundle_signature))
+    # Verifier recipe (mirrored in tests/console/test_compliance_export.py):
+    #   signed_form = body with bundle_signature.signature = ""
+    #   hashed_form = signed_form with bundle_hash deleted
+    #   bundle_hash_ok = sha256(canonical(hashed_form))
+    #   signature_ok   = HMAC(secret, canonical(signed_form))
+    #
+    # This is a behavior change from v0.6.0 — bundles created under the
+    # old scheme (body without the whole bundle_signature sub-object) will
+    # not re-verify. v0.6.0 shipped ~1 hour before v0.6.1, no production
+    # bundles in the wild. CHANGELOG calls this out.
     #
     # We build the response Pydantic model first with placeholder hash/
     # signature, then compute the real values off its ``model_dump(mode=
@@ -3737,20 +3833,33 @@ async def compliance_export(
     )
     draft_dump: dict[str, Any] = draft.model_dump(mode="json")
 
-    body_no_hash_no_sig = {
-        k: v for k, v in draft_dump.items()
-        if k not in ("bundle_hash", "bundle_signature")
+    # Canonical form for SIGNING: whole bundle present, with
+    # ``bundle_signature.signature`` blanked (can't sign yourself).
+    # ``bundle_signature.algorithm`` and ``bundle_signature.key_fingerprint``
+    # ARE included, so the signature binds them.
+    body_for_signing = dict(draft_dump)
+    sig_envelope_for_signing = dict(draft_dump["bundle_signature"])
+    sig_envelope_for_signing["signature"] = ""
+    body_for_signing["bundle_signature"] = sig_envelope_for_signing
+
+    # Canonical form for HASHING: same as signing form, with
+    # ``bundle_hash`` removed (the field that is about to hold the
+    # digest). ``bundle_signature`` envelope is otherwise identical.
+    body_for_hashing = {
+        k: v for k, v in body_for_signing.items() if k != "bundle_hash"
     }
-    canonical_no_hash_no_sig = canonical_json(body_no_hash_no_sig)
+
+    canonical_for_hashing = canonical_json(body_for_hashing)
     bundle_hash = hashlib.sha256(
-        canonical_no_hash_no_sig.encode("utf-8")
+        canonical_for_hashing.encode("utf-8")
     ).hexdigest()
 
-    body_no_sig = dict(body_no_hash_no_sig)
-    body_no_sig["bundle_hash"] = bundle_hash
-    canonical_no_sig = canonical_json(body_no_sig)
+    # Fold the freshly-computed ``bundle_hash`` into the signing form so
+    # the signature also commits to it.
+    body_for_signing["bundle_hash"] = bundle_hash
+    canonical_for_signing = canonical_json(body_for_signing)
     signature_hex = hmac.new(
-        secret_bytes, canonical_no_sig.encode("utf-8"), hashlib.sha256
+        secret_bytes, canonical_for_signing.encode("utf-8"), hashlib.sha256
     ).hexdigest()
 
     bundle_signature = ComplianceBundleSignature(

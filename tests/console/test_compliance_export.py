@@ -202,6 +202,24 @@ def test_bundle_response_shape_is_correct(
 # ---------- Hash + signature round-trip ----------------------------------
 
 
+def _canonical_signed_form(body: dict[str, Any]) -> str:
+    """Mirror of the v0.6.1 signer: blank bundle_signature.signature only."""
+    signing_body = dict(body)
+    sig_env = dict(body["bundle_signature"])
+    sig_env["signature"] = ""
+    signing_body["bundle_signature"] = sig_env
+    return canonical_json(signing_body)
+
+
+def _canonical_hashed_form(body: dict[str, Any]) -> str:
+    """Mirror of the v0.6.1 hasher: drop bundle_hash; blank signature."""
+    hashing_body = {k: v for k, v in body.items() if k != "bundle_hash"}
+    sig_env = dict(body["bundle_signature"])
+    sig_env["signature"] = ""
+    hashing_body["bundle_signature"] = sig_env
+    return canonical_json(hashing_body)
+
+
 def test_bundle_hash_and_signature_round_trip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -218,30 +236,116 @@ def test_bundle_hash_and_signature_round_trip(
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    # Two-step verifier recipe. See app.compliance_export for rationale.
-    #   bundle_hash = sha256(canonical(body \ bundle_hash \ bundle_signature))
-    #   signature   = HMAC(SECRET, canonical(body \ bundle_signature))
-    body_without_hash_and_sig = {
-        k: v for k, v in body.items()
-        if k not in ("bundle_hash", "bundle_signature")
-    }
-    canonical_no_hash_no_sig = canonical_json(body_without_hash_and_sig)
+    # v0.6.1 algorithm-pinned verifier recipe.
+    #   bundle_hash = sha256(canonical(body without bundle_hash,
+    #                        with bundle_signature.signature=""))
+    #   signature   = HMAC(SECRET, canonical(body with
+    #                      bundle_signature.signature=""))
     expected_hash = hashlib.sha256(
-        canonical_no_hash_no_sig.encode("utf-8")
+        _canonical_hashed_form(body).encode("utf-8")
     ).hexdigest()
     assert body["bundle_hash"] == expected_hash
 
-    body_without_sig = {k: v for k, v in body.items() if k != "bundle_signature"}
-    canonical_no_sig = canonical_json(body_without_sig)
     expected_sig = hmac.new(
         AUDIT_SECRET.encode("utf-8"),
-        canonical_no_sig.encode("utf-8"),
+        _canonical_signed_form(body).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
     assert body["bundle_signature"]["signature"] == expected_sig
     assert body["bundle_signature"]["key_fingerprint"] == fingerprint_key(
         AUDIT_SECRET.encode("utf-8")
     )
+
+
+# ---------- Algorithm / key-fingerprint binding (S2 P1 #2) ---------------
+
+
+def test_bundle_signature_algorithm_is_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.6.1 S2 P1 #2: the algorithm label MUST be covered by the
+    signature AND by the bundle_hash. Flipping it to a future algorithm
+    string (e.g. "Ed25519") MUST make re-verification fail — otherwise an
+    attacker holding an old HMAC secret could re-sign an old body and
+    label it as the new scheme."""
+    _install_dev_mode(monkeypatch)
+    _reset_compliance_state()
+    monkeypatch.setattr(
+        app_module, "_build_report_generator",
+        lambda: _StubGenerator(event_count=1),
+    )
+    monkeypatch.setattr(app_module, "audit_module", None)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/api/compliance/export", json={})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # Baseline: unchanged bundle verifies under the v0.6.1 recipe.
+    baseline_hash = hashlib.sha256(
+        _canonical_hashed_form(body).encode("utf-8")
+    ).hexdigest()
+    baseline_sig = hmac.new(
+        AUDIT_SECRET.encode("utf-8"),
+        _canonical_signed_form(body).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert body["bundle_hash"] == baseline_hash
+    assert body["bundle_signature"]["signature"] == baseline_sig
+
+    # Tamper: flip algorithm to a future scheme label.
+    tampered = json.loads(json.dumps(body))
+    tampered["bundle_signature"]["algorithm"] = "Ed25519"
+
+    tampered_hash = hashlib.sha256(
+        _canonical_hashed_form(tampered).encode("utf-8")
+    ).hexdigest()
+    tampered_sig = hmac.new(
+        AUDIT_SECRET.encode("utf-8"),
+        _canonical_signed_form(tampered).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    # Re-computed values on the tampered body MUST NOT match the bundle's
+    # original hash / signature. This is what a verifier sees when it
+    # recomputes locally and compares against the claimed values.
+    assert tampered_hash != tampered["bundle_hash"]
+    assert tampered_sig != tampered["bundle_signature"]["signature"]
+
+
+def test_bundle_signature_key_fingerprint_is_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v0.6.1 S2 P1 #2: the key fingerprint MUST be bound too. Swapping
+    it for any other value — even under the same AUDIT_SECRET — MUST
+    make re-verification fail."""
+    _install_dev_mode(monkeypatch)
+    _reset_compliance_state()
+    monkeypatch.setattr(
+        app_module, "_build_report_generator",
+        lambda: _StubGenerator(event_count=1),
+    )
+    monkeypatch.setattr(app_module, "audit_module", None)
+
+    client = TestClient(app_module.app)
+    resp = client.post("/api/compliance/export", json={})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    tampered = json.loads(json.dumps(body))
+    tampered["bundle_signature"]["key_fingerprint"] = "f" * 64
+
+    tampered_hash = hashlib.sha256(
+        _canonical_hashed_form(tampered).encode("utf-8")
+    ).hexdigest()
+    tampered_sig = hmac.new(
+        AUDIT_SECRET.encode("utf-8"),
+        _canonical_signed_form(tampered).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    assert tampered_hash != tampered["bundle_hash"]
+    assert tampered_sig != tampered["bundle_signature"]["signature"]
 
 
 # ---------- Auth gate ----------------------------------------------------

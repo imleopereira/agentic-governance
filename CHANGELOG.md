@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.6.1 (unreleased) — security sweep fixes
+
+Patch release driven by a 5-agent security sweep against v0.6.0 and a
+follow-on Devil's Advocate pass. No API changes; one wire-contract change
+to the compliance bundle signature scheme.
+
+### Security
+
+- **`AuditEvent` field sanitization (S5 P1).** Every caller-controllable
+  string field on ``AuditEvent`` — ``kind``, ``agent_id``, ``model``,
+  ``input_hash``, ``output_hash`` — now flows through the same NFC-normalise
+  + C0/ANSI-strip sanitizer as ``metadata``. Closes an insider-with-SDK-
+  creds text-injection primitive against any surface that renders audit
+  rows in a terminal or HTML shell (operator ``governance audit tail``
+  CLI, console event list, compliance exports).
+- **OTel exporter redacts secret-shaped metadata (S5 P1).**
+  ``OTelExporter._build_attributes`` now applies ``redact_secrets`` to
+  ``record.metadata`` before flattening values into span attributes.
+  Stack traces and vendor DSNs that accidentally land in audit metadata
+  will no longer leak over the host's OTel pipe (Datadog, Honeycomb,
+  ...). ``redact_secrets`` moved to the new ``security/`` package so
+  both ``audit`` and ``console`` can call it without cross-package
+  layering violations; ``codeatelier_governance.console.redaction``
+  remains importable as a back-compat alias until v0.7.
+- **Database DSN pattern added to ``redact_secrets`` (DA follow-up).**
+  ``postgres://``, ``postgresql://``, ``mysql://``, ``mongodb://``,
+  ``mongodb+srv://``, ``redis://``, ``rediss://`` URLs (with or without
+  embedded ``user:pass@`` credentials) are now redacted. Matches the
+  frontend ``sanitizeErrorMessage`` DSN pass for parity.
+- **``POST /api/gates/{id}/escalate`` claimant check (S3 P1).** A gate
+  claimed by reviewer A can now only be escalated by reviewer A or by
+  an admin (403 otherwise). Prior behaviour let any authenticated user
+  — including viewers — release any reviewer's claim by NULL-ing
+  ``reviewer_id``, a continuous griefing vector against the admin
+  review workflow. A ``gates.escalated`` audit row is emitted on
+  success only (no audit row on a 403, so viewers cannot flood the log
+  by probing claimed gates).
+- **Escalate TOCTOU closed (DA follow-up).** The SELECT-for-authz /
+  UPDATE split in ``escalate_gate`` could let a racing writer mutate
+  ``reviewer_id`` between the two statements at default READ COMMITTED
+  isolation. The UPDATE now pins the expected ``reviewer_id`` via
+  ``IS NOT DISTINCT FROM`` with ``RETURNING`` and 409s on a lost race
+  rather than silently succeeding on stale state.
+- **Console error-message sanitizer gains high-entropy passes (S5 P2).**
+  ``sanitizeErrorMessage`` in ``console/src/lib/connectionStore.ts``
+  now strips bare 32+ char hex runs and 40+ char base64 runs with
+  entropy lookaheads (requires at least one letter and one digit so
+  Tailwind class fixtures and monocharacter filler strings pass
+  through). Catches fake AUDIT_SECRETs, HMAC digests, and Ed25519
+  signatures that a server could echo into an error body without a
+  surrounding ``token=`` keyword.
+
+### Changed — wire contract
+
+- **Compliance bundle signature scheme is algorithm-pinned.** Both
+  ``bundle_hash`` and ``bundle_signature.signature`` now cover
+  ``bundle_signature.algorithm`` and ``bundle_signature.key_fingerprint``.
+  The prior scheme (v0.6.0) excluded the whole ``bundle_signature``
+  sub-object from the hash input and so permitted a version-confusion
+  downgrade where a holder of an old HMAC secret could re-label a
+  bundle under a future signature scheme. v0.6.0 bundles will NOT
+  re-verify under the v0.6.1 verifier recipe; v0.6.0 shipped ~1 hour
+  before v0.6.1 so no production bundles exist under the old scheme.
+
 ## v0.6.0 (2026-04-16) — Ed25519 + HMAC rotation + Article 12 export + self-discipline
 
 Published to PyPI: <https://pypi.org/project/code-atelier-governance/0.6.0/>.
