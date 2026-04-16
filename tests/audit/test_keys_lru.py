@@ -9,7 +9,6 @@ from collections.abc import Iterator
 
 import pytest
 
-from codeatelier_governance.audit import keys as keys_mod
 from codeatelier_governance.audit.keys import (
     KeyResolution,
     _LRU_MAX_ENTRIES,

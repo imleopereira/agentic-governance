@@ -129,13 +129,12 @@ def verify_event(record: AuditEventRecord, secret: bytes) -> bool:
 # behavior. Overlapping-rotation test: tests/audit/test_overlapping_rotations.py.
 # =============================================================================
 
-from dataclasses import dataclass as _dataclass
-from typing import Mapping as _Mapping
+from dataclasses import dataclass as _dataclass  # noqa: E402
+from typing import Mapping as _Mapping  # noqa: E402
 
 from .keys import (  # noqa: E402
     KeyResolution as _KeyResolution,
     KeyVersion as _KeyVersion,
-    ResolvedKey as _ResolvedKey,
     find_active_key_at_seq as _find_active_key_at_seq,
     resolve_key as _resolve_key,
 )

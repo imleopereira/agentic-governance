@@ -1,8 +1,6 @@
 """Edge-case tests for the F9 WrapperRegistry (DA findings batch)."""
 from __future__ import annotations
 
-import logging
-import os
 
 import pytest
 

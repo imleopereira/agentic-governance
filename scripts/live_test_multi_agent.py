@@ -123,7 +123,6 @@ async def main() -> int:
         PreCondition,
         LoopPolicy,
     )
-    from codeatelier_governance.audit.models import AuditEvent
     from codeatelier_governance.scope.errors import ScopeViolation
     from codeatelier_governance.cost.errors import BudgetExceeded
     from codeatelier_governance.loop.errors import LoopDetected
@@ -139,8 +138,8 @@ async def main() -> int:
     await sdk.start()
     say(f"  DB       : {db_url.split('@')[-1]}")
     say(f"  Secret   : {secret_hex[:8]}...{secret_hex[-4:]}")
-    say(f"  Backend  : http://127.0.0.1:8766 (shared Postgres + secret)")
-    say(f"  Console  : http://localhost:3001")
+    say("  Backend  : http://127.0.0.1:8766 (shared Postgres + secret)")
+    say("  Console  : http://localhost:3001")
 
     # --- register six agents --------------------------------------------
     # Agent IDs are suffixed `-live-<random>` so concurrent test runs do
@@ -240,7 +239,7 @@ async def main() -> int:
     )
 
     say(f"  Agents   : 6 ({suffix})")
-    say(f"")
+    say("")
 
     # =====================================================================
     # Concurrent agent execution
@@ -527,8 +526,8 @@ async def main() -> int:
     say(f"\n  {status_color}{_PASS}/{total} assertions passed{RESET}")
     say(f"  Elapsed: {elapsed:.2f}s of concurrent agent runtime")
     say(f"  Spend: ${total_spent:.6f}")
-    say(f"")
-    say(f"  Look for these agent IDs in http://localhost:3001/agents :")
+    say("")
+    say("  Look for these agent IDs in http://localhost:3001/agents :")
     for a in [billing, support, fraud, analytics, compliance, search]:
         say(f"    {DIM}·{RESET} {a}")
 

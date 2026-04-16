@@ -24,7 +24,6 @@ import json
 import os
 import re
 import time
-import unicodedata
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -2650,7 +2649,7 @@ def _user_can_access_agent(role: str, user_id: str, agent_id: str) -> bool:
     return False
 
 
-from .models.responses import AuditEventView as _AuditEventView_for_route
+from .models.responses import AuditEventView as _AuditEventView_for_route  # noqa: E402  # late-bound alias used only by /api/events/{id} route below
 
 
 @app.get(

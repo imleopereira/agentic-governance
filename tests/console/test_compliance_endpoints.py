@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -124,7 +125,6 @@ class TestComplianceCache:
         assert _app._compliance_cache_get("k") == {"value": 1}
 
     def test_expired_entry_is_evicted(self) -> None:
-        import time
 
         _app._compliance_cache_put("k", {"value": 1})
         # Rewind the inserted_at so the entry is past TTL.

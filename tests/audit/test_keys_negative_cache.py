@@ -8,7 +8,6 @@ behavior so a future refactor can't silently change it.
 from __future__ import annotations
 
 import base64
-import os
 
 from codeatelier_governance.audit import keys as _keys
 

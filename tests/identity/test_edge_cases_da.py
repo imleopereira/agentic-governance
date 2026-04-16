@@ -37,8 +37,10 @@ def test_file_keystore_race_between_bootstrap_and_read(tmp_path: Path) -> None:
 
     t1 = threading.Thread(target=_go, args=(ks_a,))
     t2 = threading.Thread(target=_go, args=(ks_b,))
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
     assert not errors, f"bootstrap raised under race: {errors}"
 
     # Both instances must now be able to read the same key bytes.

@@ -34,7 +34,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-import pytest
 
 from codeatelier_governance.audit.chain import compute_event_hmac, verify_event
 from codeatelier_governance.audit.models import AuditEventRecord

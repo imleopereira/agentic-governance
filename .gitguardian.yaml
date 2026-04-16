@@ -1,0 +1,19 @@
+version: 2
+
+# Files that MUST contain obviously-fake secret-shaped strings because they
+# test or exercise the SDK's secret-redaction code paths. Every value below
+# is either (a) an AWS-documented example (`AKIAIOSFODNN7EXAMPLE`,
+# `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY1`), (b) an alphabet-sequence
+# placeholder (`ghp_abcdefghijklmnopqrstuvwxyz0123456789`), or (c) a fixture
+# DSN with meme credentials (`postgres://alice:hunter2@db.internal`).
+#
+# Dropping these fixtures would leave the redaction layer untested. The
+# correct posture is to allowlist the specific test files — not to bury
+# the failure or invent weaker fake values that no longer resemble what
+# the redactor must catch in real logs.
+paths-ignore:
+  - scripts/test_no_hardcoded_creds.py
+  - tests/console/test_response_models_typed.py
+  - console/src/lib/connectionStore.test.ts
+  - console/src/lib/metadataValidator.test.ts
+  - tests/audit/test_metadata_sanitization.py

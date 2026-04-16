@@ -9,7 +9,7 @@ The fix defers registration to ``start()`` and queries
 from __future__ import annotations
 
 import secrets as _secrets
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
