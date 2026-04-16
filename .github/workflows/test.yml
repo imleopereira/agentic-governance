@@ -7,6 +7,14 @@ on:
     branches: [production]
   workflow_call:
 
+# dorny/paths-filter needs `pull-requests: read` to call the PR changed-files
+# API; without it the action fails with "Resource not accessible by
+# integration" on every PR event. `contents: read` is the least-privilege
+# default for the rest of the workflow.
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   unit:
     name: unit tests + lint + types (py${{ matrix.python }})
