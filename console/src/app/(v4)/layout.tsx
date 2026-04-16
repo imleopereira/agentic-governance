@@ -5,6 +5,32 @@ import { notFound } from "next/navigation";
 
 import { ErrorBoundary } from "@/components/v4/ErrorBoundary";
 import { ComplianceHeaderPill } from "@/components/v4/ComplianceHeaderPill";
+import { rankWorst, type Health } from "@/components/DisconnectBanner.utils";
+import { useConnectionStore } from "@/lib/connectionStore";
+import { useEventStreamStore } from "@/lib/store";
+
+// Mirror of the visibility logic in DisconnectBanner. Kept internal to
+// the layout so the pill wrapper can shift its `top` offset when the
+// banner is visible — otherwise the fixed-position pill renders on top
+// of the in-flow banner, which looks like a stacking bug even though
+// it's correct z-order.
+function restToHealth(s: "ok" | "degraded" | "offline"): Health {
+  if (s === "ok") return "connected";
+  if (s === "offline") return "disconnected";
+  return "reconnecting";
+}
+function sseToHealth(
+  s: "connecting" | "connected" | "disconnected" | "polling",
+): Health {
+  if (s === "connected" || s === "polling") return "connected";
+  if (s === "disconnected") return "disconnected";
+  return "reconnecting";
+}
+function useIsBannerVisible(): boolean {
+  const restStatus = useConnectionStore((s) => s.status);
+  const sseStatus = useEventStreamStore((s) => s.connectionStatus);
+  return rankWorst(restToHealth(restStatus), sseToHealth(sseStatus)) !== "connected";
+}
 
 /**
  * v4 console shell layout boundary.
@@ -46,19 +72,32 @@ export default function V4Layout({ children }: { children: ReactNode }) {
   return (
     <ErrorBoundary>
       <div className="v4-shell">
-        <div
-          className="v4-header-pill-slot"
-          style={{
-            position: "fixed",
-            top: 12,
-            right: 16,
-            zIndex: 20,
-          }}
-        >
-          <ComplianceHeaderPill />
-        </div>
+        <PillSlot />
         {children}
       </div>
     </ErrorBoundary>
+  );
+}
+
+// When the yellow/red DisconnectBanner is visible it takes ~40px of
+// vertical space at the top of the shell. The pill is fixed-positioned
+// and would otherwise render ON TOP of the banner. Shift `top` below
+// the banner height + a small gap when the banner is showing; snap
+// back to 12px when it's clear.
+function PillSlot() {
+  const bannerVisible = useIsBannerVisible();
+  return (
+    <div
+      className="v4-header-pill-slot"
+      style={{
+        position: "fixed",
+        top: bannerVisible ? 52 : 12,
+        right: 16,
+        zIndex: 20,
+        transition: "top 120ms ease",
+      }}
+    >
+      <ComplianceHeaderPill />
+    </div>
   );
 }
