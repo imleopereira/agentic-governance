@@ -66,7 +66,10 @@ jobs:
       - name: install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,otel,console]"
+          # [migrations] extra brings in psycopg (v3) — required by the
+          # seeded-DB integration test which spins a Docker Postgres and
+          # imports psycopg directly to wait for readiness.
+          python -m pip install -e ".[dev,otel,console,migrations]"
       - name: apply DDL
         run: |
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
