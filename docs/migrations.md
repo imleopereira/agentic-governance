@@ -22,6 +22,23 @@ is the upstream-recommended successor.
 
 ## Run the upgrade
 
+The recommended path in v0.6+ is the CLI:
+
+```bash
+governance migrate --database-url postgresql://user:pass@host:5432/db
+```
+
+This applies the bundled DDL files (base schema) and then runs
+`alembic upgrade head` in one shot. Idempotent — running twice is a
+no-op because alembic tracks applied revisions in the
+`alembic_version` table.
+
+### Manual path (alembic only)
+
+If you already have the base schema in place (e.g. from an earlier
+`governance migrate` run or a DBA-managed deployment), you can run
+alembic directly:
+
 ```bash
 # Point Alembic at your DB. Any of these work:
 export SQLALCHEMY_URL="postgresql://user:pass@host:5432/db"
@@ -32,12 +49,23 @@ export SQLALCHEMY_URL="postgresql://user:pass@host:5432/db"
 alembic upgrade head
 ```
 
-`alembic upgrade head` is the canonical command. v0.6 ships a merge
-migration (`ab1f55d62f81_merge_v06_feature_heads`) that unifies the
-three parallel v0.6 feature branches (Ed25519 agent identity, HMAC
-chain key rotation, wrapper coverage registry) into a single head.
-Earlier pre-release builds of v0.6 required `alembic upgrade heads`
-(plural); this no longer applies.
+v0.6 ships a merge migration (`ab1f55d62f81_merge_v06_feature_heads`)
+that unifies the three parallel v0.6 feature branches (Ed25519 agent
+identity, HMAC chain key rotation, wrapper coverage registry) into a
+single head. Earlier pre-release builds of v0.6 required
+`alembic upgrade heads` (plural); this no longer applies.
+
+### Why this matters for fresh installs
+
+Prior to v0.6.0 on PyPI, `governance migrate` applied only the DDL
+files and left the post-v0.5 schema changes (Ed25519 signing columns,
+agent-key tables, rotation markers) to a separate manual
+`alembic upgrade head`. Operators who ran `governance migrate` on a
+fresh database and did not follow up with alembic ended up on the
+v0.5 schema — every `AuditModule.log()` call degraded to
+`StoreUnavailableError` against the missing `signature_status`
+column and rows were silently dropped per invariant #1. v0.6.0 fixes
+this by invoking alembic automatically from `governance migrate`.
 
 ## What gets applied in v0.6
 

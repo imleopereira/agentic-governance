@@ -369,6 +369,29 @@ Per-user request rate limit on the six endpoints wired by F6#4:
 `/api/agents/presence`, `/api/gates/pending`, `/api/gates/recent`.
 Returns HTTP 429 with `Retry-After` when exceeded.
 
+### `GOVERNANCE_COMPLIANCE_RATE_LIMIT`
+
+| Property | Value |
+|---|---|
+| **Required** | No |
+| **Default** | `1` (requests per 60 seconds per user) |
+| **Read in** | `src/codeatelier_governance/console/app.py:3116` |
+| **Status** | **New in v0.6.0** |
+
+Per-user rate limit on the compliance endpoints (`GET /api/compliance/report`,
+`POST /api/compliance/verify-chain`, `POST /api/compliance/export`). Compliance
+calls are expensive — they verify the HMAC chain over the requested window
+(default last 1000 events) — and should not be treated as cheap polling
+endpoints.
+
+The 1-req-per-60-seconds default is deliberately tight. Raise it only for
+deployments where an auditor or compliance officer legitimately needs to
+export bundles across multiple windows within the rate-limit window.
+
+Returns HTTP 429 with `Retry-After` when exceeded. Rate-limit state is
+process-local (in-memory dict keyed on user id) — multi-worker uvicorn
+deployments multiply the effective limit by worker count.
+
 ---
 
 ## Frontend variables

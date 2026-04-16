@@ -2,8 +2,8 @@
 
 **Enforcement gates for every action routed through the SDK — in-process, just Postgres.**
 
-[![tests](https://github.com/imleopereira/code-atelier-governance/actions/workflows/test.yml/badge.svg)](https://github.com/imleopereira/code-atelier-governance/actions/workflows/test.yml)
 [![PyPI](https://img.shields.io/pypi/v/code-atelier-governance)](https://pypi.org/project/code-atelier-governance/)
+[![Python](https://img.shields.io/pypi/pyversions/code-atelier-governance)](https://pypi.org/project/code-atelier-governance/)
 
 Most LLM tools tell you what your agent did, after the fact. Code Atelier
 Governance gates decisions *before* the LLM call fires — for every action
@@ -54,16 +54,17 @@ pip install "code-atelier-governance[otel]"               # + OpenTelemetry expo
 pip install "code-atelier-governance[migrations]"         # + alembic + psycopg3 (one-time, for `alembic upgrade head`)
 ```
 
-The `[migrations]` extra is required to run the v0.6 alembic upgrade
-because the SDK runtime driver is `asyncpg` (async-only) and alembic's
-sync env.py needs a sync driver. See `docs/migrations.md` for the full
-runbook and `docs/configuration.md` for every environment variable the
-SDK and console read.
+The `[migrations]` extra is required for fresh installs and for
+upgrading v0.5.x deployments to v0.6. `governance migrate` applies the
+base DDL and then runs `alembic upgrade head` automatically, so a
+single command takes a new database all the way to HEAD. See
+`docs/migrations.md` for the full runbook and `docs/configuration.md`
+for every environment variable the SDK and console read.
 
 ## Setup
 
 ```bash
-# Apply DDL to your Postgres
+# One command: DDL + alembic upgrade head.
 governance migrate --database-url postgresql://user:pass@host/db
 
 # Create a console user
@@ -83,8 +84,15 @@ governance console add-user --username admin --role admin
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Generates the event log required by EU AI Act Article 12 for all actions routed through the SDK. Produces an Article 12 evidence report from the audit trail. The report does not assert compliance — it provides evidence for actions the SDK observed. Article 12 compliance for your deployment depends on routing all relevant AI actions through the SDK. |
 
-## What's new in v0.6
+## What's new in v0.6.0
 
+- **Article 12 evidence export.** `POST /api/compliance/export`
+  packages the compliance report and chain verification into a single
+  HMAC-signed JSON bundle (`bundle_hash` + `bundle_signature`) a
+  compliance officer can hand to an auditor. The v4 Compliance page
+  has an "Export Article 12 evidence" button wired to it, with a
+  Windows-safe filename and screen-reader-announced download
+  lifecycle.
 - **Ed25519 agent identity.** Per-row Ed25519 signatures over the HMAC
   audit chain, with three keystore backends (`file://`, `env://`,
   `ephemeral`) and graceful degradation to `signature_status='unsigned_local_failure'`

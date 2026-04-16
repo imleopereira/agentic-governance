@@ -1,13 +1,14 @@
 # Changelog
 
-## v0.6.1 (unreleased) — polish sprint: evidence export + console + self-discipline
+## v0.6.0 (2026-04-16) — Ed25519 + HMAC rotation + Article 12 export + self-discipline
 
-Polish release driven by the v0.6 team retrospective. No new PRD features; this
-sprint fixes the console compliance surface, closes a silently breached
-LLM-theater test-count tripwire, and finishes v0.6 wiring. No database schema
-changes. See **Silent / wire-contract changes** below for additions to audit
-event kinds and `signature_status` values that downstream pipelines must
-account for before upgrading.
+Published to PyPI: <https://pypi.org/project/code-atelier-governance/0.6.0/>.
+
+Major release implementing F2–F9 of the v0.6 PRD plus the polish pass landed
+after the initial v0.6 tag (Track A finish, LLM-theater tripwire closure,
+compliance export, fresh-install fix). See **Silent / wire-contract changes**
+below for additions to audit event kinds and `signature_status` values that
+downstream pipelines must account for before upgrading.
 
 ### Added
 
@@ -40,19 +41,19 @@ account for before upgrading.
 - **LLM-theater tripwire closed.** Source-grep assertions are replaced with
   runtime tests where feasible, and CI now enforces a numeric ceiling on the
   remaining source-grep count with a monotonic-decrease rule per release.
-  The count silently breached the v0.6 threshold (8 > 5); v0.6.1 restores
+  The count silently breached the v0.6 threshold (8 > 5); v0.6.0 restores
   discipline by making the violation loud.
 
 ### Silent / wire-contract changes
 
-These are additive and do not break a strict v0.6.0 client, but a downstream
-pipeline parsing the audit log with an exhaustive enum MUST add the new values
-before upgrading.
+These are additive and do not break a strict v0.5.x client at the wire
+level, but a downstream pipeline parsing the audit log with an exhaustive
+enum MUST add the new values before upgrading.
 
 - **`signature_status` values expanded.** The `AuditEventRecord.signature_status`
   Literal now includes `revoked_key`, `invalid_signature`, and `unknown_key`
   in addition to the v0.6.0 set. A pipeline using a strict enum on this field
-  must add these values before pulling v0.6.1 audit rows.
+  must add these values before pulling v0.6.0 audit rows.
 - **New audit event kind `audit.agent_key_revocation`.** Emitted whenever a
   key is revoked via `RevocationStore.revoke_with_chain_event()`. Downstream
   filters that allow-list known event kinds must add it.
@@ -70,43 +71,44 @@ before upgrading.
   the public `canonical_json` helper) but a regulator-facing "how to verify
   this bundle on your own machine" recipe has not shipped. Blocks the
   "hand this to your regulator" positioning; until then the export is a
-  design-partner demo artefact. Slated for v0.6.2.
+  design-partner demo artefact. Slated for v0.6.1.
 - **HMAC-only bundle signature.** Bundle is signed with HMAC-SHA256 under the
   shared `AUDIT_SECRET`. An auditor must hold the secret to verify — fine
   for self-contained evidence-handoff but blocks third-party offline
   verification. Ed25519 bundle signing with a published public key is the
-  v0.6.2 target.
+  v0.6.1 target.
 - **`rotation_status.known_fingerprints_in_window`** is misnamed — the value
-  is the UNRESOLVED fingerprints list. Rename held to v0.6.2 because the
+  is the UNRESOLVED fingerprints list. Rename held to v0.6.1 because the
   bundle wire contract is already shipped.
 - **429 UX**: rate-limit retries surface a generic error rather than parsing
   `Retry-After`. Product-level UX decision pending.
 - **Compliance export rate limit (1 req/60s/user)** is tight for officers
-  running bundle exports across multiple windows. Overridable in v0.6.1 via
+  running bundle exports across multiple windows. Overridable via
   `GOVERNANCE_COMPLIANCE_RATE_LIMIT` for environments that need higher
   throughput. The bundle is embedded in the signer's audit chain regardless.
 
-## v0.6.0 (2026-04-15) — Ed25519, HMAC rotation, wrapper coverage, backend wiring
+### ⚠️ Required upgrade step (v0.5.x → v0.6)
 
-Major release implementing F2–F9 of the v0.6 PRD across the SDK and console.
+**Install the `[migrations]` extra and run `governance migrate` (or
+`alembic upgrade head`) before starting the v0.6 SDK in any environment
+that has v0.5.x audit data.** The v0.6 `PostgresAuditStore` writes to the
+new `signature`, `signing_key_fingerprint`, and `signature_status` columns
+on `governance_audit_events`. Against a pre-migration v0.5.x schema those
+columns do not exist and `AuditModule.log()` degrades to
+`StoreUnavailableError` — audit rows are silently dropped until the
+migration is applied.
 
-### ⚠️ Required upgrade step
-
-**Run `alembic upgrade head` before starting the v0.6 SDK in any environment
-that has v0.5.x audit data.** The v0.6 `PostgresAuditStore` writes to the new
-`signature`, `signing_key_fingerprint`, and `signature_status` columns on
-`governance_audit_events`. Against a pre-migration v0.5.x schema those columns
-do not exist and `AuditModule.log()` degrades to `StoreUnavailableError` —
-audit rows are silently dropped until the migration is applied.
-
-The `[migrations]` extra is required to run alembic against Postgres because
-the SDK's runtime driver is `asyncpg` (async-only), and alembic's sync env.py
-needs a sync driver:
-
+```bash
+pip install "code-atelier-governance[migrations]==0.6.0"
+governance migrate --database-url postgresql://...
+# Equivalent: alembic upgrade head (manual path; governance migrate now
+# runs alembic automatically after applying the base DDL).
 ```
-pip install code-atelier-governance[migrations]
-alembic upgrade head    # singular — a merge migration unifies the v0.6 heads
-```
+
+The `[migrations]` extra is required because the SDK runtime driver is
+`asyncpg` (async-only) and alembic's sync env.py needs a sync driver.
+A merge migration unifies the three parallel v0.6 feature heads (Ed25519,
+HMAC rotation, wrapper coverage) into a single head.
 
 A pre-existing append-only grants gap on `governance_audit_events` is also
 closed in this release (CLAUDE.md invariant 2). After upgrading, the
