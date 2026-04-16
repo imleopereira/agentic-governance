@@ -3,8 +3,10 @@
 /**
  * ContractsPanel — PRD B2: empty state ALWAYS.
  *
- * Do NOT render simulated contract data. The contracts API endpoint ships in
- * v0.6; until then we show a friction-free empty state pointing at the SDK.
+ * Do NOT render simulated contract data. Contracts are registered via
+ * the SDK in-process; this panel shows the pointer, not a synthetic
+ * list. A per-agent read endpoint that would let the console enumerate
+ * registered contracts is on the v0.7 roadmap.
  */
 
 import { EmptyState } from "./EmptyState";
@@ -16,7 +18,7 @@ export interface ContractsPanelProps {
 }
 
 // FIX 13: the panel is per-agent even though we don't use the id until
-// the contracts API ships in v0.6. Take the prop under its real name so
+// the contracts read endpoint lands. Take the prop under its real name so
 // callers (and future maintainers) aren't misled by a `_agentId`
 // convention that suggests it is genuinely unused at the design level.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -33,7 +35,8 @@ export function ContractsPanel({ agentId }: ContractsPanelProps) {
         }
       />
       <InfoBox tone="info">
-        The contracts API endpoint ships in v0.6.
+        Contracts are registered in-process via the SDK. A per-agent
+        read endpoint is on the v0.7 roadmap.
       </InfoBox>
     </div>
   );

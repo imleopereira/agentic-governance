@@ -1,5 +1,69 @@
 # Changelog
 
+## v0.6.2 (unreleased) — v4 console default flip
+
+Console-only release. No SDK API changes, no wire-contract changes, no
+migrations. Lands the four parked Wave 1.5 worktrees from the v0.6.1
+polish sprint and flips the default console UI from v3 to v4.
+
+> **BREAKING DEFAULT**: The console now loads v4 on first visit. Set
+> `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` before upgrading if your team
+> has existing documentation or training materials that reference the
+> v3 layout. v3 is removed in v0.7.
+
+### Added
+
+- **v4 is the default console UI.** `next.config.ts`, middleware, and
+  the v4 layout all fall through to `v4` when
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION` is unset. `/` rewrites to `/agents`
+  under v4.
+- **Compliance entry in the v4 sidebar.** `FileCheck` icon, routes to
+  `/compliance`, lands on the Article 12 report with the Export button
+  Wave 1 shipped.
+- **ComplianceHeaderPill navigates to /compliance on click.** The
+  pill's primary affordance is now navigation; re-verify moves to an
+  adjacent keyboard-reachable icon button with an explicit
+  `aria-label="Re-verify chain integrity"`. Auto-reverify on stale and
+  the in-flight guard are unchanged.
+- **Officer-voice empty-state copy** for the v4 drill panels
+  (`empty-states.ts`): no version callouts, no raw Python, one
+  actionable sentence per state targeted at compliance officers.
+- **`console_ui_version` cookie persistence.** The `?ui=v3` / `?ui=v4`
+  query override now survives subsequent navigations via a 30-day
+  `SameSite=Lax` cookie. Precedence: query → cookie → env var →
+  default `v4`. The query param is stripped from the URL on the
+  persist-redirect.
+- **Playwright v4-default smoke test.** `tests/e2e/v4-default.spec.ts`
+  (three tests: default `/` → v4, Compliance nav + export button,
+  `?ui=v3` cookie). A new `console-e2e-smoke` CI job runs it on
+  console-touching PRs with `continue-on-error: true` while we collect
+  flake stats. Promote to blocking in v0.7.
+
+### Changed
+
+- **V3DeprecationBanner copy flipped.** Banner (still
+  `NEXT_PUBLIC_SHOW_V3_BANNER`-gated) now shows only when
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` is explicitly set, warning
+  forced-v3 operators that v3 is removed in v0.7. Default-install
+  users never see it because they land on v4.
+- **Sidebar "Topology" → "Agents"** in v4 (`/agents` is the v4
+  landing). v3 nav untouched to preserve the exact shipped v0.6.1
+  layout for escape-hatch users.
+- **ContractsPanel copy.** Removed the stale "ships in v0.6" line;
+  contracts have been registerable in-process since v0.6.0. The new
+  text points at the SDK registration API and notes that a per-agent
+  read endpoint is on the v0.7 roadmap.
+- **`console/src/app/page.tsx`** (v3 root landing) renamed the page
+  component from `TopologyPage` to `AgentsPage`, fixed the H1, and
+  moved the Python onboarding snippet behind `<details>` so the v3
+  empty state stops shouting at non-dev visitors.
+
+### Opt-out
+
+- Set `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` at build time to keep v3 as
+  the default. The `?ui=v3` URL param flips the `console_ui_version`
+  cookie and persists across navigations. v3 is removed in v0.7.
+
 ## v0.6.1 (unreleased) — security sweep fixes
 
 Patch release driven by a 5-agent security sweep against v0.6.0 and a

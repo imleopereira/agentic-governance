@@ -84,6 +84,14 @@ governance console add-user --username admin --role admin
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Generates the event log required by EU AI Act Article 12 for all actions routed through the SDK. Produces an Article 12 evidence report from the audit trail. The report does not assert compliance — it provides evidence for actions the SDK observed. Article 12 compliance for your deployment depends on routing all relevant AI actions through the SDK. |
 
+## What's new in v0.6.2
+
+- **v4 is the default console UI.** `NEXT_PUBLIC_CONSOLE_UI_VERSION`
+  defaults to `v4` as of v0.6.2; set it to `v3` at build time to keep
+  the legacy console. `?ui=v3` persists via a `console_ui_version`
+  cookie (SameSite=Lax, 30 days). v3 is removed in v0.7. See
+  `docs/configuration.md` for the full escape-hatch semantics.
+
 ## What's new in v0.6.0
 
 - **Article 12 evidence export.** `POST /api/compliance/export`

@@ -243,45 +243,53 @@ function DetailPanel({ agent, onClose }: { agent: PostureAgent; onClose: () => v
 }
 
 // ─── Empty State ──────────────────────────────────────────────────────────────
-function EmptyTopology() {
+function EmptyAgents() {
   const [copied, setCopied] = useState(false);
   const snippet = `from codeatelier_governance import GovernanceSDK
 
 sdk = GovernanceSDK(database_url="postgresql://...")
 agent = await sdk.register_agent("my-agent")`;
   return (
-    <div style={{ textAlign: "center", padding: "4rem 2rem", maxWidth: 520, margin: "0 auto" }}>
+    <div style={{ textAlign: "center", padding: "4rem 2rem", maxWidth: 560, margin: "0 auto" }}>
       <div style={{ width: 56, height: 56, borderRadius: "50%",
         background: "rgba(130,40,245,0.1)", border: "1px solid rgba(130,40,245,0.2)",
         display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 1.25rem" }}>
         <Activity size={24} style={{ color: "var(--accent)" }} aria-hidden="true" />
       </div>
       <h2 style={{ fontSize: "1.125rem", fontWeight: 600, marginBottom: "0.5rem" }}>
-        No agents registered
+        No agents instrumented yet
       </h2>
       <p style={{ fontSize: "0.875rem", color: "var(--text-tertiary)", marginBottom: "1.5rem", lineHeight: 1.6 }}>
-        Connect your first agent in 3 lines of Python. Once registered it will appear here with live status, budget usage, and audit events.
+        A developer will need to wrap your first agent with the governance SDK.
+        Once wrapped, it will appear here with live status, spend, and audit events —
+        share this page&rsquo;s URL with them to get started.
       </p>
-      <div style={{ background: "rgba(0,0,0,0.3)", border: "1px solid var(--border)",
-        borderRadius: "var(--radius-md)", padding: "1rem", textAlign: "left", position: "relative" }}>
-        <pre className="font-mono" style={{ fontSize: "0.8125rem", color: "var(--fg)", margin: 0, whiteSpace: "pre-wrap" }}>
-          {snippet}
-        </pre>
-        <button
-          onClick={async () => { await navigator.clipboard.writeText(snippet).catch(() => null); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
-          aria-label="Copy code snippet"
-          style={{ position: "absolute", top: 8, right: 8, background: "rgba(130,40,245,0.1)",
-            border: "1px solid rgba(130,40,245,0.2)", color: copied ? "var(--accent-light)" : "var(--text-tertiary)",
-            borderRadius: "var(--radius-sm)", padding: "4px 8px", fontSize: "0.6875rem", cursor: "pointer" }}>
-          {copied ? "Copied!" : "Copy"}
-        </button>
-      </div>
+      <details style={{ background: "rgba(0,0,0,0.3)", border: "1px solid var(--border)",
+        borderRadius: "var(--radius-md)", padding: "0.75rem 1rem", textAlign: "left" }}>
+        <summary style={{ cursor: "pointer", fontSize: "0.8125rem", color: "var(--text-secondary)",
+          listStyle: "revert", userSelect: "none" }}>
+          Show developer setup
+        </summary>
+        <div style={{ position: "relative", marginTop: "0.75rem" }}>
+          <pre className="font-mono" style={{ fontSize: "0.8125rem", color: "var(--fg)", margin: 0, whiteSpace: "pre-wrap" }}>
+            {snippet}
+          </pre>
+          <button
+            onClick={async () => { await navigator.clipboard.writeText(snippet).catch(() => null); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+            aria-label="Copy code snippet"
+            style={{ position: "absolute", top: 0, right: 0, background: "rgba(130,40,245,0.1)",
+              border: "1px solid rgba(130,40,245,0.2)", color: copied ? "var(--accent-light)" : "var(--text-tertiary)",
+              borderRadius: "var(--radius-sm)", padding: "4px 8px", fontSize: "0.6875rem", cursor: "pointer" }}>
+            {copied ? "Copied!" : "Copy"}
+          </button>
+        </div>
+      </details>
     </div>
   );
 }
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
-export default function TopologyPage() {
+export default function AgentsPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
@@ -319,7 +327,7 @@ export default function TopologyPage() {
   if (isLoading) {
     return (
       <div className="space-y-6" aria-busy="true">
-        <h1 style={{ fontSize: "1.375rem", fontWeight: 700 }}>Agent Topology</h1>
+        <h1 style={{ fontSize: "1.375rem", fontWeight: 700 }}>Agents</h1>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "0.75rem" }}>
           {Array.from({ length: 6 }).map((_, i) => <CardSkeleton key={i} />)}
         </div>
@@ -350,14 +358,14 @@ export default function TopologyPage() {
   }
 
   if (!data || data.agent_count === 0) {
-    return <><h1 style={{ fontSize: "1.375rem", fontWeight: 700, marginBottom: "1rem" }}>Agent Topology</h1><EmptyTopology /></>;
+    return <><h1 style={{ fontSize: "1.375rem", fontWeight: 700, marginBottom: "1rem" }}>Agents</h1><EmptyAgents /></>;
   }
 
   return (
     <div onKeyDown={handleGridKey}>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
         marginBottom: "1.25rem", gap: "1rem" }}>
-        <h1 style={{ fontSize: "1.375rem", fontWeight: 700 }}>Agent Topology</h1>
+        <h1 style={{ fontSize: "1.375rem", fontWeight: 700 }}>Agents</h1>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
           <label htmlFor="agent-search" style={{ position: "absolute", width: 1, height: 1, overflow: "hidden", clip: "rect(0,0,0,0)" }}>
             Search agents

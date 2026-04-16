@@ -21,14 +21,16 @@ import { ComplianceHeaderPill } from "@/components/v4/ComplianceHeaderPill";
  * dedupe. This layout still contributes the v4 ErrorBoundary +
  * DisconnectBanner wrapping.
  *
- * FIX 6: when `NEXT_PUBLIC_CONSOLE_UI_VERSION` is not `v4`, call
- * `notFound()` so the route hits the 404 page instead of rendering an
- * empty screen for a hand-typed v4 URL under v3.
+ * FIX 6 (v0.6.2): v4 is now the default. Call `notFound()` only when
+ * the env var is explicitly `v3` — a user who has forced v3 should not
+ * render v4 pages. The unset case falls through to v4 per the flipped
+ * default. Cookie-based `?ui=v3` overrides are handled by middleware.ts
+ * (which redirects) and do not reach this layout.
  */
 export default function V4Layout({ children }: { children: ReactNode }) {
-  const version = process.env.NEXT_PUBLIC_CONSOLE_UI_VERSION ?? "v3";
+  const version = process.env.NEXT_PUBLIC_CONSOLE_UI_VERSION ?? "v4";
 
-  if (version !== "v4") {
+  if (version === "v3") {
     notFound();
   }
 

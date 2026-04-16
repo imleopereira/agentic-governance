@@ -6,7 +6,7 @@ import { useAuth } from "@/lib/auth";
 import { useEventStreamStore } from "@/lib/store";
 import {
   LayoutGrid, Activity, CheckSquare, ScrollText,
-  DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield,
+  DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield, FileCheck,
 } from "lucide-react";
 
 interface NavItem {
@@ -18,11 +18,27 @@ interface NavItem {
 // rewrites `/` to `/agents`, so a Topology link at `href: "/"` never
 // highlights. Replace it with a proper "Agents" entry in v4; leave the
 // v3 nav untouched.
+//
+// v0.6.2 (Agent E): add `Compliance` entry to the v4 nav so
+// the Article 12 report is reachable from the primary IA, not just the
+// header pill. The route `/compliance` is the only v4-only page beyond
+// `/agents`; the rest of the v4 nav items (`/stream`, `/gates`,
+// `/events`, `/cost`, `/admin/users`) do NOT have `(v4)/*` counterparts
+// yet and transparently hand off to the v3 pages at `app/<route>/`
+// because route-group parentheses don't change URL paths. The v4 shell
+// (fixed header pill, ErrorBoundary, DisconnectBanner) does NOT wrap
+// those handoff pages — this is acceptable for Wave 1.5; Wave 2+ will
+// re-parent routes under `(v4)/` one by one.
+//
+// v3 nav deliberately does NOT include Compliance: `(v4)/compliance`'s
+// layout calls `notFound()` when `NEXT_PUBLIC_CONSOLE_UI_VERSION !== "v4"`,
+// so a Compliance entry in v3 would route v3 users straight to a 404.
 const IS_V4 = process.env.NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4";
 
 const NAV_ITEMS: NavItem[] = IS_V4
   ? [
       { label: "Agents", href: "/agents", icon: LayoutGrid },
+      { label: "Compliance", href: "/compliance", icon: FileCheck },
       { label: "Event Stream", href: "/stream", icon: Activity },
       { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
       { label: "Audit Log", href: "/events", icon: ScrollText },

@@ -34,5 +34,9 @@ export default defineConfig({
     globals: false,
     setupFiles: ["./src/test-setup.ts"],
     css: false,
+    // Playwright E2E specs live under tests/e2e/ and must NOT be
+    // picked up by vitest — they import from `@playwright/test` and
+    // are executed by `npm run e2e` (see playwright.config.ts).
+    exclude: ["node_modules", "dist", ".next", "tests/e2e/**"],
   },
 });

@@ -152,7 +152,7 @@ describe("ScopePanel — runtime render", () => {
     );
     await waitFor(() => {
       expect(
-        screen.getByText(/Allowlist enforced by SDK/i),
+        screen.getByText(/No scope policy set for this agent/i),
       ).toBeInTheDocument();
     });
   });

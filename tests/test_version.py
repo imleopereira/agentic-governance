@@ -1,8 +1,8 @@
 """BLOCKER 0: pin the published package version.
 
-The v0.6.0 release is gated on pyproject.toml saying ``0.6.0``. This
-test asserts the installed metadata matches and is the literal tag
-blocker check the team review surfaced.
+The release is gated on pyproject.toml matching ``EXPECTED_VERSION``.
+This test asserts the installed metadata matches and is the literal
+tag blocker check the team review surfaced.
 """
 from __future__ import annotations
 
@@ -11,10 +11,10 @@ from importlib.metadata import version
 import codeatelier_governance
 
 
-EXPECTED_VERSION = "0.6.0"
+EXPECTED_VERSION = "0.6.2"
 
 
-def test_pyproject_version_is_v0_6_0() -> None:
+def test_pyproject_version_matches_expected() -> None:
     assert version("code-atelier-governance") == EXPECTED_VERSION
 
 
