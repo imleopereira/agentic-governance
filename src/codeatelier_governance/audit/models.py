@@ -16,7 +16,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+import structlog
+
 from codeatelier_governance.audit.sanitization import sanitize_metadata, sanitize_string
+
+_logger = structlog.get_logger(__name__)
 
 # --- Size caps (security: DoS prevention at the SDK boundary) -----------------
 MAX_KIND_LEN = 128
@@ -112,23 +116,39 @@ class AuditEvent(BaseModel):
         # Pydantic's max_length check has already run on the raw input, so
         # the sanitizer's internal cap is a belt-and-suspenders on the NFC
         # expansion case only; the field cap is the real ceiling.
-        object.__setattr__(
-            self, "agent_id", sanitize_string(self.agent_id, max_len=MAX_AGENT_ID_LEN)
-        )
-        object.__setattr__(
-            self, "kind", sanitize_string(self.kind, max_len=MAX_KIND_LEN)
-        )
-        if self.model is not None:
-            object.__setattr__(self, "model", sanitize_string(self.model, max_len=128))
-        if self.input_hash is not None:
-            object.__setattr__(
-                self, "input_hash", sanitize_string(self.input_hash, max_len=MAX_HASH_LEN)
-            )
-        if self.output_hash is not None:
-            object.__setattr__(
-                self,
-                "output_hash",
-                sanitize_string(self.output_hash, max_len=MAX_HASH_LEN),
+        # DX v0.6.1 finding: sanitization is silent with no opt-out. Any caller
+        # who hashes these field values externally and compares against the
+        # stored record will silently diverge if the sanitizer mutates the
+        # value (backslash-escape, C0/ANSI strip, NFC normalize). We can't
+        # offer a knob in a security patch — the sanitization IS the fix —
+        # but we CAN emit structured-log observability so a caller who hits
+        # the regression can detect it. Field names logged, values are NOT
+        # (metadata may contain PII). Opt-out knob slated for v0.6.2.
+        sanitized_fields: list[str] = []
+        for field_name, max_len in (
+            ("agent_id", MAX_AGENT_ID_LEN),
+            ("kind", MAX_KIND_LEN),
+            ("model", 128),
+            ("input_hash", MAX_HASH_LEN),
+            ("output_hash", MAX_HASH_LEN),
+        ):
+            raw = getattr(self, field_name)
+            if raw is None:
+                continue
+            clean = sanitize_string(raw, max_len=max_len)
+            if clean != raw:
+                sanitized_fields.append(field_name)
+            object.__setattr__(self, field_name, clean)
+        if sanitized_fields:
+            _logger.warning(
+                "audit.event.field_sanitized",
+                fields=sanitized_fields,
+                note=(
+                    "AuditEvent field values were mutated by the v0.6.1 "
+                    "sanitizer (NFC + C0/ANSI strip + backslash escape). If "
+                    "you hash these fields externally, hashes will diverge "
+                    "from the stored record."
+                ),
             )
 
 

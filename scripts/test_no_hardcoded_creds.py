@@ -126,6 +126,13 @@ ALLOW_SUFFIXES: tuple[str, ...] = (
     "scripts/automation/deprecated/console-redesign-frontend.sh",
     "scripts/automation/deprecated/console-redesign-pipeline.sh",
     "scripts/automation/deprecated/console-redesign-review.sh",
+    # Secret-redaction tests MUST contain realistic-looking fixture DSNs
+    # and credentials to exercise the redactor — same rationale as the
+    # `.gitguardian.yaml` paths-ignore list. The fixtures (alice:hunter2,
+    # root:rootpw, xkcd-meme placeholders) are not real credentials.
+    "tests/audit/test_otel_exporter_redaction.py",
+    "tests/audit/test_metadata_sanitization.py",
+    "tests/console/test_response_models_typed.py",
 )
 
 
