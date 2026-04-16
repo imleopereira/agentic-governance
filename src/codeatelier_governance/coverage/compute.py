@@ -8,7 +8,7 @@ tuple. ``reason`` is the DA-blocker discriminator that disambiguates
 """
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import structlog
 
@@ -105,4 +105,4 @@ class CoverageComputer:
                 error_type=type(exc).__name__,
                 detail="Coverage computation failed; returning registry_disabled.",
             )
-            return (None, cast(CoverageReason, "registry_disabled"))
+            return (None, "registry_disabled")

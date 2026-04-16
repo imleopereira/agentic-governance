@@ -317,7 +317,7 @@ class ReportGenerator:
         if self._audit_store is not None:
             store = self._audit_store
             if hasattr(store, "_events"):
-                for evt in store._events.values():  # type: ignore[attr-defined]
+                for evt in store._events.values():
                     if getattr(evt, "kind", None) == KEY_ROTATION_KIND:
                         return True
             return False
@@ -618,7 +618,7 @@ class ReportGenerator:
         if self._audit_store is not None:
             store = self._audit_store
             if hasattr(store, "_events"):
-                total = len(store._events)  # type: ignore[attr-defined]
+                total = len(store._events)
                 return (total - 1) if total > 0 else None
             return None
         # Postgres path

@@ -301,7 +301,7 @@ class AgentKeyRegistry:
             public_key_pem=row[1],
             activated_at_chain_seq=row[2],
         )
-        return row[1]
+        return str(row[1])
 
     async def lookup_keys_for_agent(
         self, agent_id: str

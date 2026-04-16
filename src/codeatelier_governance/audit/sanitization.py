@@ -45,7 +45,7 @@ def sanitize_string(value: str, max_len: int = DEFAULT_MAX_STRING_LEN) -> str:
     See module docstring for the threat model and order rationale.
     """
     if not isinstance(value, str):  # defensive — caller should pre-check
-        return value  # type: ignore[unreachable]
+        return value
     # 1. NFC normalize first (zalgo defense).
     value = unicodedata.normalize("NFC", value)
     # 2. Cap RAW input length BEFORE escaping. Escapes double the length.

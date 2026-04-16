@@ -336,7 +336,7 @@ async def _run_rotate_chain_key(
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    from codeatelier_governance.audit.keys import _resolve_uri  # type: ignore
+    from codeatelier_governance.audit.keys import _resolve_uri
     from codeatelier_governance.audit.rotation import rotate_chain_key
 
     outgoing = os.environ.get("GOVERNANCE_AUDIT_SECRET")

@@ -20,6 +20,7 @@ themselves raise loudly so the caller can make the degradation decision.
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 import re
 import stat
@@ -185,7 +186,7 @@ class EnvKeyStore:
             )
         try:
             pem = base64.b64decode(raw, validate=True)
-        except (ValueError, base64.binascii.Error) as exc:
+        except (ValueError, binascii.Error) as exc:
             raise KeyStoreError(
                 f"{self.var_name}: value is not valid base64 ({exc})"
             ) from exc
