@@ -21,6 +21,18 @@ from codeatelier_governance.cli.commands import (
 )
 
 
+def _qa_db_url() -> str:
+    """Resolve the integration-test Postgres URL without a hardcoded fallback."""
+    url = os.environ.get("GOVERNANCE_DATABASE_URL") or os.environ.get(
+        "GOVERNANCE_QA_DB_URL"
+    )
+    if not url:
+        pytest.skip(
+            "Set GOVERNANCE_DATABASE_URL or GOVERNANCE_QA_DB_URL for integration tests."
+        )
+    return url
+
+
 # -- Parser tests --------------------------------------------------------------
 
 
@@ -90,7 +102,7 @@ def test_database_url_missing_exits(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_migrate_idempotent() -> None:
     """Running migrate twice should succeed (IF NOT EXISTS in DDL)."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
+    url = _qa_db_url()
     await _run_migrate(url)
     await _run_migrate(url)  # Should not raise
 
@@ -102,7 +114,7 @@ async def test_migrate_idempotent() -> None:
 @pytest.mark.asyncio
 async def test_verify_clean_session() -> None:
     """Verify should exit 0 for a valid HMAC chain."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
+    url = _qa_db_url()
     secret_hex = secrets.token_hex(32)
 
     # First, migrate
@@ -135,7 +147,7 @@ async def test_verify_clean_session() -> None:
 @pytest.mark.asyncio
 async def test_verify_empty_session() -> None:
     """Verify should exit 1 for a session with no events."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
+    url = _qa_db_url()
     secret_hex = secrets.token_hex(32)
     os.environ["GOVERNANCE_AUDIT_SECRET"] = secret_hex
 
@@ -153,7 +165,7 @@ async def test_verify_empty_session() -> None:
 @pytest.mark.asyncio
 async def test_budget_shows_data(capsys: pytest.CaptureFixture[str]) -> None:
     """Budget command should output JSON with agent_id."""
-    url = os.environ.get("GOVERNANCE_DATABASE_URL", os.environ.get("GOVERNANCE_QA_DB_URL", "postgresql://governance:governance@localhost:5435/governance_qa"))
+    url = _qa_db_url()
     await _run_migrate(url)
     # Clear migrate output before capturing budget output
     capsys.readouterr()

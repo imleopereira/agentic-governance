@@ -7,9 +7,10 @@
  * Rules per .agent-outputs/ui-ux/enforcement-trace-spec.md section 2.
  *
  * This component is presentational — it does NOT fetch session events itself.
- * Agent Q will wire session correlation via a `sessionEvents` prop in a later
- * pass. For now we infer from the single expanded event's `kind`, which is
- * sufficient for all violation variants and the common PASS-all case.
+ * Inference is keyed strictly on the single expanded event's `kind`, which is
+ * sufficient for all violation variants and the common PASS-all case. The
+ * previous `sessionEvents` prop was declared but never destructured (dead
+ * API surface) and was removed in F1.
  */
 
 import { memo, useMemo } from "react";
@@ -34,8 +35,6 @@ interface Gate {
 
 export interface EnforcementTraceProps {
   event: AuditEvent;
-  /** Optional related session events (not yet used — Agent Q will wire). */
-  sessionEvents?: readonly AuditEvent[];
 }
 
 const GATE_ORDER: readonly GateId[] = [

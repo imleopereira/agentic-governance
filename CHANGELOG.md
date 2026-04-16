@@ -1,5 +1,268 @@
 # Changelog
 
+## v0.6.1 (unreleased) — polish sprint: evidence export + console + self-discipline
+
+Polish release driven by the v0.6 team retrospective. No new PRD features; this
+sprint fixes the console compliance surface, closes a silently breached
+LLM-theater test-count tripwire, and finishes v0.6 wiring. No database schema
+changes. See **Silent / wire-contract changes** below for additions to audit
+event kinds and `signature_status` values that downstream pipelines must
+account for before upgrading.
+
+### Added
+
+- **`POST /api/compliance/export`** — signed Article 12 evidence bundle.
+  Packages the existing `/api/compliance/report` and `/api/compliance/verify-chain`
+  outputs into one JSON document with a sha256 `bundle_hash` and an HMAC-SHA256
+  `bundle_signature` under the active `AUDIT_SECRET`. If the internal
+  `verify_chain` pass raises, the bundle still emits with
+  `chain_verification_error` populated — the export is evidence, not an
+  enforcement gate. Shares the 1 req/60 s/user F4 rate-limit bucket.
+- **"Export Article 12 evidence" button** on the v4 Compliance page wired to
+  the new endpoint. Bundle filename uses a Windows-safe stamp
+  (`compliance-evidence-{start}-{end}.json` with `:` replaced by `-`). Button
+  is screen-reader wired with `aria-describedby` help + error + status live
+  region so the download lifecycle is announced.
+- **`GOVERNANCE_COMPLIANCE_RATE_LIMIT` env var** overrides the default
+  1 req/60s per-user ceiling on compliance endpoints (export, report,
+  verify-chain). Default unchanged.
+
+### Changed
+
+- **Track A — AuditModule wiring finished.** `activation_seq` is now monotonic
+  (enforced at insert, not just advisory), and revocation writes append a chain
+  row rather than mutating state.
+- **DrillPanel** focus-management bug fix (v4 console).
+- **sseValidator** comment cleanup to match the v0.6 typed SSE path.
+
+### Self-discipline
+
+- **LLM-theater tripwire closed.** Source-grep assertions are replaced with
+  runtime tests where feasible, and CI now enforces a numeric ceiling on the
+  remaining source-grep count with a monotonic-decrease rule per release.
+  The count silently breached the v0.6 threshold (8 > 5); v0.6.1 restores
+  discipline by making the violation loud.
+
+### Silent / wire-contract changes
+
+These are additive and do not break a strict v0.6.0 client, but a downstream
+pipeline parsing the audit log with an exhaustive enum MUST add the new values
+before upgrading.
+
+- **`signature_status` values expanded.** The `AuditEventRecord.signature_status`
+  Literal now includes `revoked_key`, `invalid_signature`, and `unknown_key`
+  in addition to the v0.6.0 set. A pipeline using a strict enum on this field
+  must add these values before pulling v0.6.1 audit rows.
+- **New audit event kind `audit.agent_key_revocation`.** Emitted whenever a
+  key is revoked via `RevocationStore.revoke_with_chain_event()`. Downstream
+  filters that allow-list known event kinds must add it.
+- **New audit event kind `compliance.bundle_exported`.** Emitted on every
+  successful `POST /api/compliance/export`. Alerting on "unknown event kinds"
+  will see this as noise until the rule is updated.
+- **Console test environment changed from Node to jsdom.** Console tests that
+  previously asserted `typeof window === 'undefined'` will now behave
+  differently.
+
+### Known limitations
+
+- **No offline verifier script or `docs/verify-evidence.md` yet.** The bundle
+  format is self-describing (algorithm, key_fingerprint, canonicalization via
+  the public `canonical_json` helper) but a regulator-facing "how to verify
+  this bundle on your own machine" recipe has not shipped. Blocks the
+  "hand this to your regulator" positioning; until then the export is a
+  design-partner demo artefact. Slated for v0.6.2.
+- **HMAC-only bundle signature.** Bundle is signed with HMAC-SHA256 under the
+  shared `AUDIT_SECRET`. An auditor must hold the secret to verify — fine
+  for self-contained evidence-handoff but blocks third-party offline
+  verification. Ed25519 bundle signing with a published public key is the
+  v0.6.2 target.
+- **`rotation_status.known_fingerprints_in_window`** is misnamed — the value
+  is the UNRESOLVED fingerprints list. Rename held to v0.6.2 because the
+  bundle wire contract is already shipped.
+- **429 UX**: rate-limit retries surface a generic error rather than parsing
+  `Retry-After`. Product-level UX decision pending.
+- **Compliance export rate limit (1 req/60s/user)** is tight for officers
+  running bundle exports across multiple windows. Overridable in v0.6.1 via
+  `GOVERNANCE_COMPLIANCE_RATE_LIMIT` for environments that need higher
+  throughput. The bundle is embedded in the signer's audit chain regardless.
+
+## v0.6.0 (2026-04-15) — Ed25519, HMAC rotation, wrapper coverage, backend wiring
+
+Major release implementing F2–F9 of the v0.6 PRD across the SDK and console.
+
+### ⚠️ Required upgrade step
+
+**Run `alembic upgrade head` before starting the v0.6 SDK in any environment
+that has v0.5.x audit data.** The v0.6 `PostgresAuditStore` writes to the new
+`signature`, `signing_key_fingerprint`, and `signature_status` columns on
+`governance_audit_events`. Against a pre-migration v0.5.x schema those columns
+do not exist and `AuditModule.log()` degrades to `StoreUnavailableError` —
+audit rows are silently dropped until the migration is applied.
+
+The `[migrations]` extra is required to run alembic against Postgres because
+the SDK's runtime driver is `asyncpg` (async-only), and alembic's sync env.py
+needs a sync driver:
+
+```
+pip install code-atelier-governance[migrations]
+alembic upgrade head    # singular — a merge migration unifies the v0.6 heads
+```
+
+A pre-existing append-only grants gap on `governance_audit_events` is also
+closed in this release (CLAUDE.md invariant 2). After upgrading, the
+`/health/governance` endpoint should report `append_only_grants_ok: true`.
+
+### ⚠️ Check your monitoring queries
+
+v0.6 renames the halt audit event kind from `agent.killed` to `agent.halted`.
+Existing SQL, grep, SIEM, or BI queries filtering on the literal string
+`agent.killed` will silently stop matching v0.6 halt events.
+
+**Action required**: audit your downstream consumers. Either:
+
+1. **Use the new view** — `governance_audit_events_halted` unions both kinds:
+
+   ```sql
+   SELECT * FROM governance_audit_events_halted
+   WHERE created_at > now() - interval '1 hour';
+   ```
+
+2. **Or update your queries** to match both kinds:
+
+   ```sql
+   WHERE kind IN ('agent.killed', 'agent.halted')
+   ```
+
+Historic `agent.killed` rows remain in the chain as-is (HMAC chain integrity
+requires append-only). Only new rows after the v0.6 upgrade use `agent.halted`.
+
+**JSON-schema consumers**: v0.6 also adds three new columns to
+`governance_audit_events` — `signature`, `signing_key_fingerprint`, and
+`signature_status`. Any SIEM, ETL, or BI pipeline that parses audit-event
+rows as JSON against a strict schema will see new keys after the upgrade
+and may trip schema validation. Either widen the schema to allow the new
+keys or filter them out at the export layer before they hit the consumer.
+
+### Added
+
+- **F2.5 full `kill` → `halt` rename** across SDK, console, and audit.
+  Backward-compat aliases (`KillRequest`, `AgentKilledError`, `is_killed`,
+  `assert_alive`, `force_refresh_killed_cache`, `_killed_cache`,
+  `_KILL_CACHE_TTL_SECONDS`, and the `POST /api/agents/{agent_id}/kill`
+  route) are preserved for v0.6 and **REMOVED in v0.7**. Historic
+  `agent.killed` audit rows stay in the HMAC chain as-is (append-only
+  invariant #2); a SQL view `governance_audit_events_halted` unions
+  both `agent.killed` and `agent.halted` kinds for downstream queries.
+- **F6 Track A — Ed25519 agent identity** with three keystore backends
+  (`file://`, `env://`, `ephemeral`), per-row signatures over the HMAC chain,
+  append-only key registry and revocation tables, and graceful degradation
+  to `signature_status='unsigned_local_failure'` if the signer cannot load
+  its private key (host call path never raises).
+- **F6 Track B — HMAC chain key rotation** with dual-signed rotation marker
+  rows (outgoing + incoming MAC), salted fingerprint construction
+  (`HMAC-SHA256(key, 'codeatelier.fingerprint.v1')`), bounded LRU resolution
+  cache (max 64 entries), and a `rotate-chain-key` CLI command. Missing key
+  material resolves to `chain_integrity_status='unverified'`, surfaced via
+  `/health/governance`.
+- **F6#4 per-user rate limiting** on `/api/policies`, `/api/policies/{id}`,
+  `/api/events/stats`, `/api/agents/presence`, `/api/gates/pending`, and
+  `/api/gates/recent`. Default 60 req/min/user, configurable via
+  `GOVERNANCE_CONSOLE_USER_RATE_LIMIT`.
+- **F9 wrapper coverage registry** (opt-in via `enable_coverage=True` in
+  `GovernanceConfig`). New `governance_wrapper_registrations` table
+  (mutable state, NOT audit), in-memory primary + Postgres mirror, hostname
+  PII removal via salted hashing, instance UUID PK to defeat PID reuse,
+  opportunistic 30-day prune, and a new `GET /api/coverage` endpoint.
+- **F3 backend endpoint wiring** — all 9 prior orphan endpoints now use
+  Pydantic response models with `extra="forbid"` and pass through a
+  recursive secret-redaction layer (`sk-ant-`, `sk-`, `xoxb-`, `gh[ps]_`,
+  AWS keys). Session DELETE now emits a `pipeline.session_revoked`
+  audit event.
+- **F2 P0 console fixes** — halt 404 fixed, SSE ghost-field hydration via
+  lazy `GET /api/events/{event_id}` with typed `AuditEventView`, truncation
+  bucket relabel, DisconnectBanner consolidation with `rankWorst()`,
+  `KillRequest.reason` validator (NFC normalize, 512-char cap, escape
+  `\\` first then `\n\r\t`, strip C0 controls).
+- **F6#5 sanitizer hardening** — `sanitizeErrorMessage` now strips DSNs,
+  Unix and Windows filesystem paths, IPv4 and IPv6 addresses in addition
+  to the existing auth-keyword patterns.
+- **F7 pipeline hygiene** — new `GET /health/governance` (anon: status only;
+  authed: chain-integrity + key resolution state + p50/p95 latency),
+  `automation/lib/validate_cron_artifacts.py` (CI not cron), pre-commit
+  TODO gate at `.githooks/pre-commit-todo-gate.sh` (allows version-tagged
+  `TODO(vN.M.P):`), `Makefile install-hooks` target, `CODEOWNERS` at repo
+  root, `V3DeprecationBanner` mounted in the v3 root layout, and CI jobs
+  for `tsc --noEmit`, `validate-cron-artifacts`, `console-version-parity`.
+- **Migrations runbook** at `docs/migrations.md`.
+- **Integration test** at `tests/integration/test_migration_against_seeded_db.py`
+  that spins up a real Postgres in Docker, seeds v0.5.x-shaped audit rows,
+  runs `alembic upgrade head`, and asserts the migration backfill, the
+  append-only enforcement, and the post-migration default behavior. Marked
+  `@pytest.mark.integration` so it is skipped by default.
+
+### Changed
+
+- Console version bumped from `0.4.0` to `0.5.0` (`app.py` + `package.json`).
+- `compliance/models.py::ComplianceReport` now carries
+  `coverage_pct_reason: Literal["no_scope_policies_registered","registry_disabled","ok"] | None`
+  to disambiguate `coverage_pct=None` between "registry disabled" and
+  "denominator is zero."
+- `migrations/env.py` now coerces `postgresql://` and `postgresql+asyncpg://`
+  URLs to `postgresql+psycopg://` at runtime so alembic can run with the
+  optional `[migrations]` extra installed.
+
+### Security
+
+- New tables `governance_agent_keys`, `governance_agent_key_revocations`,
+  `governance_audit_chain_keys` are append-only at the grant level
+  (`REVOKE UPDATE, DELETE FROM PUBLIC`).
+- New migration `978884c6b7f1_revoke_audit_grants.py` closes a pre-existing
+  gap on `governance_audit_events`: the append-only trigger has been in
+  place since v0.1, but the role-level grants were never revoked. v0.6
+  brings the original audit table to parity with the new identity tables.
+- `cryptography>=42.0,<46.0` added as a direct runtime dependency
+  (Cybersecurity-approved, see `.agent-outputs/cybersecurity/`).
+
+### Known limitations
+
+- **F4 `unresolved_fingerprints` is NOT a verification signal in v0.6.**
+  The field is always `[]` on the single-key verifier path and is only
+  populated when `rotation_aware=true` (F6 Track B rotation-aware
+  verifier), which is not wired into the console handlers in this
+  release. An empty list MUST NOT be interpreted as "all keys verified
+  successfully". The new `rotation_aware` boolean on
+  `ComplianceReportView` / `VerifyChainResponse` makes the distinction
+  explicit; wiring the rotation-aware path ships in v0.6.1.
+- The following v0.6 PRD items remain pending and ship in v0.6.1:
+  - **F5** — HITL approval queue panel.
+  - **F6 bundle item 3** — audit write rate limiting.
+  - **F6 bundle item 6** — tenant-scoped query keys.
+  - **`JsonlFallbackStore`** — does not yet round-trip the new
+    signature columns; rows recovered from the disk fallback degrade
+    to `signature_status='unsigned'` (constraint #7: not a chain
+    break).
+  - **`vitest.config.ts`** — missing in this cut; the path-alias and
+    JSX-from-ts-tests configurations are broken, and the v0.6 a11y
+    and v4 unit-test layer is currently pinned via source-grep tests
+    only.
+  - **No `axe-core`, `@testing-library/react`, or `@playwright/test`
+    in `console/package.json` devDependencies** — the a11y guarantees
+    are enforced by source-grep assertions until these land.
+  - **ESLint config bootstrap** — deferred; `eslint .` is not wired
+    into the v0.6 CI matrix.
+
+  F1 (console honesty pass), F2.5 (full `kill`→`halt` rename), F4
+  (compliance console surface), and F8 (code quality: TS literal
+  narrowing, hand-rolled SSE validator, 4 critical v4 tests) all
+  shipped in Wave 4 of v0.6.0 and are NOT pending.
+- The v3 console remains the default. The v4 IA shell exists under
+  `console/src/app/(v4)/` and is opt-in via
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION=v4`. The default flips to v4 once F1
+  wires the F3 backend consumers and un-stubs `useAgentPolicy`.
+- `JsonlFallbackStore` does not yet round-trip the new signature columns;
+  rows recovered from the disk fallback degrade to `signature_status='unsigned'`
+  (constraint #7: not a chain break).
+
 ## v0.5.4 (2026-04-14) — kill switch enforcement hotfix
 
 Emergency P0 hotfix. Closes a shipped production bug in v0.5.3 where the console

@@ -268,12 +268,17 @@ describe("mapAgentStatus — stale agents bypass live-only branches", () => {
 });
 
 describe("mapAgentStatus — unknown status literals", () => {
+  // `PostureStatus` is now a literal union ("PASS" | "WARN" | "FAIL"), so a
+  // drifted backend value is a TYPE error at compile time. These tests still
+  // matter — the runtime can receive anything over the wire — so we cast via
+  // `unknown` to simulate a drifted backend response shape. Fail-loud on
+  // unknown literal is still the contract we pin here.
   it("returns degraded when scope.status is an unknown string", () => {
     expect(
       mapAgentStatus(
         agent({
           scope: {
-            status: "MAYBE", // drifted backend literal
+            status: "MAYBE" as unknown as "PASS",
             violations_today: 0,
             latest_violation: null,
           },
@@ -288,7 +293,7 @@ describe("mapAgentStatus — unknown status literals", () => {
       mapAgentStatus(
         agent({
           cost: {
-            status: "over_limit", // drifted backend literal
+            status: "over_limit" as unknown as "PASS",
             usd_today: 10,
             tokens_today: 0,
             exceeded_today: 0,
@@ -304,7 +309,7 @@ describe("mapAgentStatus — unknown status literals", () => {
       mapAgentStatus(
         agent({
           scope: {
-            status: "pass", // deliberate lowercase — catches case regression
+            status: "pass" as unknown as "PASS",
             violations_today: 0,
             latest_violation: null,
           },

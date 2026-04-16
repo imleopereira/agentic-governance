@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-atelier-governance"
-version = "0.5.4"
+version = "0.6.0"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -35,6 +35,7 @@ dependencies = [
     "structlog>=24.0",
     "alembic>=1.13",
     "greenlet>=3.0",
+    "cryptography>=42.0,<46.0",
 ]
 
 [project.urls]
@@ -73,6 +74,18 @@ dev = [
 publish = [
     "build",
     "twine",
+]
+# Alembic's migrations/env.py runs in sync mode (Alembic has no async
+# runner). The SDK's runtime path uses asyncpg, but asyncpg cannot be
+# used as a SQLAlchemy sync driver, so migration runs need a sync
+# Postgres driver. psycopg3 is the actively-maintained successor to
+# psycopg2 and ships a smaller wheel. Install with:
+#     pip install "code-atelier-governance[migrations]"
+# See docs/migrations.md for details. Do NOT add psycopg to the core
+# runtime dependencies — that would pull ~3MB into every install just
+# to cover a one-shot `alembic upgrade head` operation.
+migrations = [
+    "psycopg[binary]>=3.1,<4.0",
 ]
 
 [project.scripts]

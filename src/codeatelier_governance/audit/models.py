@@ -11,10 +11,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from codeatelier_governance.audit.sanitization import sanitize_metadata
 
 # --- Size caps (security: DoS prevention at the SDK boundary) -----------------
 MAX_KIND_LEN = 128
@@ -94,7 +96,13 @@ class AuditEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def model_post_init(self, __context: Any) -> None:
+        # BLOCKER C5: validate raw metadata size FIRST so an attacker
+        # cannot bypass the 64 KiB DoS cap by submitting one giant string
+        # that the sanitizer would otherwise truncate. THEN sanitize for
+        # ANSI / C0 control chars on every string leaf.
         _validate_metadata(self.metadata)
+        sanitized = sanitize_metadata(self.metadata)
+        object.__setattr__(self, "metadata", sanitized)
 
 
 PLACEHOLDER_HMAC = "0" * 64
@@ -130,6 +138,20 @@ class AuditEventRecord(BaseModel):
     prev_hash: str | None = Field(default=None, max_length=MAX_HASH_LEN)
     hmac: str = Field(min_length=64, max_length=MAX_HASH_LEN)
     created_at: datetime
+    # --- F6 Track A: Ed25519 agent identity -------------------------------
+    # Optional — pre-v0.6 rows and rows written with agent_identity disabled
+    # carry None/unsigned here. See design doc constraints #1 and #7.
+    signature: bytes | None = Field(default=None)
+    signing_key_fingerprint: str | None = Field(default=None, max_length=MAX_HASH_LEN)
+    signature_status: Literal[
+        "signed",
+        "unsigned",
+        "unsigned_local_failure",
+        "legacy_unsigned",
+        "revoked_key",
+        "invalid_signature",
+        "unknown_key",
+    ] = "unsigned"
 
     @property
     def is_placeholder(self) -> bool:

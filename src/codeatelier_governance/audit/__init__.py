@@ -8,6 +8,12 @@ Public API:
     AuditError          — base exception
     ChainIntegrityError — raised when HMAC verification fails
 """
+from .corrections import (
+    ALLOWED_REASONS,
+    NOTE_MAX_CHARS,
+    CorrectionValidationError,
+    validate_correction_payload,
+)
 from .errors import (
     AuditError,
     BufferOverflowError,
@@ -19,6 +25,7 @@ from .module import AuditModule
 from .store import AuditStore, BatchingWriter, InMemoryAuditStore
 
 __all__ = [
+    "ALLOWED_REASONS",
     "AuditError",
     "AuditEvent",
     "AuditEventRecord",
@@ -27,7 +34,10 @@ __all__ = [
     "BatchingWriter",
     "BufferOverflowError",
     "ChainIntegrityError",
+    "CorrectionValidationError",
     "EventKind",
     "InMemoryAuditStore",
+    "NOTE_MAX_CHARS",
     "StoreUnavailableError",
+    "validate_correction_payload",
 ]

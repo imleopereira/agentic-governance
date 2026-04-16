@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS governance_audit_events (
     prev_hash       VARCHAR(128) NULL,
     hmac_value      VARCHAR(128) NOT NULL,
     created_at      TIMESTAMPTZ  NOT NULL
+    -- NOTE: v0.6+ columns (signature, signing_key_fingerprint,
+    -- signature_status) are ADDED by alembic migrations, not by this DDL.
+    -- `cga migrate` now runs alembic after DDL so fresh installs end up
+    -- with the current schema; the upgrade path (v0.5 -> v0.6) also goes
+    -- through alembic. Keeping new columns in migrations (not DDL) means
+    -- the migration idempotency test can seed a real v0.5-shape schema.
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_session     ON governance_audit_events (session_id);

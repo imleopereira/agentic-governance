@@ -2,9 +2,20 @@
 """Live integration test: exercises every SDK feature against real OpenAI + real Postgres.
 
 Usage:
-    OPENAI_API_KEY=sk-... python scripts/live_test.py
+    export GOVERNANCE_TEST_DATABASE_URL=postgresql+asyncpg://user:pass@host:port/db
+    export GOVERNANCE_TEST_AUDIT_SECRET=<32-byte hex>
+    export OPENAI_API_KEY=sk-...
+    python scripts/live_test.py
 
-Requires: Postgres running at localhost:5435 (Docker QA instance).
+Both env vars are required. No fallback credentials, no ephemeral secret
+generation: a chain-integrity bug that only reproduces across runs with a
+stable HMAC key must be observable, which is impossible if the secret is
+regenerated every run.
+
+This module is importable with no side effects. All env-var loading and
+configuration printing happens inside ``run_all_tests`` — ``import
+scripts.live_test`` never touches ``os.environ`` and never calls
+``sys.exit``. See README.md 'Running the live test suite'.
 """
 from __future__ import annotations
 
@@ -13,6 +24,7 @@ import json
 import os
 import sys
 import time
+from urllib.parse import urlparse
 from uuid import uuid4
 
 # Colors for output
@@ -23,8 +35,91 @@ CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
-DB_URL = "postgresql+asyncpg://governance:governance@localhost:5435/governance_qa"
-SECRET = "b91da652c8e045f389c6882a34a82d20b6a29d0f39154dc456f84a1ca64280bd"
+
+def _redact_db_url(url: str) -> str:
+    """Return a log-safe form of a DB URL: scheme://<redacted>@host:port/db.
+
+    Raises only on unexpected internal failures — a catch-all ``except
+    Exception`` here would mask real bugs (e.g. a stacktrace leak hidden
+    behind ``repr``). ``urlparse`` itself raises ``ValueError`` on a few
+    malformed inputs; anything else escapes as a real bug. The port
+    attribute can raise ``ValueError`` on an out-of-range port (e.g.
+    ``host:99999``), which is narrowed below.
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "<host>"
+        try:
+            port = f":{parsed.port}" if parsed.port else ""
+        except ValueError:
+            port = ""
+        db = parsed.path or ""
+        scheme = parsed.scheme or "<scheme>"
+        return f"{scheme}://<redacted>@{host}{port}{db}"
+    except ValueError:
+        return "<unparseable-db-url>"
+
+
+def _load_db_url() -> str:
+    """Load the test DB URL from env. Fail loud if unset — no fallback."""
+    url = os.environ.get("GOVERNANCE_TEST_DATABASE_URL")
+    if not url:
+        sys.stderr.write(
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_DATABASE_URL is not set.\n"
+            "       This script never falls back to a hardcoded credential.\n"
+            "       See README.md section 'Running the live test suite'.\n"
+        )
+        sys.exit(2)
+    # Defence in depth: reject the historically-leaked default outright.
+    # Built as two tokens so this very string does not trip the credential
+    # guard in scripts/test_no_hardcoded_creds.py.
+    _legacy_user = "governance"
+    _legacy_default = f"{_legacy_user}:{_legacy_user}@"
+    if _legacy_default in url:
+        sys.stderr.write(
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_DATABASE_URL uses the legacy "
+            "`governance:governance` credential. Rotate and retry.\n"
+        )
+        sys.exit(2)
+    return url
+
+
+def _load_audit_secret() -> str:
+    """Load the test HMAC secret from env. Fail loud if unset — no fallback.
+
+    The ephemeral-secret path was removed: a chain-integrity regression that
+    only reproduces across two runs with a stable key is invisible if the
+    key rotates every run. The test must prove the attack fails, not
+    generate a fresh key and hope.
+    """
+    secret = os.environ.get("GOVERNANCE_TEST_AUDIT_SECRET")
+    if not secret:
+        sys.stderr.write(
+            f"{RED}FATAL{RESET} GOVERNANCE_TEST_AUDIT_SECRET is not set.\n"
+            "       Generate one with:\n"
+            "           python -c 'import secrets; print(secrets.token_hex(32))'\n"
+            "       Export it and retry. See README.md section 'Running the\n"
+            "       live test suite' for the rationale (stable key is required\n"
+            "       to observe chain-integrity regressions across runs).\n"
+        )
+        sys.exit(2)
+    return secret
+
+
+def _load_config() -> tuple[str, str]:
+    """Load all env-driven config. Called from the main entry point only.
+
+    Keeping this out of module scope means ``import scripts.live_test`` is
+    a pure, side-effect-free operation: no env reads, no prints, no exits.
+    Any tool that imports this module (pytest --collect-only, importlib,
+    IDE indexers) will not trip FATAL errors mid-collection.
+    """
+    db_url = _load_db_url()
+    secret = _load_audit_secret()
+    print(f"  live_test db  : {_redact_db_url(db_url)}")
+    print(f"  live_test auth: <redacted {len(secret)} chars>")
+    return db_url, secret
+
 
 results: list[dict] = []
 
@@ -38,6 +133,8 @@ def log_result(test: str, passed: bool, detail: str = "") -> None:
 
 
 async def run_all_tests() -> None:
+    DB_URL, SECRET = _load_config()
+
     from openai import AsyncOpenAI
 
     from codeatelier_governance import (
@@ -52,7 +149,6 @@ async def run_all_tests() -> None:
     from codeatelier_governance.scope.models import ScopePolicy
     from codeatelier_governance.cost.models import BudgetPolicy
     from codeatelier_governance.scope.errors import ScopeViolation
-    from codeatelier_governance.cost.errors import BudgetExceeded
     from codeatelier_governance.integrations.openai_wrap import wrap_openai
 
     print(f"\n{BOLD}{CYAN}{'='*60}{RESET}")
@@ -370,6 +466,10 @@ async def run_all_tests() -> None:
 
 if __name__ == "__main__":
     if not os.environ.get("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY env var required")
-        sys.exit(1)
+        sys.stderr.write(
+            f"{RED}FATAL{RESET}: OPENAI_API_KEY is not set. The live test suite "
+            "exercises a real OpenAI round-trip and will not run without it. "
+            "See README.md section 'Running the live test suite'.\n"
+        )
+        sys.exit(2)
     asyncio.run(run_all_tests())

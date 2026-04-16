@@ -7,6 +7,23 @@
 
 import { useEffect, useRef } from "react";
 import { useEventStreamStore } from "@/lib/store";
+import { validateSseEnvelope } from "@/lib/sseValidator";
+import { validateMetadata } from "@/lib/metadataValidator";
+
+// DA Wave 4 SHIP-WITH-CHANGES (F8): wire the hand-rolled validators
+// into the live SSE path. Malformed envelopes are dropped, metadata
+// fields that fail the narrowing rules are coerced to `null`, and a
+// single `console.warn` per drop gives operators a drift signal. See
+// `sseValidator.ts` / `metadataValidator.ts` for rationale.
+
+/** Monotonic counter of dropped SSE envelopes, exported for tests and
+ *  for any future operator telemetry sidecar. Lives on the module so a
+ *  consumer can read it without pulling in the Zustand store. */
+export let droppedEnvelopeCount = 0;
+/** Test-only reset. Not part of the public API. */
+export function __resetDroppedEnvelopeCount(): void {
+  droppedEnvelopeCount = 0;
+}
 
 export function useEventStream() {
   const esRef = useRef<EventSource | null>(null);
@@ -77,30 +94,70 @@ export function useEventStream() {
 
       function handleMessage(e: MessageEvent, kindOverride?: string) {
         if (!mountedRef.current) return;
+        let raw: unknown;
         try {
-          const raw = JSON.parse(e.data as string) as Record<string, unknown>;
-          useEventStreamStore.getState().addEvents([
-            {
-              event_id: String(raw.event_id ?? crypto.randomUUID()),
-              session_id: raw.session_id as string | undefined,
-              agent_id: String(raw.agent_id ?? "unknown"),
-              kind: kindOverride ?? String(raw.kind ?? "audit"),
-              model: raw.model as string | null | undefined,
-              metadata: (raw.metadata as Record<string, unknown>) ?? {},
-              created_at: String(
-                raw.created_at ?? new Date().toISOString()
-              ),
-              chain_seq: raw.chain_seq as number | undefined,
-              hmac_value: raw.hmac_value as string | null | undefined,
-              prev_hash: raw.prev_hash as string | null | undefined,
-              _received_at: performance.now(),
-            },
-          ]);
-          if (e.lastEventId) {
-            useEventStreamStore.getState().setLastEventId(e.lastEventId);
-          }
+          raw = JSON.parse(e.data as string);
         } catch {
-          /* ignore parse errors */
+          droppedEnvelopeCount += 1;
+          console.warn("Dropped invalid SSE envelope", { reason: "json_parse" });
+          return;
+        }
+        // DA Wave 4 F8 wiring: run the strict validator BEFORE touching
+        // the store. A truncated fallback envelope is still legal — the
+        // validator accepts `truncated: true` paired with a bounded
+        // chain_seq. Anything else drops to a single-line warn.
+        //
+        // Back-compat bucketing (F2): when the NOTIFY trigger sheds
+        // fields over the 7 KB cap it emits `{truncated: true}` with
+        // possibly null agent_id. Preserve the old
+        //     raw.agent_id ?? (raw.truncated ? "_truncated" : "unknown")
+        // bucketing rule by rewriting a missing agent_id to a synthetic
+        // value BEFORE revalidation, so the strict validator still
+        // passes and the TrailPanel "by agent" filter keeps working.
+        const rawAny = raw as Record<string, unknown>;
+        if (
+          typeof rawAny.agent_id !== "string" ||
+          rawAny.agent_id.length === 0
+        ) {
+          rawAny.agent_id = rawAny.truncated ? "_truncated" : "unknown";
+        }
+        const envelope = validateSseEnvelope(raw);
+        if (envelope === null) {
+          droppedEnvelopeCount += 1;
+          console.warn("Dropped invalid SSE envelope", {
+            reason: "schema_mismatch",
+          });
+          return;
+        }
+        // Metadata narrowing: the NOTIFY envelope does not carry metadata
+        // but a (future) richer payload might. Run the validator now so
+        // any non-scalar leak is coerced to null at the store boundary.
+        const rawObj = raw as Record<string, unknown>;
+        const rawMeta =
+          rawObj.metadata && typeof rawObj.metadata === "object"
+            ? (rawObj.metadata as Record<string, unknown>)
+            : null;
+        const meta = validateMetadata(rawMeta);
+        useEventStreamStore.getState().addEvents([
+          {
+            event_id: envelope.event_id,
+            session_id: envelope.session_id ?? undefined,
+            agent_id: envelope.agent_id,
+            kind: kindOverride ?? envelope.kind,
+            model: meta.model,
+            metadata: {
+              model: meta.model,
+              tool: meta.tool,
+              request_id: meta.request_id,
+            },
+            created_at: envelope.created_at,
+            chain_seq: envelope.chain_seq,
+            _needs_hydration: true,
+            _received_at: performance.now(),
+          },
+        ]);
+        if (e.lastEventId) {
+          useEventStreamStore.getState().setLastEventId(e.lastEventId);
         }
       }
 

@@ -1,0 +1,9 @@
+# CODEOWNERS — internal review responsibility map
+# Repo is private; this file is referenced by internal review process.
+
+console/models/responses.py @cybersecurity @leo
+src/codeatelier_governance/console/app.py @cybersecurity @leo
+src/codeatelier_governance/audit/* @cybersecurity @leo
+src/codeatelier_governance/compliance/* @cybersecurity @leo
+decisions/* @leo
+* @leo

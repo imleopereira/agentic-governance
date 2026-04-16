@@ -90,6 +90,27 @@ class ComplianceReport(BaseModel):
     #: ``"failed"`` — chain check was attempted and found a broken link.
     chain_integrity_status: ChainIntegrityStatus = "unverified"
 
+    #: DA Wave 4 blocker fix: window bounds that the chain verification
+    #: actually covered. Stored here so the console handler can read them
+    #: off the already-generated report instead of running ``verify_chain``
+    #: a second time. Both are ``None`` when chain verification was skipped.
+    chain_verified_from_seq: int | None = Field(default=None, ge=0)
+    chain_verified_to_seq: int | None = Field(default=None, ge=0)
+
+    #: BLOCKER C1: ``True`` when verification used the rotation-aware path
+    #: (i.e. at least one ``audit.chain_key_rotation`` marker row exists in
+    #: the audited window). When ``False``, ``unresolved_fingerprints`` is
+    #: ALWAYS empty and MUST NOT be interpreted as "all keys verified" —
+    #: the single-key path simply does not track it.
+    rotation_aware: bool = False
+
+    #: BLOCKER C1: list of fingerprints that the rotation-aware verifier
+    #: could not resolve to key material (env vars missing). When the
+    #: rotation-aware path runs and this list is non-empty, the chain
+    #: status MUST be ``"unverified"`` (NOT ``"verified"`` — the verifier
+    #: cannot decide whether those rows are intact or tampered with).
+    unresolved_fingerprints: list[str] = Field(default_factory=list)
+
     #: Always populated.  Never empty.  Reminds consumers that this report
     #: only covers events that passed through the SDK wrapper.
     coverage_caveat: str = Field(min_length=1)
@@ -100,6 +121,26 @@ class ComplianceReport(BaseModel):
     #: must always be present — its absence would imply 100 % coverage.
     #: Must be in the range [0.0, 1.0] when provided.
     coverage_pct: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    #: DA-blocker discriminator for ``coverage_pct=None``.  Distinguishes:
+    #:
+    #: - ``"ok"``: ``coverage_pct`` is populated and meaningful.
+    #: - ``"no_scope_policies_registered"``: denominator is zero (no governed
+    #:   agents have been declared); ``coverage_pct`` is mathematically
+    #:   undefined.
+    #: - ``"registry_disabled"``: the F9 wrapper registry is not available
+    #:   (engine absent, feature opt-out, or transient DB error).
+    #: - ``None``: legacy v0.5.x reports reconstructed from old data, where
+    #:   the field did not exist.
+    #:
+    #: A v0.6+ report MUST always populate this field.  Without it, an
+    #: auditor cannot disambiguate "no agents declared" from "coverage
+    #: measurement opted out", and the compliance artifact is ambiguous.
+    coverage_pct_reason: Literal[
+        "no_scope_policies_registered",
+        "registry_disabled",
+        "ok",
+    ] | None = None
 
     @field_validator("coverage_caveat")
     @classmethod

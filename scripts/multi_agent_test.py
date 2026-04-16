@@ -36,10 +36,12 @@ from codeatelier_governance import (
 )
 from codeatelier_governance.integrations.openai_wrap import wrap_openai
 
-DB_URL = os.environ.get(
-    "GOVERNANCE_DATABASE_URL",
-    "postgresql://governance:governance@localhost:5435/governance_qa",
-)
+DB_URL = os.environ.get("GOVERNANCE_DATABASE_URL")
+if not DB_URL:
+    raise SystemExit(
+        "GOVERNANCE_DATABASE_URL is not set. "
+        "This script no longer falls back to a hardcoded credential."
+    )
 SESSION_ID = uuid.uuid4()
 
 # The customer ticket we're processing
@@ -123,10 +125,10 @@ async def main() -> None:
             })
 
         print(f"\n{'='*60}")
-        print(f"  MULTI-AGENT GOVERNANCE TEST")
+        print("  MULTI-AGENT GOVERNANCE TEST")
         print(f"  Session:  {SESSION_ID}")
         print(f"  Ticket:   {TICKET['id']}")
-        print(f"  Agents:   triage-agent, research-agent, response-agent")
+        print("  Agents:   triage-agent, research-agent, response-agent")
         print(f"{'='*60}\n")
 
         # ─── Phase 1: Triage Agent ───────────────────────────────────
@@ -263,7 +265,7 @@ async def main() -> None:
         for agent_id in ["triage-agent", "research-agent", "response-agent"]:
             await sdk.presence.mark_idle(agent_id)
 
-        print(f"\n  All agents marked IDLE.")
+        print("\n  All agents marked IDLE.")
         print(f"  Verify: governance verify --session-id {SESSION_ID}")
         print(f"  Console: http://localhost:3001/events?session_id={SESSION_ID}")
         print(f"{'='*60}\n")

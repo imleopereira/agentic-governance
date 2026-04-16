@@ -51,7 +51,14 @@ pip install "code-atelier-governance[openai]"             # + OpenAI wrapper
 pip install "code-atelier-governance[anthropic]"          # + Anthropic wrapper
 pip install "code-atelier-governance[langchain]"          # + LangChain handler
 pip install "code-atelier-governance[otel]"               # + OpenTelemetry export
+pip install "code-atelier-governance[migrations]"         # + alembic + psycopg3 (one-time, for `alembic upgrade head`)
 ```
+
+The `[migrations]` extra is required to run the v0.6 alembic upgrade
+because the SDK runtime driver is `asyncpg` (async-only) and alembic's
+sync env.py needs a sync driver. See `docs/migrations.md` for the full
+runbook and `docs/configuration.md` for every environment variable the
+SDK and console read.
 
 ## Setup
 
@@ -76,7 +83,67 @@ governance console add-user --username admin --role admin
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Generates the event log required by EU AI Act Article 12 for all actions routed through the SDK. Produces an Article 12 evidence report from the audit trail. The report does not assert compliance — it provides evidence for actions the SDK observed. Article 12 compliance for your deployment depends on routing all relevant AI actions through the SDK. |
 
+## What's new in v0.6
+
+- **Ed25519 agent identity.** Per-row Ed25519 signatures over the HMAC
+  audit chain, with three keystore backends (`file://`, `env://`,
+  `ephemeral`) and graceful degradation to `signature_status='unsigned_local_failure'`
+  when a signer cannot load its private key. The host call path never
+  raises.
+- **HMAC chain key rotation.** Rotate the `GOVERNANCE_AUDIT_SECRET`
+  without breaking historical verification. Dual-signed rotation marker
+  rows, salted fingerprint construction, bounded LRU resolution cache,
+  and a `governance rotate-chain-key` CLI command.
+- **Compliance pill + Article 12 evidence report.** `governance report
+  --format article12` generates the EU AI Act Article 12 evidence
+  record from the audit trail. The report includes a `coverage_pct`
+  (with disambiguated null reason) and the new `rotation_aware`
+  verification flag.
+- **`kill` → `halt` rename** across SDK, console, and audit. Backward-
+  compat aliases preserved in v0.6, removed in v0.7. See the table
+  below.
+- **F9 wrapper coverage registry.** Opt-in registry that records every
+  wrapped LLM client at import time, surfaced via `GET /api/coverage`
+  and the new `/health/governance` endpoint. Hostname stored as a
+  salted HMAC digest only.
+- **`/health/governance`** — anon: status only; authed: chain-integrity
+  state, key resolution state, append-only grants check, p50/p95
+  latency.
+
+See `CHANGELOG.md` for the full release notes and `docs/migrations.md`
+for the upgrade runbook (run `alembic upgrade head` before starting
+v0.6 against any DB that has v0.5.x audit data).
+
+### `kill` → `halt` rename — symbol map
+
+All legacy names are still importable in v0.6 via identity aliases.
+New code should use the halt-named symbols. **All legacy aliases will
+be removed in v0.7.**
+
+| Legacy (v0.5.x, deprecated in v0.6, removed in v0.7) | Current (v0.6+) |
+|---|---|
+| `AgentKilledError` | `AgentHaltedError` |
+| `is_killed()` | `is_halted()` |
+| `assert_alive()` | `assert_not_halted()` |
+| `KillRequest` | `HaltRequest` |
+| `POST /api/agents/{id}/kill` | `POST /api/agents/{id}/halt` |
+| `kind='agent.killed'` audit events | `kind='agent.halted'` audit events |
+| `_killed_by` / `_killed_at` metadata | `_halted_by` / `_halted_at` metadata |
+| `force_refresh_killed_cache()` | `force_refresh_halted_cache()` |
+| `_KILL_CACHE_TTL_SECONDS` | `_HALT_CACHE_TTL_SECONDS` |
+| `_killed_cache*` | `_halted_cache*` |
+
+Historic `agent.killed` rows stay in the HMAC chain as-is — the
+append-only invariant blocks rewriting historical audit data. A SQL
+view `governance_audit_events_halted` unions both kinds for downstream
+queries; see the CHANGELOG monitoring-query callout.
+
 ## Framework adapters
+
+The wrapper imports below are the canonical, supported entry points.
+If you call `openai.OpenAI()` or `anthropic.Anthropic()` directly
+without going through these wrappers, the call is invisible to every
+SDK gate (budget, scope, audit). See the Threat Model section.
 
 ```python
 # OpenAI — 1 line (async and sync clients supported)
@@ -246,6 +313,49 @@ GovernanceSDK(
     verify_chain_on_read=True,
 )
 ```
+
+## Running the live test suite
+
+`scripts/live_test.py` exercises every SDK feature against a real Postgres
+instance and a real OpenAI endpoint. It is the authoritative pre-release
+check: unit tests alone will not catch packaging, pool-lifecycle, or
+chain-integrity regressions that only surface end-to-end.
+
+Two environment variables are **required**. The script has no fallbacks:
+it fails loud if either is missing. This is a deliberate security
+property — hardcoded credentials have leaked into CI logs historically,
+so the guard in `scripts/test_no_hardcoded_creds.py` scans the tree and
+fails CI on any literal secret.
+
+```bash
+# Required: a throwaway Postgres the test owns end-to-end.
+# Spin one up locally if you don't have one:
+#     docker run --rm -d -p 5435:5432 \
+#       -e POSTGRES_USER=livetest \
+#       -e POSTGRES_PASSWORD="$(python -c 'import secrets; print(secrets.token_hex(16))')" \
+#       -e POSTGRES_DB=governance postgres:16
+export GOVERNANCE_TEST_DATABASE_URL=postgresql+asyncpg://<user>:<pass>@localhost:5435/governance
+
+# Required: a stable 32-byte HMAC key. The ephemeral-per-run path was
+# removed because chain-integrity bugs that only reproduce across runs
+# with the same key are invisible if the key rotates every run.
+export GOVERNANCE_TEST_AUDIT_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+
+# Required: OpenAI credentials. Test 4 makes a real API call.
+export OPENAI_API_KEY=sk-...
+
+python scripts/live_test.py
+```
+
+The run exercises audit (HMAC chain verification), scope, cost (with
+auto-pricing), budget gates, a real wrapped OpenAI call, loop detection,
+agent presence, behavioral contracts, built-in model pricing, per-model
+cost breakdowns, hot-reload config, and an Article 12 compliance report.
+Exit code is `0` on full pass, `1` on any failure.
+
+If you see `FATAL GOVERNANCE_TEST_DATABASE_URL is not set` or
+`FATAL GOVERNANCE_TEST_AUDIT_SECRET is not set`, export the missing env
+var and retry — the script never falls back to a default.
 
 ## Documentation
 

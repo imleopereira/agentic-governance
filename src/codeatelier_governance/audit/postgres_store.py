@@ -15,15 +15,59 @@ from uuid import UUID
 
 import struct
 
-from sqlalchemy import Column, DateTime, MetaData, String, Table, select, text
+from sqlalchemy import (
+    Column,
+    DateTime,
+    LargeBinary,
+    MetaData,
+    String,
+    Table,
+    Text,
+    select,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+
+import structlog
 
 from ..utils import normalize_db_url
 from .errors import StoreUnavailableError
 from .models import AuditEventRecord
 from .store import AuditStore, ChainBuilder
+
+_logger = structlog.get_logger(__name__)
+
+# BLOCKER DX: v0.6 adds these columns to governance_audit_events. If the
+# schema is missing any of them, the very first write blows up with an
+# opaque ProgrammingError. We name them here so both the startup self-
+# check and the per-write catch handler can reference the same set.
+_REQUIRED_V06_COLUMNS = ("signature", "signing_key_fingerprint", "signature_status")
+
+
+def _is_missing_v06_columns_error(exc: BaseException) -> bool:
+    """True if the exception looks like 'a v0.6 column does not exist'.
+
+    Matches both the asyncpg UndefinedColumnError and the SQLAlchemy
+    ProgrammingError wrapper. The match is on substrings of the error
+    message because we cannot import asyncpg.exceptions safely from
+    every install profile.
+    """
+    msg = str(exc).lower()
+    if "does not exist" not in msg and "undefined column" not in msg:
+        return False
+    return any(col in msg for col in _REQUIRED_V06_COLUMNS)
+
+
+def _v06_alembic_message() -> str:
+    """Operator-actionable diagnostic for missing v0.6 columns."""
+    return (
+        "governance_audit_events is missing v0.6 columns "
+        f"({', '.join(_REQUIRED_V06_COLUMNS)}). Run "
+        "'alembic upgrade head' to apply the v0.6 migrations. "
+        "See docs/migrations.md."
+    )
 
 
 def _session_lock_key(session_id: UUID) -> int:
@@ -55,6 +99,10 @@ audit_events = Table(
     Column("prev_hash", String(128), nullable=True),
     Column("hmac_value", String(128), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+    # F6 Track A: Ed25519 agent identity columns (migration f6a1ed25519aid).
+    Column("signature", LargeBinary(), nullable=True),
+    Column("signing_key_fingerprint", Text(), nullable=True),
+    Column("signature_status", Text(), nullable=False, server_default="unsigned"),
 )
 
 
@@ -81,6 +129,44 @@ class PostgresAuditStore(AuditStore):
         else:
             raise ValueError(
                 "PostgresAuditStore requires either database_url or engine"
+            )
+
+    async def start(self) -> None:
+        """BLOCKER DX: opportunistic startup schema check.
+
+        Queries information_schema for the v0.6 audit columns. Logs a
+        loud structlog WARNING naming the missing columns when one or
+        more are absent, so an operator sees the mismatch BEFORE the
+        first customer request hits and tries to write. Never raises —
+        a startup that cannot reach the DB yet must still come up
+        (host application MUST continue working if the governance DB
+        is unreachable, per CLAUDE.md invariant #1).
+        """
+        try:
+            async with self._engine.connect() as conn:
+                res = await conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'governance_audit_events' "
+                        "AND column_name IN ('signature', 'signing_key_fingerprint', "
+                        "'signature_status')"
+                    )
+                )
+                present = {r[0] for r in res}
+        except Exception as exc:  # noqa: BLE001 — defensive, see docstring
+            _logger.warning(
+                "audit.postgres_store.startup_check_failed",
+                error_type=type(exc).__name__,
+            )
+            return
+        missing = [c for c in _REQUIRED_V06_COLUMNS if c not in present]
+        if missing:
+            _logger.warning(
+                "audit.postgres_store.missing_v0_6_columns",
+                missing_columns=missing,
+                remediation=(
+                    "Run 'alembic upgrade head' to apply the v0.6 migrations."
+                ),
             )
 
     async def insert_with_chain_lock(
@@ -147,14 +233,35 @@ class PostgresAuditStore(AuditStore):
                             "prev_hash": record.prev_hash,
                             "hmac_value": record.hmac,
                             "created_at": record.created_at,
+                            "signature": record.signature,
+                            "signing_key_fingerprint": record.signing_key_fingerprint,
+                            "signature_status": record.signature_status,
                         }
                     ],
                 )
             return record
         except Exception as exc:
+            # BLOCKER DX: name the cause when the schema is pre-v0.6.
+            if _is_missing_v06_columns_error(exc):
+                raise StoreUnavailableError(_v06_alembic_message()) from exc
             raise StoreUnavailableError(
                 f"postgres insert_with_chain_lock failed: {type(exc).__name__}"
             ) from exc
+
+    async def get_current_chain_seq(self) -> int:
+        """Return ``MAX(chain_seq)`` across all sessions, or 0 on empty chain.
+
+        Used by the F6 Track A key registration path to stamp
+        ``activated_at_chain_seq`` with the current chain head rather than
+        a hardcoded 0. If the table is unreachable the caller is expected
+        to catch the exception and treat the registration as deferred.
+        """
+        async with self._engine.connect() as conn:
+            res = await conn.execute(
+                text("SELECT COALESCE(MAX(chain_seq), 0) FROM governance_audit_events")
+            )
+            row = res.first()
+        return int(row[0]) if row is not None and row[0] is not None else 0
 
     async def _read_last_hmac_no_lock(self, session_id: UUID) -> str | None:
         """Optimistic read of the latest hmac for a session, no advisory lock."""
@@ -187,6 +294,9 @@ class PostgresAuditStore(AuditStore):
                 "prev_hash": e.prev_hash,
                 "hmac_value": e.hmac,
                 "created_at": e.created_at,
+                "signature": e.signature,
+                "signing_key_fingerprint": e.signing_key_fingerprint,
+                "signature_status": e.signature_status,
             }
             for e in events
         ]
@@ -194,6 +304,9 @@ class PostgresAuditStore(AuditStore):
             async with self._engine.begin() as conn:
                 await conn.execute(audit_events.insert(), rows)
         except Exception as exc:
+            # BLOCKER DX: name the cause when the schema is pre-v0.6.
+            if _is_missing_v06_columns_error(exc):
+                raise StoreUnavailableError(_v06_alembic_message()) from exc
             # Never leak the underlying error message — it may contain DB URLs.
             raise StoreUnavailableError(
                 f"postgres write failed: {type(exc).__name__}"
@@ -242,7 +355,8 @@ class PostgresAuditStore(AuditStore):
                 text(
                     "SELECT event_id, session_id, agent_id, parent_event_id, "
                     "kind, model, input_hash, output_hash, metadata_json, "
-                    "prev_hash, hmac_value, created_at "
+                    "prev_hash, hmac_value, created_at, "
+                    "signature, signing_key_fingerprint, signature_status "
                     "FROM governance_audit_events "
                     "WHERE session_id = :sid "
                     "ORDER BY chain_seq"
@@ -272,4 +386,7 @@ def _row_to_record(row: Any) -> AuditEventRecord:
         prev_hash=row["prev_hash"],
         hmac=row["hmac_value"],
         created_at=row["created_at"],
+        signature=row.get("signature"),
+        signing_key_fingerprint=row.get("signing_key_fingerprint"),
+        signature_status=row.get("signature_status") or "unsigned",
     )

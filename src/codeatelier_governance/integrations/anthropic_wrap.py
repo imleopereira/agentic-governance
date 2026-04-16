@@ -518,6 +518,18 @@ def wrap_anthropic(
     registered: list[str] = getattr(sdk, "_registered_wrappers", [])
     if wrapper_label not in registered:
         registered.append(wrapper_label)
+        # F9: record this wrapper in the coverage registry. Fire-and-forget:
+        # a registry error must never propagate into host code (invariant #1).
+        try:
+            registry = getattr(sdk, "_wrapper_registry", None)
+            if registry is not None:
+                registry.register(agent_id, "anthropic")
+        except Exception as _reg_exc:  # noqa: BLE001
+            logger.warning(
+                "governance.anthropic_wrap.coverage_register_failed",
+                agent_id=agent_id,
+                error_type=type(_reg_exc).__name__,
+            )
         # If SDK already started, emit an info confirming enforcement is now active.
         if getattr(sdk, "_started", False):
             logger.info(

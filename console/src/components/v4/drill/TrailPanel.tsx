@@ -10,8 +10,10 @@
 import { SectionLabel } from "../SectionLabel";
 import { EmptyState } from "../EmptyState";
 import { InfoBox } from "../InfoBox";
+import { Skeleton } from "@/components/Skeleton";
 import { useAgentTrail } from "@/hooks/useAgentQueries";
 import { sanitizeErrorMessage } from "@/lib/connectionStore";
+import { EMPTY_STATES } from "@/lib/empty-states";
 import type { AuditEvent } from "@/lib/api";
 
 export interface TrailPanelProps {
@@ -49,13 +51,14 @@ export function TrailPanel({ agentId }: TrailPanelProps) {
   const { data: events, isLoading, error } = useAgentTrail(agentId);
 
   if (isLoading) {
+    // WCAG 4.1.3: loading is a Skeleton, not an EmptyState.
     return (
-      <div className="space-y-3">
+      <div className="space-y-3" aria-busy="true">
         <SectionLabel>Recent Events</SectionLabel>
-        <EmptyState
-          title="Loading recent events..."
-          description="Fetching audit trail from governance backend."
-        />
+        <Skeleton className="h-4 w-full" />
+        <Skeleton className="h-4 w-5/6" />
+        <Skeleton className="h-4 w-4/6" />
+        <Skeleton className="h-4 w-3/4" />
       </div>
     );
   }
@@ -76,8 +79,8 @@ export function TrailPanel({ agentId }: TrailPanelProps) {
       <div className="space-y-3">
         <SectionLabel>Recent Events</SectionLabel>
         <EmptyState
-          title="No events yet"
-          description="This agent has not logged any events."
+          title={EMPTY_STATES.trailPanel.title}
+          description={EMPTY_STATES.trailPanel.description}
         />
       </div>
     );

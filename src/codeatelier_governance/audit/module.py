@@ -29,7 +29,7 @@ from uuid import UUID, uuid4
 import structlog
 
 from . import context
-from .chain import compute_event_hmac, verify_event
+from .chain import compute_event_hmac, sign_audit_row, verify_event
 from .errors import ChainIntegrityError
 from .models import AuditEvent, AuditEventRecord
 from .store import AuditStore, BatchingWriter
@@ -105,10 +105,18 @@ class AuditModule:
         secret: bytes,
         writer: BatchingWriter | None = None,
         verify_chain_on_read: bool = False,
+        signer: Any = None,
     ) -> None:
         _check_secret_strength(secret, "audit secret")
         self._store = store
         self._secret = secret
+        # F6 Track A: optional Ed25519 signer. When None, every row is
+        # written with signature_status='unsigned'. When set, each row's
+        # sign attempt is wrapped in try/except per design constraint #1
+        # (graceful degradation): a signer failure MUST NOT break the host
+        # call path — the row is still written with
+        # signature_status='unsigned_local_failure'.
+        self._signer = signer
         self._started = False
         self._start_warned = False
         self._verify_chain_on_read = verify_chain_on_read
@@ -124,6 +132,18 @@ class AuditModule:
         # additional ``chain.degraded_start`` event so the discontinuity is
         # visible to auditors.
         self._degraded_starts: set[UUID] = set()
+        # Sanctioned-event registry for the audit-correction second-layer
+        # guard. ``log_validated_correction`` adds ``id(event)`` to this set
+        # before awaiting ``log(event)`` and discards it in a ``finally``.
+        # Using a set (rather than a single-slot sentinel) lets multiple
+        # sanctioned calls run concurrently on the same AuditModule without
+        # false-denying each other: each call tracks its own event. Set
+        # mutations (``add``/``discard``/``in``) are atomic in CPython, so
+        # no lock is needed around them. The event object is held in the
+        # local frame of ``log_validated_correction`` for the full duration
+        # of the inner ``log()`` call, so CPython cannot GC-and-reuse its
+        # id while the check runs — the membership test is race-safe.
+        self._sanctioned_correction_event_ids: set[int] = set()
 
     def subscribe(
         self,
@@ -156,18 +176,97 @@ class AuditModule:
         return context.session(session_id)
 
     # --- core API -----------------------------------------------------------
+    async def log_validated_correction(
+        self,
+        validated_payload: dict[str, Any],
+        hmac_key: bytes,
+    ) -> AuditEventRecord:
+        """Append a validated audit-correction event to the chain.
+
+        This is the ONLY sanctioned path for writing ``audit.correction``
+        events. ``validated_payload`` MUST be the return value of
+        ``codeatelier_governance.audit.corrections.validate_correction_payload``
+        — no other dict shape is accepted. Direct calls to ``log`` with
+        ``kind='audit.correction'`` are refused at the top of ``log``.
+
+        The second-layer guard exists because the first-layer allowlist
+        (the ``corrections`` module) only protects operators who remember
+        to call it. A malicious or buggy code path that constructs an
+        ``AuditEvent(kind='audit.correction', metadata={...})`` directly
+        would otherwise bypass every field / reason / pattern check. This
+        entry point requires a sanitized dict that can only come from the
+        allowlist validator.
+        """
+        # Import inside the method to break an import cycle: corrections
+        # does not depend on module, and module does not need to hold a
+        # package-level reference.
+        from . import corrections as _corrections
+
+        if not isinstance(validated_payload, dict):
+            raise RuntimeError(
+                "log_validated_correction: payload must be a dict returned "
+                "by validate_correction_payload()."
+            )
+        if validated_payload.get("kind") not in _corrections.PERMITTED_KINDS:
+            raise RuntimeError(
+                "log_validated_correction: payload.kind is not in the "
+                "correction allowlist. Run validate_correction_payload() first."
+            )
+        # Re-validate as a defense in depth: if anything mutated the dict
+        # between the allowlist call and here, the second pass will catch
+        # it. This also enforces the entropy check on hmac_key via H2.
+        sanitized = _corrections.validate_correction_payload(
+            validated_payload, hmac_key
+        )
+
+        metadata: dict[str, Any] = {
+            "reason": sanitized["reason"],
+            "operator_id": sanitized["operator_id"],
+            "ref_chain_seq_start": sanitized["ref_chain_seq_start"],
+            "ref_chain_seq_end": sanitized["ref_chain_seq_end"],
+            "note": sanitized["note"],
+        }
+        event = AuditEvent(
+            agent_id="governance.operator",
+            kind=sanitized["kind"],
+            metadata=metadata,
+        )
+        # Mark this specific event as sanctioned so the guard in ``log``
+        # lets it through. Concurrent sanctioned calls each register their
+        # own event id; the finally removes only this call's id, so a
+        # parallel sanctioned call is never false-denied. A subsequent
+        # direct ``log(AuditEvent(kind='audit.correction'))`` still raises
+        # because its id is not in the set.
+        sanctioned_id = id(event)
+        self._sanctioned_correction_event_ids.add(sanctioned_id)
+        try:
+            return await self.log(event)
+        finally:
+            self._sanctioned_correction_event_ids.discard(sanctioned_id)
+
     async def log(self, event: AuditEvent) -> AuditEventRecord:
         """Log an audit event. Returns the stored record with chain fields.
 
-        **Non-breaking guarantee:** this method NEVER raises. Audit is an
-        observation surface, not an enforcement gate — if our internal
-        storage is on fire, the host application call must continue. On
-        catastrophic failure (both primary and fallback unreachable, or any
-        unexpected internal exception) we log a critical-level message and
-        return a placeholder record with ``hmac="0"*64`` and a
-        ``metadata["audit.unavailable"] = True`` flag so the caller can
-        detect the degraded state if they care to. The host call always
-        gets a record back.
+        **Non-breaking guarantee:** this method never raises on storage
+        failure. Audit is an observation surface, not an enforcement gate —
+        if our internal storage is on fire, the host application call must
+        continue. On catastrophic failure (both primary and fallback
+        unreachable, or any unexpected internal exception) we log a
+        critical-level message and return a placeholder record with
+        ``hmac="0"*64`` and a ``metadata["audit.unavailable"] = True`` flag
+        so the caller can detect the degraded state if they care to. The
+        host call always gets a record back.
+
+        **Exception — reserved event kinds:** ``log()`` raises
+        ``RuntimeError`` when ``event.kind`` is in the reserved set
+        (currently ``{"audit.correction"}``). These event kinds must be
+        written through :meth:`log_validated_correction`, which routes the
+        payload through :func:`codeatelier_governance.audit.corrections.validate_correction_payload`
+        and its field/reason/pattern allowlist. Calling ``log()`` directly
+        with a reserved kind is a misuse bug, not a storage failure, and
+        the raise is deliberate — the contract is "observation always
+        succeeds, but reserved kinds are not observation." See the
+        ``corrections`` module docstring for the full rationale.
 
         Chain construction is atomic with the insert via the store's
         ``insert_with_chain_lock`` method — under PostgresAuditStore this is
@@ -181,6 +280,26 @@ class AuditModule:
         marker on the next successful primary log so auditors can find
         every gap.
         """
+        # Second-layer guard: audit.correction events must flow through
+        # ``log_validated_correction``. The corrections module is the
+        # first-layer allowlist; this check catches any code path that
+        # constructs an AuditEvent with kind='audit.correction' directly
+        # and tries to bypass the field / reason / pattern allowlist.
+        from . import corrections as _corrections
+
+        if (
+            event.kind in _corrections.PERMITTED_KINDS
+            and id(event) not in self._sanctioned_correction_event_ids
+        ):
+            raise RuntimeError(
+                "audit.correction events must go through "
+                "AuditModule.log_validated_correction(validate_correction_payload(...), "
+                "hmac_key) — direct sdk.audit.log(AuditEvent(kind='audit.correction')) "
+                "is not permitted. See the docstring in "
+                "codeatelier_governance.audit.corrections for the rationale and "
+                "the full allowlist."
+            )
+
         if not self._started and not self._start_warned:
             self._start_warned = True
             logger.warning(
@@ -280,6 +399,36 @@ class AuditModule:
                 prev_hash=prev_hash,
                 created_at=created_at,
             )
+            # F6 Track A: Ed25519 signing wiring. ``sign_audit_row`` itself
+            # catches every exception and returns ``(None, None,
+            # 'unsigned_local_failure')`` — but wrap again in defense-in-depth
+            # so any import-time / unexpected bug inside the helper also
+            # degrades rather than breaks the host. Constraint #1.
+            try:
+                row_for_signing: dict[str, Any] = {
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "agent_id": event.agent_id,
+                    "parent_event_id": parent_id,
+                    "kind": event.kind,
+                    "model": event.model,
+                    "input_hash": event.input_hash,
+                    "output_hash": event.output_hash,
+                    "metadata": event.metadata,
+                    "prev_hash": prev_hash,
+                    "created_at": created_at,
+                    "hmac": mac,
+                }
+                sig_bytes, sig_fp, sig_status = sign_audit_row(
+                    row_for_signing, self._signer
+                )
+            except Exception as exc:  # noqa: BLE001 — constraint #1
+                logger.warning(
+                    "audit.signing_outer_failure",
+                    error_type=type(exc).__name__,
+                    agent_id=event.agent_id,
+                )
+                sig_bytes, sig_fp, sig_status = (None, None, "unsigned_local_failure")
             return AuditEventRecord(
                 event_id=event_id,
                 session_id=session_id,
@@ -293,6 +442,9 @@ class AuditModule:
                 prev_hash=prev_hash,
                 hmac=mac,
                 created_at=created_at,
+                signature=sig_bytes,
+                signing_key_fingerprint=sig_fp,
+                signature_status=sig_status,  # type: ignore[arg-type]
             )
 
         async def build_marker(prev_hash: str | None) -> AuditEventRecord:
