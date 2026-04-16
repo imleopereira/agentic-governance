@@ -1,5 +1,91 @@
 # Changelog
 
+## v0.6.1 (unreleased) — polish sprint: evidence export + console + self-discipline
+
+Polish release driven by the v0.6 team retrospective. No new PRD features; this
+sprint fixes the console compliance surface, closes a silently breached
+LLM-theater test-count tripwire, and finishes v0.6 wiring. No database schema
+changes. See **Silent / wire-contract changes** below for additions to audit
+event kinds and `signature_status` values that downstream pipelines must
+account for before upgrading.
+
+### Added
+
+- **`POST /api/compliance/export`** — signed Article 12 evidence bundle.
+  Packages the existing `/api/compliance/report` and `/api/compliance/verify-chain`
+  outputs into one JSON document with a sha256 `bundle_hash` and an HMAC-SHA256
+  `bundle_signature` under the active `AUDIT_SECRET`. If the internal
+  `verify_chain` pass raises, the bundle still emits with
+  `chain_verification_error` populated — the export is evidence, not an
+  enforcement gate. Shares the 1 req/60 s/user F4 rate-limit bucket.
+- **"Export Article 12 evidence" button** on the v4 Compliance page wired to
+  the new endpoint. Bundle filename uses a Windows-safe stamp
+  (`compliance-evidence-{start}-{end}.json` with `:` replaced by `-`). Button
+  is screen-reader wired with `aria-describedby` help + error + status live
+  region so the download lifecycle is announced.
+- **`GOVERNANCE_COMPLIANCE_RATE_LIMIT` env var** overrides the default
+  1 req/60s per-user ceiling on compliance endpoints (export, report,
+  verify-chain). Default unchanged.
+
+### Changed
+
+- **Track A — AuditModule wiring finished.** `activation_seq` is now monotonic
+  (enforced at insert, not just advisory), and revocation writes append a chain
+  row rather than mutating state.
+- **DrillPanel** focus-management bug fix (v4 console).
+- **sseValidator** comment cleanup to match the v0.6 typed SSE path.
+
+### Self-discipline
+
+- **LLM-theater tripwire closed.** Source-grep assertions are replaced with
+  runtime tests where feasible, and CI now enforces a numeric ceiling on the
+  remaining source-grep count with a monotonic-decrease rule per release.
+  The count silently breached the v0.6 threshold (8 > 5); v0.6.1 restores
+  discipline by making the violation loud.
+
+### Silent / wire-contract changes
+
+These are additive and do not break a strict v0.6.0 client, but a downstream
+pipeline parsing the audit log with an exhaustive enum MUST add the new values
+before upgrading.
+
+- **`signature_status` values expanded.** The `AuditEventRecord.signature_status`
+  Literal now includes `revoked_key`, `invalid_signature`, and `unknown_key`
+  in addition to the v0.6.0 set. A pipeline using a strict enum on this field
+  must add these values before pulling v0.6.1 audit rows.
+- **New audit event kind `audit.agent_key_revocation`.** Emitted whenever a
+  key is revoked via `RevocationStore.revoke_with_chain_event()`. Downstream
+  filters that allow-list known event kinds must add it.
+- **New audit event kind `compliance.bundle_exported`.** Emitted on every
+  successful `POST /api/compliance/export`. Alerting on "unknown event kinds"
+  will see this as noise until the rule is updated.
+- **Console test environment changed from Node to jsdom.** Console tests that
+  previously asserted `typeof window === 'undefined'` will now behave
+  differently.
+
+### Known limitations
+
+- **No offline verifier script or `docs/verify-evidence.md` yet.** The bundle
+  format is self-describing (algorithm, key_fingerprint, canonicalization via
+  the public `canonical_json` helper) but a regulator-facing "how to verify
+  this bundle on your own machine" recipe has not shipped. Blocks the
+  "hand this to your regulator" positioning; until then the export is a
+  design-partner demo artefact. Slated for v0.6.2.
+- **HMAC-only bundle signature.** Bundle is signed with HMAC-SHA256 under the
+  shared `AUDIT_SECRET`. An auditor must hold the secret to verify — fine
+  for self-contained evidence-handoff but blocks third-party offline
+  verification. Ed25519 bundle signing with a published public key is the
+  v0.6.2 target.
+- **`rotation_status.known_fingerprints_in_window`** is misnamed — the value
+  is the UNRESOLVED fingerprints list. Rename held to v0.6.2 because the
+  bundle wire contract is already shipped.
+- **429 UX**: rate-limit retries surface a generic error rather than parsing
+  `Retry-After`. Product-level UX decision pending.
+- **Compliance export rate limit (1 req/60s/user)** is tight for officers
+  running bundle exports across multiple windows. Overridable in v0.6.1 via
+  `GOVERNANCE_COMPLIANCE_RATE_LIMIT` for environments that need higher
+  throughput. The bundle is embedded in the signer's audit chain regardless.
+
 ## v0.6.0 (2026-04-15) — Ed25519, HMAC rotation, wrapper coverage, backend wiring
 
 Major release implementing F2–F9 of the v0.6 PRD across the SDK and console.

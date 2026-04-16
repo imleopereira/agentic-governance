@@ -1,10 +1,10 @@
 /**
  * Hand-rolled SSE envelope validator.
  *
- * Why hand-rolled: `zod` was rejected by the Cybersec dependency approval
- * process (see `.agents/cybersecurity.md`). Every third-party runtime
- * dependency is a supply-chain attack surface; a 120-line validator with
- * zero deps is the right trade-off for the narrow schema we actually emit.
+ * Why hand-rolled: `zod` was rejected by our dependency approval process.
+ * Every third-party runtime dependency is a supply-chain attack surface;
+ * a 120-line validator with zero deps is the right trade-off for the
+ * narrow schema we actually emit.
  *
  * Ground truth for the envelope shape is the Postgres NOTIFY payload built
  * in `src/codeatelier_governance/console/triggers.sql` (notify_governance_event):

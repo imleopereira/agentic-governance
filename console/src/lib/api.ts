@@ -222,6 +222,43 @@ export interface VerifyChainResponse {
   verified_at_utc: string;
 }
 
+/** Request body for POST /api/compliance/export — all fields optional.
+ *  When omitted, the backend defaults the window to the last 7 days. */
+export interface ComplianceExportRequest {
+  window_start?: string;
+  window_end?: string;
+  tenant_id?: string | null;
+}
+
+/** Response shape for POST /api/compliance/export.
+ *
+ *  The bundle is self-verifying: ``bundle_hash`` is sha256 over the
+ *  canonical body without ``bundle_hash`` / ``bundle_signature``, and
+ *  ``bundle_signature.signature`` is HMAC-SHA256 over the canonical
+ *  body without ``bundle_signature``. Archive the whole JSON for
+ *  regulator submission; the active ``bundle_signature.key_fingerprint``
+ *  proves which audit secret was in effect when the bundle was issued. */
+export interface ComplianceBundleResponse {
+  bundle_version: "1.0";
+  generated_at: string;
+  tenant_id: string | null;
+  window: { start: string; end: string };
+  report: ComplianceReportView;
+  verify_chain: VerifyChainResponse | null;
+  chain_verification_error: string | null;
+  rotation_status: {
+    active_fingerprint: string;
+    known_fingerprints_in_window: string[];
+  };
+  event_count: number;
+  bundle_hash: string;
+  bundle_signature: {
+    algorithm: "HMAC-SHA256";
+    key_fingerprint: string;
+    signature: string;
+  };
+}
+
 // ---------- API functions ----------
 
 export const api = {
@@ -305,4 +342,17 @@ export const api = {
       `/api/compliance/verify-chain${qs ? `?${qs}` : ""}`,
     );
   },
+
+  /** F4 polish (v0.6.1): download a signed Article 12 evidence bundle.
+   *
+   *  Packages the current ``compliance_report`` + ``verify_chain``
+   *  outputs into a self-verifying JSON bundle with an HMAC-SHA256
+   *  signature under the active ``AUDIT_SECRET``. The bundle is
+   *  append-only evidence — not a real-time integrity check.
+   *
+   *  Rate limited by the same 1 req/60 s/user F4 bucket as the other
+   *  compliance endpoints — the Download button should debounce and
+   *  surface the 429 ``Retry-After`` inline on failure. */
+  exportComplianceBundle: (body: ComplianceExportRequest = {}) =>
+    post<ComplianceBundleResponse>("/api/compliance/export", body),
 };

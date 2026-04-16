@@ -132,7 +132,7 @@ export function DrillPanel({
         restoreTarget.focus();
       }
     };
-  }, [open, tab, triggerRef]);
+  }, [open, triggerRef]);
 
   // Escape closes. NO Tab cycling — this is a non-modal drawer.
   const onKeyDown = useCallback(

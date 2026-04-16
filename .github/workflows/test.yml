@@ -111,6 +111,55 @@ jobs:
         working-directory: console
         run: npm run typecheck
 
+  console-llm-theater-tripwire:
+    name: console LLM-theater tripwire (source-grep tests)
+    runs-on: ubuntu-latest
+    # v0.6 PRD F7 set a tripwire at 5 instances of the "source-grep
+    # test" pattern — a test that `readFileSync`-s a component file
+    # and regex-matches it for structural tokens, instead of rendering
+    # the component and asserting on runtime behaviour. The team shipped
+    # 8 such files in v0.6 (process breach disclosed in CHANGELOG).
+    #
+    # v0.6.1 polish sprint closes that breach: all 8 files were
+    # rewritten to render + assert, and this job makes a regression
+    # impossible. The count of `readFileSync` occurrences in console
+    # *.test.ts / *.test.tsx files MUST remain at 0 on every push. One
+    # new source-grep test in a PR is enough to fail this job.
+    steps:
+      - uses: actions/checkout@v4
+      - name: count source-grep tests
+        run: |
+          # DA v0.6.1: broaden the tripwire from ``readFileSync`` only to
+          # ANY fs-read helper that a test might use to pull a component
+          # file off disk. Covers:
+          #   * readFileSync (sync fs)
+          #   * readFile     (both node:fs/promises and callback-form)
+          #   * import("fs") / require("fs")
+          # Security v0.6.1: widened quote handling and subpath variants.
+          # Single-quoted imports (`from 'fs'`) and `fs/promises` subpaths
+          # previously bypassed the tripwire. The new regex treats the
+          # quote as any of "'` and matches `fs`, `fs/…`, `node:fs`, or
+          # `node:fs/…` so every realistic fs-read path trips the gate.
+          # A matching line in ANY *.test.ts / *.test.tsx file under
+          # console/src fails the job. `grep -l` exits 1 when nothing
+          # matches; `|| true` keeps the pipeline's exit status pinned to
+          # the `wc -l` step.
+          # Pattern built piece-by-piece to avoid single-quote escaping
+          # hell. `q` is the character class of quote styles JS/TS allows
+          # (double, single, backtick). Subpath variants (`fs/promises`,
+          # `node:fs/promises`) and the dynamic `import("fs")` form are
+          # all covered.
+          q='["'"'"'`]'
+          pattern="readFileSync|readFile\(|from[[:space:]]+${q}(node:)?fs(/[a-z]+)?${q}|require\([[:space:]]*${q}(node:)?fs(/[a-z]+)?${q}[[:space:]]*\)|import\([[:space:]]*${q}(node:)?fs(/[a-z]+)?${q}[[:space:]]*\)"
+          count=$(grep -rlE "$pattern" console/src --include="*.test.ts" --include="*.test.tsx" 2>/dev/null | wc -l || true)
+          count=${count// /}
+          echo "source-grep test-file count: $count"
+          if [ "$count" -gt 0 ]; then
+            echo "LLM-theater tripwire: $count source-grep tests found"
+            grep -rnE "$pattern" console/src --include="*.test.ts" --include="*.test.tsx" || true
+            exit 1
+          fi
+
   package:
     name: clean-venv install smoke test
     runs-on: ubuntu-latest

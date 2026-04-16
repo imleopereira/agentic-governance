@@ -1,95 +1,206 @@
 /**
- * useEventStream — reconnect-scheduling contract test.
+ * useEventStream — reconnect-scheduling contract (runtime).
  *
- * Characterises the exponential-backoff reconnect loop implemented in
- * `useEventStream.ts :: scheduleReconnect`. The rule set:
+ * v0.6.1 polish sprint: replaces the v0.6 source-grep test that
+ * read `useEventStream.ts` off disk and regex-matched
+ * `reconnectDelayRef = useRef(3)`, the backoff cap literal, and the
+ * `setConnectionStatus("connecting" / "connected" / "disconnected")`
+ * call-sites.
  *
- *   - Initial reconnect delay: 3 seconds.
- *   - Each scheduled reconnect doubles the delay, capped at 30 seconds.
- *   - A successful `onopen` resets the delay back to 3 seconds.
- *   - A manual reconnect resets the delay back to 3 seconds.
- *   - The store's `connectionStatus` transitions:
- *       connecting → connected (on open)
- *       connected  → disconnected (on error/close)
+ * The runtime test below mounts the hook in a jsdom environment,
+ * installs a fake `EventSource` that we can drive via `emitOpen()` /
+ * `emitError()`, advances vitest fake timers, and asserts the store
+ * transitions + the URL the hook opens (for Last-Event-ID replay).
  *
- * Why not mount the hook? Same rationale as `useEventStream.statusMap.test.ts`
- * — the console vitest env is Node-only, no jsdom, no EventSource
- * polyfill. We characterise the backoff rule as a pure function and pin
- * the source text so any drift is flagged in CI. When jsdom lands as an
- * approved dev dep (tracked under the deferred-edge-cases memory),
- * these tests are the natural upgrade path to a real render-and-mock
- * EventSource harness.
+ * Why it's a `.ts` file (no JSX): `renderHook` mounts React without
+ * any custom tree, so we don't need the JSX transform here.
  */
-import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
+import { renderHook, act } from "@testing-library/react";
 
-// Local re-implementation of the backoff rule. Must match
-// `useEventStream.ts :: scheduleReconnect` / `connect.onopen`.
-function nextDelay(current: number): number {
-  return Math.min(current * 2, 30);
+import { useEventStream } from "./useEventStream";
+import { useEventStreamStore } from "@/lib/store";
+
+// ---------------------------------------------------------------------------
+// Fake EventSource — captures every instance the hook creates so the test
+// can drive `open` / `error` / `message` events and inspect the URL the
+// hook asked for (for Last-Event-ID replay verification).
+// ---------------------------------------------------------------------------
+interface FakeES {
+  url: string;
+  withCredentials: boolean;
+  readyState: number;
+  onopen: ((this: FakeES, ev: Event) => void) | null;
+  onmessage: ((this: FakeES, ev: MessageEvent) => void) | null;
+  onerror: ((this: FakeES, ev: Event) => void) | null;
+  addEventListener: (type: string, listener: EventListener) => void;
+  removeEventListener: (type: string, listener: EventListener) => void;
+  close: () => void;
+  _emitOpen: () => void;
+  _emitError: () => void;
 }
 
-describe("useEventStream — reconnect backoff rule", () => {
-  it("doubles 3 → 6", () => {
-    expect(nextDelay(3)).toBe(6);
+let esInstances: FakeES[] = [];
+
+function installFakeEventSource(): void {
+  class FakeEventSource implements FakeES {
+    url: string;
+    withCredentials: boolean;
+    readyState = 0;
+    onopen: ((this: FakeES, ev: Event) => void) | null = null;
+    onmessage: ((this: FakeES, ev: MessageEvent) => void) | null = null;
+    onerror: ((this: FakeES, ev: Event) => void) | null = null;
+    listeners: Record<string, EventListener[]> = {};
+
+    constructor(url: string, init?: { withCredentials?: boolean }) {
+      this.url = url;
+      this.withCredentials = Boolean(init?.withCredentials);
+      esInstances.push(this as unknown as FakeES);
+    }
+
+    addEventListener(type: string, listener: EventListener): void {
+      (this.listeners[type] ??= []).push(listener);
+    }
+
+    removeEventListener(type: string, listener: EventListener): void {
+      this.listeners[type] = (this.listeners[type] ?? []).filter(
+        (l) => l !== listener,
+      );
+    }
+
+    close(): void {
+      this.readyState = 2;
+    }
+
+    _emitOpen(): void {
+      this.readyState = 1;
+      this.onopen?.call(this as unknown as FakeES, new Event("open"));
+    }
+
+    _emitError(): void {
+      this.onerror?.call(this as unknown as FakeES, new Event("error"));
+    }
+  }
+  (globalThis as unknown as { EventSource: typeof FakeEventSource }).EventSource =
+    FakeEventSource;
+}
+
+describe("useEventStream — reconnect backoff + store transitions (runtime)", () => {
+  beforeEach(() => {
+    esInstances = [];
+    installFakeEventSource();
+    vi.useFakeTimers();
+    // Reset store state between tests.
+    useEventStreamStore.setState({
+      events: [],
+      connectionStatus: "connecting",
+      lastEventId: null,
+      reconnectIn: 0,
+      pendingApprovals: 0,
+    });
   });
 
-  it("doubles 6 → 12", () => {
-    expect(nextDelay(6)).toBe(12);
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it("doubles 12 → 24", () => {
-    expect(nextDelay(12)).toBe(24);
+  it("transitions connecting → connected on open", async () => {
+    renderHook(() => useEventStream());
+    // Hook mounts synchronously and opens an EventSource.
+    expect(esInstances).toHaveLength(1);
+    expect(useEventStreamStore.getState().connectionStatus).toBe("connecting");
+    act(() => {
+      esInstances[0]._emitOpen();
+    });
+    expect(useEventStreamStore.getState().connectionStatus).toBe("connected");
   });
 
-  it("caps 24 → 30 (one step past the cap)", () => {
-    expect(nextDelay(24)).toBe(30);
+  it("transitions connected → disconnected on error and schedules reconnect", () => {
+    renderHook(() => useEventStream());
+    act(() => {
+      esInstances[0]._emitOpen();
+    });
+    expect(useEventStreamStore.getState().connectionStatus).toBe("connected");
+    act(() => {
+      esInstances[0]._emitError();
+    });
+    expect(useEventStreamStore.getState().connectionStatus).toBe(
+      "disconnected",
+    );
+    // Reconnect scheduled — reconnectIn should be the initial 3 seconds.
+    expect(useEventStreamStore.getState().reconnectIn).toBe(3);
   });
 
-  it("caps 30 → 30 (stable at cap)", () => {
-    expect(nextDelay(30)).toBe(30);
+  it("doubles the backoff 3 → 6 on the second failure", () => {
+    renderHook(() => useEventStream());
+    act(() => esInstances[0]._emitOpen());
+    act(() => esInstances[0]._emitError());
+    // Advance past the 3s timer to let scheduleReconnect fire.
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    // A new EventSource was created by the reconnect.
+    expect(esInstances.length).toBeGreaterThanOrEqual(2);
+    // Fail it again; reconnectIn should now report 6s.
+    const latest = esInstances[esInstances.length - 1];
+    act(() => latest._emitError());
+    expect(useEventStreamStore.getState().reconnectIn).toBe(6);
   });
 
-  it("never exceeds 30 even with an oversize current value", () => {
-    expect(nextDelay(1000)).toBe(30);
-  });
-});
-
-describe("useEventStream — reconnect source pin (drift guard)", () => {
-  const SRC = readFileSync(
-    resolve(__dirname, "./useEventStream.ts"),
-    "utf8",
-  );
-
-  it("starts with a 3-second initial delay", () => {
-    // `reconnectDelayRef.current = 3` is the canonical reset. The comment
-    // on the same line calls out the "seconds, doubles on each failure"
-    // rule, so pinning the literal is enough.
-    expect(SRC).toMatch(/reconnectDelayRef\s*=\s*useRef\(3\)/);
-  });
-
-  it("caps backoff at 30 seconds", () => {
-    expect(SRC).toContain("Math.min(reconnectDelayRef.current * 2, 30)");
-  });
-
-  it("resets to 3 seconds on successful open", () => {
-    expect(SRC).toMatch(/reconnectDelayRef\.current\s*=\s*3/);
+  it("resets the backoff to 3s after a successful open", () => {
+    renderHook(() => useEventStream());
+    // Fail once: backoff bumps to 6 internally.
+    act(() => esInstances[0]._emitError());
+    act(() => {
+      vi.advanceTimersByTime(3000);
+    });
+    // New attempt. Fail it too so the delay bumps to 12s internally.
+    const second = esInstances[esInstances.length - 1];
+    act(() => second._emitError());
+    // Now advance and let the third attempt OPEN — the delay must reset.
+    act(() => {
+      vi.advanceTimersByTime(6000);
+    });
+    const third = esInstances[esInstances.length - 1];
+    act(() => third._emitOpen());
+    // Fail the third connection — reconnectIn must be 3 again, proving reset.
+    act(() => third._emitError());
+    expect(useEventStreamStore.getState().reconnectIn).toBe(3);
   });
 
-  it("transitions store to connecting before attempting a new SSE", () => {
-    expect(SRC).toContain('setConnectionStatus("connecting")');
+  it("caps the backoff at 30 seconds no matter how many failures compound", () => {
+    renderHook(() => useEventStream());
+    // Fail, advance past delay, repeat 8 times — the cap should kick in.
+    const delays = [3000, 6000, 12000, 24000, 30000, 30000, 30000, 30000];
+    for (const delay of delays) {
+      const latest = esInstances[esInstances.length - 1];
+      act(() => latest._emitError());
+      act(() => {
+        vi.advanceTimersByTime(delay);
+      });
+    }
+    // Fail once more; reconnectIn must be <= 30.
+    const latest = esInstances[esInstances.length - 1];
+    act(() => latest._emitError());
+    expect(useEventStreamStore.getState().reconnectIn).toBeLessThanOrEqual(30);
   });
 
-  it("transitions store to connected on open", () => {
-    expect(SRC).toContain('setConnectionStatus("connected")');
+  it("uses Last-Event-ID replay on reconnect when a lastEventId has been set", () => {
+    useEventStreamStore.setState({ lastEventId: "evt-last-99" });
+    renderHook(() => useEventStream());
+    const url = esInstances[0].url;
+    expect(url).toContain("last_event_id=evt-last-99");
   });
 
-  it("transitions store to disconnected on error", () => {
-    expect(SRC).toContain('setConnectionStatus("disconnected")');
-  });
-
-  it("uses Last-Event-ID replay on reconnect", () => {
-    expect(SRC).toContain("last_event_id=");
+  it("does NOT include last_event_id on the first connect with empty state", () => {
+    renderHook(() => useEventStream());
+    expect(esInstances[0].url).not.toContain("last_event_id=");
   });
 });

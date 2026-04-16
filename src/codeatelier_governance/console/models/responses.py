@@ -450,3 +450,84 @@ class VerifyChainResponse(StrictResponse):
     rotation_aware: bool = False
     unresolved_fingerprints: list[str]
     verified_at_utc: datetime
+
+
+class ComplianceBundleWindow(StrictResponse):
+    """Window bounds (ISO-8601 UTC) for a compliance evidence bundle."""
+
+    model_config = _STRICT
+
+    start: datetime
+    end: datetime
+
+
+class ComplianceBundleSignature(StrictResponse):
+    """HMAC-SHA256 signature envelope for a compliance evidence bundle.
+
+    Holds the algorithm, the salted fingerprint of the signing key
+    (reusing :func:`codeatelier_governance.audit.keys.fingerprint_key`),
+    and the hex-encoded HMAC signature over the canonical JSON of the
+    surrounding bundle with ``bundle_signature`` field removed.
+    """
+
+    model_config = _STRICT
+
+    algorithm: Literal["HMAC-SHA256"] = "HMAC-SHA256"
+    key_fingerprint: str = Field(min_length=1, max_length=128)
+    signature: str = Field(min_length=1, max_length=128)
+
+
+class ComplianceBundleRotationStatus(StrictResponse):
+    """Rotation telemetry for the window covered by the bundle.
+
+    ``active_fingerprint`` is the salted fingerprint of the currently
+    active ``AUDIT_SECRET`` (same construction as
+    :class:`ComplianceBundleSignature.key_fingerprint`). The
+    ``known_fingerprints_in_window`` list mirrors the verifier's
+    ``unresolved_fingerprints`` — any fingerprints the rotation-aware
+    path saw while verifying the bundle's chain window.
+    """
+
+    # TODO(v0.6.2): rename ``known_fingerprints_in_window`` →
+    # ``unresolved_fingerprints_in_window``; the current name implies
+    # "all keys seen (healthy)" but the value is actually the
+    # UNRESOLVED list (rotation-aware verifier couldn't resolve them).
+    # Holding the rename to v0.6.2 because the bundle wire contract is
+    # already in a shipped response model and changing it requires a
+    # deprecation note on the export endpoint.
+    model_config = _STRICT
+
+    active_fingerprint: str = Field(min_length=1, max_length=128)
+    known_fingerprints_in_window: list[str] = Field(default_factory=list)
+
+
+class ComplianceBundleResponse(StrictResponse):
+    """POST /api/compliance/export — signed Article 12 evidence bundle.
+
+    Packages the output of ``compliance_report`` and
+    ``compliance_verify_chain`` into a single JSON document that an
+    auditor can archive and later re-verify offline: the bundle hash is
+    the sha256 of the canonical serialization of the body without its
+    ``bundle_signature`` field, and ``bundle_signature.signature`` is
+    the HMAC-SHA256 of that same canonical body under the current
+    ``AUDIT_SECRET``.
+
+    If the internal ``verify_chain`` call raises or times out, the
+    ``verify_chain`` field is ``None`` and ``chain_verification_error``
+    carries the error classname so the rest of the bundle is still
+    emittable — the export is evidence, not an enforcement gate.
+    """
+
+    model_config = _STRICT
+
+    bundle_version: Literal["1.0"] = "1.0"
+    generated_at: datetime
+    tenant_id: str | None = Field(default=None, max_length=256)
+    window: ComplianceBundleWindow
+    report: ComplianceReportView
+    verify_chain: VerifyChainResponse | None = None
+    chain_verification_error: str | None = Field(default=None, max_length=256)
+    rotation_status: ComplianceBundleRotationStatus
+    event_count: int = Field(ge=0)
+    bundle_hash: str = Field(min_length=64, max_length=64)
+    bundle_signature: ComplianceBundleSignature

@@ -19,14 +19,27 @@ from uuid import UUID
 from .models import AuditEventRecord
 
 
-def _canonical(value: Any) -> str:
+def canonical_json(value: Any) -> str:
     """Deterministic JSON serialization for hashing.
 
     sort_keys ensures the same dict produces the same bytes regardless of
     insertion order; separators strips whitespace; default=str handles
     UUID/datetime/etc.
+
+    v0.6.1: promoted from the previously-private ``_canonical`` name
+    because the console's compliance-bundle export legitimately needs
+    the same serialization contract the audit chain uses (so a bundle's
+    signature/hash computed offline matches the server's). ``_canonical``
+    remains as a back-compat alias; new callers MUST use ``canonical_json``.
     """
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+# ---------------------------------------------------------------------------
+# Back-compat aliases (keep callers inside the audit module working)
+# ---------------------------------------------------------------------------
+# Removed v0.7: ``_canonical`` (use ``canonical_json``)
+_canonical = canonical_json
 
 
 def compute_event_hmac(
@@ -395,9 +408,11 @@ def verify_chain_with_rotation(
 # functions above this marker without coordinating with the other track.
 #
 # The helpers here are intentionally decoupled from AuditModule.log so they
-# can be unit-tested in isolation and wired into the write path WITHOUT
-# touching module.py (which Track B may also be editing). The full wiring
-# into AuditModule is left as a follow-up — see the Track A report.
+# can be unit-tested in isolation. Wiring into AuditModule.log is COMPLETE
+# as of v0.6.1 — see ``audit/module.py`` ``_log_unsafe`` (the signing block
+# surrounding ``sign_audit_row``). Keeping the helpers separate means unit
+# tests can exercise the signing contract without constructing an
+# AuditModule / AuditStore pair.
 
 
 def canonical_row_bytes_for_signing(
