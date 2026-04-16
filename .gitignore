@@ -40,7 +40,8 @@ console/node_modules/
 console/.next/
 console/out/
 console/.env.local
-console/package-lock.json
+# NOTE: console/package-lock.json IS tracked — actions/setup-node cache
+# keys off it, and supply-chain integrity demands it live with the code.
 
 # Local automation (cron scripts, logs)
 scripts/automation/logs/
