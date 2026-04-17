@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import weakref
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -44,6 +45,54 @@ logger = structlog.get_logger(__name__)
 # Sentinel tool name used for scope checks at the LLM-call interception point.
 # OpenAI calls have no explicit tool name here, so we use a stable sentinel.
 _CHAT_COMPLETIONS_SENTINEL = "chat.completions.create"
+
+# v0.6.2-followup (Bug #8 hardening): conservative per-chunk token estimate for
+# torn-down streams. See anthropic_wrap.STREAM_CHUNK_TOKEN_ESTIMATE for
+# rationale (over-count on uncertainty; under-counting = silent bypass).
+STREAM_CHUNK_TOKEN_ESTIMATE = 8
+
+# v0.6.2-followup: strong references to pending reconcile tasks spawned from
+# sync __exit__ / __iter__ paths so the asyncio task isn't GC'd mid-execution.
+_PENDING_RECONCILES: "set[asyncio.Task[Any]]" = set()
+
+
+def _spawn_tracked_reconcile(loop: asyncio.AbstractEventLoop, coro: Any) -> None:
+    """Spawn a reconcile coroutine as a task with a strong ref held until done."""
+    task = loop.create_task(coro)
+    _PENDING_RECONCILES.add(task)
+    task.add_done_callback(_PENDING_RECONCILES.discard)
+
+
+def _inject_include_usage(kwargs: dict[str, Any], agent_id: str) -> None:
+    """Auto-inject ``stream_options={'include_usage': True}`` when streaming.
+
+    v0.6.2-followup (Bypass #4): previously the wrapper required the caller
+    to opt into ``stream_options={"include_usage": True}``. Callers who
+    forgot got silent under-counting: OpenAI never emits a final usage chunk,
+    ``_extract_chunk_usage`` returns None, reconcile warns but tracked stays
+    at the projected amount. That's the bypass.
+
+    Fix: inject by default for streaming calls. Respect explicit user intent —
+    if the caller set ``include_usage: False``, we warn but don't override.
+    """
+    if not kwargs.get("stream"):
+        return
+    opts = dict(kwargs.get("stream_options") or {})
+    if "include_usage" not in opts:
+        opts["include_usage"] = True
+        kwargs["stream_options"] = opts
+    elif opts["include_usage"] is False:
+        logger.warning(
+            "governance.openai_wrap.include_usage_explicitly_disabled",
+            agent_id=agent_id,
+            detail=(
+                "Caller explicitly set stream_options={'include_usage': False}. "
+                "Governance honors this, but streaming reconciliation cannot "
+                "read actual usage and tracked amount will remain the "
+                "projected value. Remove the False override to enable "
+                "accurate reconciliation."
+            ),
+        )
 
 
 async def _halt_check_if_wired(sdk: Any, agent_id: str) -> None:
@@ -103,16 +152,44 @@ def _extract_token_usage(response: Any) -> dict[str, int]:
     return usage
 
 
-def _estimate_usd(model: str, usage: dict[str, int]) -> float:
+def _estimate_usd(sdk: Any, model: str, usage: dict[str, int]) -> float:
     """Estimate USD cost using the built-in pricing table.
 
-    Returns 0.0 if the model is unknown or usage is empty.
+    Post-call observation surface — MUST NOT raise by contract. We respect
+    the CostModule's ``strict_unknown_models`` flag but catch
+    :class:`UnknownModelError` and log at ``error`` level so the caller
+    sees the misconfiguration without breaking the host call. In strict
+    mode on unknown model we return 0.0 AND log an error (operator visibility).
     """
+    from codeatelier_governance.cost.errors import UnknownModelError
     from codeatelier_governance.cost.pricing import estimate_cost
 
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
-    return estimate_cost(model, prompt, completion)
+    cost = getattr(sdk, "cost", None)
+    strict = bool(getattr(cost, "_strict_unknown_models", False))
+    fallback = getattr(cost, "_unknown_model_fallback_usd_per_million", None)
+    try:
+        return estimate_cost(
+            model,
+            prompt,
+            completion,
+            strict=strict,
+            fallback_usd_per_million=fallback,
+        )
+    except UnknownModelError as exc:
+        logger.error(
+            "governance.openai_wrap.unknown_model",
+            model=model,
+            error=str(exc),
+            detail=(
+                "Unknown model name encountered in post-call cost accounting. "
+                "USD budget caps will not count this call. Add the model to "
+                "MODEL_PRICING or set strict_unknown_models=False with a "
+                "non-zero fallback rate on CostModule."
+            ),
+        )
+        return 0.0
 
 
 def _has_running_loop() -> bool:
@@ -174,49 +251,54 @@ async def _handle_streaming_response(
     stream: Any,
     model: str,
     projected_tokens: int | None,
-) -> None:
-    """Log the streaming audit event with cost_tracked=True.
+) -> Any:
+    """Track projected tokens at stream start; reconcile when stream completes.
 
-    For async streaming responses we cannot iterate the stream inside the wrapper
-    (the caller needs the iterable).  Instead we immediately use ``projected_tokens``
-    (max_tokens from the call kwargs or SDK default) as the tracked usage and emit
-    a ``llm.result`` event with ``cost_tracked=True``.
+    Two-phase cost accounting for streams (v0.6.2 Bug #8 fix):
+      1. Track ``projected_tokens`` (max_tokens or SDK default) so the
+         forward-looking budget gate sees projected spend.
+      2. Return a reconciliation proxy that reads the final ``usage``
+         chunk (requires ``stream_options={'include_usage': True}``) and
+         tracks the DELTA via :meth:`CostModule.reconcile`.
 
-    If ``projected_tokens`` is unavailable, a warning is emitted and
-    ``cost_tracked=False`` is recorded — the operator must call
-    ``sdk.cost.track()`` manually.
+    Previously the wrapper trusted ``max_tokens`` forever — a stream with
+    10 max_tokens but 10k actual output would undercount by 1000x, a USD
+    cap bypass vector.
 
-    Args:
-        sdk: The GovernanceSDK instance.
-        agent_id: The agent identifier.
-        session_id: The current session UUID.
-        stream: The streaming response object (not consumed here).
-        model: The model name used for this call.
-        projected_tokens: The declared max_tokens or SDK default, if available.
+    Returns:
+        The stream object, wrapped with a reconciliation proxy. The caller
+        uses the proxy in place of the raw stream.
     """
     if projected_tokens is not None and projected_tokens > 0:
         await _safe_cost_track(sdk, agent_id, session_id, projected_tokens, 0.0)
         await _safe_audit_log(
             sdk, agent_id, "llm.result",
             {"model": model, "streaming": True, "cost_tracked": True,
-             "projected_tokens_tracked": projected_tokens},
+             "projected_tokens_tracked": projected_tokens,
+             "reconciliation": "pending"},
             model=str(model), session_id=session_id,
         )
-    else:
-        logger.warning(
-            "governance.openai_wrap.streaming_no_usage",
-            agent_id=agent_id,
-            detail=(
-                "Streaming call with no max_tokens declared and no SDK default. "
-                "Cost not tracked for this call. Pass max_tokens= in your API "
-                "call or set GovernanceSDK(..., default_max_tokens=N)."
-            ),
+        return _wrap_openai_stream_for_reconciliation(
+            stream, sdk, agent_id, session_id, model, projected_tokens,
         )
-        await _safe_audit_log(
-            sdk, agent_id, "llm.result",
-            {"model": model, "streaming": True, "cost_tracked": False},
-            model=str(model), session_id=session_id,
-        )
+    logger.warning(
+        "governance.openai_wrap.streaming_no_usage",
+        agent_id=agent_id,
+        detail=(
+            "Streaming call with no max_tokens declared and no SDK default. "
+            "Cost not tracked upfront — will be reconciled against the "
+            "final provider usage chunk when the stream ends."
+        ),
+    )
+    await _safe_audit_log(
+        sdk, agent_id, "llm.result",
+        {"model": model, "streaming": True, "cost_tracked": False,
+         "reconciliation": "pending"},
+        model=str(model), session_id=session_id,
+    )
+    return _wrap_openai_stream_for_reconciliation(
+        stream, sdk, agent_id, session_id, model, 0,
+    )
 
 
 async def _safe_audit_log(
@@ -263,6 +345,277 @@ def _is_streaming_response(response: Any) -> bool:
     return type_name in ("Stream", "AsyncStream")
 
 
+def _extract_chunk_usage(chunk: Any) -> dict[str, int] | None:
+    """If an OpenAI stream chunk carries a final ``usage`` block, extract it.
+
+    OpenAI emits the final-usage chunk only when the caller passes
+    ``stream_options={"include_usage": True}``. When absent, we cannot
+    reconcile accurately and fall back to the projected tokens.
+    """
+    usage = getattr(chunk, "usage", None)
+    if usage is None:
+        return None
+    out: dict[str, int] = {}
+    for src, dst in (
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+        ("total_tokens", "total_tokens"),
+    ):
+        val = getattr(usage, src, None)
+        if val is not None:
+            out[dst] = int(val)
+    if "total_tokens" not in out and {"prompt_tokens", "completion_tokens"} <= set(out):
+        out["total_tokens"] = out["prompt_tokens"] + out["completion_tokens"]
+    return out or None
+
+
+async def _reconcile_openai_stream(
+    sdk: Any,
+    agent_id: str,
+    session_id: UUID,
+    final_usage: dict[str, int] | None,
+    model: str,
+    projected_tokens: int,
+    *,
+    chunks_seen: int = 0,
+    torn_down: bool = False,
+) -> None:
+    """Reconcile a finished OpenAI stream against the provider's final usage.
+
+    v0.6.2-followup: when the stream was ``torn_down`` (cancellation / mid-stream
+    exception) and no final usage chunk was captured, fall back to a conservative
+    per-chunk token estimate (``chunks_seen * STREAM_CHUNK_TOKEN_ESTIMATE``)
+    floored at ``projected_tokens``. Over-counts on purpose to close the bypass.
+    """
+    reconciliation_source = "provider_final"
+    if final_usage is None or "total_tokens" not in final_usage:
+        if torn_down and chunks_seen > 0:
+            estimated_actual = max(
+                projected_tokens,
+                chunks_seen * STREAM_CHUNK_TOKEN_ESTIMATE,
+            )
+            final_usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": estimated_actual,
+                "total_tokens": estimated_actual,
+            }
+            reconciliation_source = "chunk_estimate"
+            logger.warning(
+                "governance.openai_wrap.stream_usage_estimated",
+                agent_id=agent_id,
+                model=model,
+                projected_tokens=projected_tokens,
+                chunks_seen=chunks_seen,
+                estimated_actual=estimated_actual,
+                detail=(
+                    "OpenAI stream torn down before final usage chunk; "
+                    "estimating actual tokens from chunk count. Over-counts "
+                    "by design to avoid silent budget bypass."
+                ),
+            )
+        else:
+            logger.warning(
+                "governance.openai_wrap.stream_usage_unavailable",
+                agent_id=agent_id,
+                model=model,
+                projected_tokens=projected_tokens,
+                detail=(
+                    "OpenAI stream did not expose a final usage chunk. Pass "
+                    "stream_options={'include_usage': True} to enable accurate "
+                    "reconciliation; tracked amount remains the projected value."
+                ),
+            )
+            return
+    actual_tokens = int(final_usage["total_tokens"])
+    actual_usd = _estimate_usd(sdk, model, final_usage)
+    cost = getattr(sdk, "cost", None)
+    if cost is None or not hasattr(cost, "reconcile"):
+        token_delta = max(0, actual_tokens - projected_tokens)
+        if token_delta > 0 or actual_usd > 0.0:
+            await _safe_cost_track(
+                sdk, agent_id, session_id, token_delta, actual_usd,
+            )
+    else:
+        try:
+            await cost.reconcile(
+                agent_id,
+                session_id,
+                projected_tokens=projected_tokens,
+                actual_tokens=actual_tokens,
+                projected_usd=0.0,
+                actual_usd=actual_usd,
+                model=model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "governance.openai_wrap.reconcile_failed",
+                agent_id=agent_id,
+                error_type=type(exc).__name__,
+            )
+    await _safe_audit_log(
+        sdk, agent_id, "llm.result.reconciled",
+        {
+            "model": model,
+            "streaming": True,
+            "projected_tokens": projected_tokens,
+            "actual_tokens": actual_tokens,
+            "actual_usd": actual_usd,
+            "token_delta": actual_tokens - projected_tokens,
+            "reconciliation_source": reconciliation_source,
+        },
+        model=str(model), session_id=session_id,
+    )
+
+
+def _openai_abandonment_finalizer(
+    state: dict[str, Any],
+    agent_id: str,
+    session_id: UUID,
+    projected_tokens: int,
+    model: str,
+) -> None:
+    """Emit WARN when an OpenAI stream proxy is GC'd without iteration.
+
+    MUST NOT capture the proxy in its closure — weakref.finalize passes the
+    state dict as an arg so the proxy can actually be collected.
+    """
+    if state.get("reconciled"):
+        return
+    state["reconciled"] = True
+    logger.warning(
+        "governance.stream.abandoned_without_reconcile",
+        agent_id=agent_id,
+        session_id=str(session_id),
+        projected_tokens=projected_tokens,
+        model=model,
+        detail=(
+            "OpenAI stream proxy was garbage-collected without iteration — "
+            "final usage was never read. Tracked amount remains the projected "
+            "(max_tokens) value. To fix: iterate the stream or call close()."
+        ),
+    )
+
+
+def _wrap_openai_stream_for_reconciliation(
+    stream: Any,
+    sdk: Any,
+    agent_id: str,
+    session_id: UUID,
+    model: str,
+    projected_tokens: int,
+    state: dict[str, Any] | None = None,
+) -> Any:
+    """Proxy an OpenAI stream so we reconcile usage when iteration ends.
+
+    v0.6.2-followup — closes bypass vectors found in DA review:
+      * Abandonment: weakref.finalize emits WARN on GC without iteration.
+      * Cancellation / mid-stream exception: split except/else so
+        CancelledError (BaseException) triggers estimate-based reconcile AND
+        is re-raised.
+      * isinstance transparency: __class__ reports wrapped type.
+
+    The terminal chunk optionally carries ``.usage`` when
+    ``stream_options={'include_usage': True}``. The outer wrapper auto-injects
+    that option for streaming calls (see :func:`_inject_include_usage`) so
+    reconciliation works by default.
+    """
+    if state is None:
+        state = {"last_usage": None, "reconciled": False, "chunks_seen": 0}
+    has_aiter = hasattr(stream, "__aiter__")
+    has_iter = hasattr(stream, "__iter__")
+    _wrapped_class = type(stream)
+
+    async def _run_reconcile(torn_down: bool = False) -> None:
+        if state["reconciled"]:
+            return
+        state["reconciled"] = True
+        await _reconcile_openai_stream(
+            sdk, agent_id, session_id,
+            state["last_usage"], model, projected_tokens,
+            chunks_seen=state.get("chunks_seen", 0),
+            torn_down=torn_down,
+        )
+
+    class _ReconcilingProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(stream, name)
+
+        def __repr__(self) -> str:
+            return f"<OpenAIReconcilingProxy wrap={stream!r}>"
+
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return _wrapped_class
+
+        if has_aiter:
+            def __aiter__(self) -> Any:
+                async def _gen() -> Any:
+                    try:
+                        async for chunk in stream:
+                            state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                            chunk_usage = _extract_chunk_usage(chunk)
+                            if chunk_usage is not None:
+                                state["last_usage"] = chunk_usage
+                            yield chunk
+                    except BaseException:
+                        # CancelledError inherits BaseException; reconcile with
+                        # torn_down=True then re-raise so cancellation actually
+                        # propagates.
+                        try:
+                            await _run_reconcile(torn_down=True)
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.error(
+                                "governance.openai_wrap.reconcile_aiter_failed",
+                                error_type=type(_exc).__name__,
+                            )
+                        raise
+                    else:
+                        try:
+                            await _run_reconcile(torn_down=False)
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.error(
+                                "governance.openai_wrap.reconcile_aiter_failed",
+                                error_type=type(_exc).__name__,
+                            )
+                return _gen()
+
+        if has_iter:
+            def __iter__(self) -> Any:
+                torn_down = False
+                try:
+                    for chunk in stream:
+                        state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                        chunk_usage = _extract_chunk_usage(chunk)
+                        if chunk_usage is not None:
+                            state["last_usage"] = chunk_usage
+                        yield chunk
+                except BaseException:
+                    torn_down = True
+                    raise
+                finally:
+                    try:
+                        if _has_running_loop():
+                            loop = asyncio.get_running_loop()
+                            _spawn_tracked_reconcile(
+                                loop, _run_reconcile(torn_down=torn_down),
+                            )
+                        else:
+                            asyncio.run(_run_reconcile(torn_down=torn_down))
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.error(
+                            "governance.openai_wrap.reconcile_iter_failed",
+                            error_type=type(_exc).__name__,
+                        )
+
+    proxy = _ReconcilingProxy()
+    weakref.finalize(
+        proxy,
+        _openai_abandonment_finalizer,
+        state, agent_id, session_id, projected_tokens, model,
+    )
+    return proxy
+
+
 def _wrap_sync_create(
     original: Any,
     sdk: GovernanceSDK,
@@ -288,6 +641,12 @@ def _wrap_sync_create(
 
         model = kwargs.get("model", "unknown")
         is_streaming = kwargs.get("stream", False)
+
+        # v0.6.2-followup (Bypass #4): auto-inject stream_options={include_usage:True}
+        # for streaming calls so reconciliation works by default. Respects explicit
+        # caller intent — honors include_usage=False with a WARN.
+        if is_streaming:
+            _inject_include_usage(kwargs, agent_id)
 
         # Model selection policy — advisory, sync path
         if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
@@ -326,9 +685,12 @@ def _wrap_sync_create(
             raise
 
         if is_streaming or _is_streaming_response(response):
-            # Streaming: budget gate already fired above. Audit with cost_tracked=True
-            # (post-stream tracking is not feasible in the sync path without consuming
-            # the generator, so we fall back to max_tokens as projected usage).
+            # Streaming: budget gate already fired above. Track projected
+            # upfront, then return a reconciliation-wrapped stream so the
+            # provider's final usage chunk lands as a delta (Bug #8 fix).
+            # Reconciliation requires the caller to pass
+            # stream_options={'include_usage': True} — otherwise the
+            # wrapper logs a warning and tracked amount remains projected.
             tracked_tokens = _projected or 0
             if tracked_tokens > 0:
                 asyncio.run(_safe_cost_track(sdk, agent_id, session_id, tracked_tokens, 0.0))
@@ -336,7 +698,8 @@ def _wrap_sync_create(
                     _safe_audit_log(
                         sdk, agent_id, "llm.result",
                         {"model": model, "streaming": True, "cost_tracked": True,
-                         "projected_tokens_tracked": tracked_tokens},
+                         "projected_tokens_tracked": tracked_tokens,
+                         "reconciliation": "pending"},
                         model=str(model), session_id=session_id,
                     )
                 )
@@ -344,20 +707,23 @@ def _wrap_sync_create(
                 logger.warning(
                     "governance.openai_wrap.streaming_no_usage",
                     agent_id=agent_id,
-                    detail="Streaming call with no max_tokens; cost not tracked for this call.",
+                    detail="Streaming call with no max_tokens; will reconcile from final usage chunk.",
                 )
                 asyncio.run(
                     _safe_audit_log(
                         sdk, agent_id, "llm.result",
-                        {"model": model, "streaming": True, "cost_tracked": False},
+                        {"model": model, "streaming": True, "cost_tracked": False,
+                         "reconciliation": "pending"},
                         model=str(model), session_id=session_id,
                     )
                 )
-            return response
+            return _wrap_openai_stream_for_reconciliation(
+                response, sdk, agent_id, session_id, str(model), tracked_tokens,
+            )
 
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
-        usd = _estimate_usd(str(model), usage)
+        usd = _estimate_usd(sdk, str(model), usage)
 
         asyncio.run(
             _safe_audit_log(
@@ -386,6 +752,13 @@ def _wrap_async_create(
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         model = kwargs.get("model", "unknown")
         is_streaming = kwargs.get("stream", False)
+
+        # v0.6.2-followup (Bypass #4): auto-inject stream_options={include_usage:True}
+        # for streaming calls BEFORE the LLM call so OpenAI emits the final usage
+        # chunk and reconciliation can read actual tokens. Honors an explicit
+        # include_usage=False with a WARN (never overrides user intent).
+        if is_streaming:
+            _inject_include_usage(kwargs, agent_id)
 
         # Model selection policy — advisory, never raises
         if getattr(sdk, "routing", None) is not None and sdk.routing.has_policies():
@@ -439,11 +812,13 @@ def _wrap_async_create(
         await pre_audit_task
 
         if is_streaming or _is_streaming_response(response):
-            # Item 4: pre-stream gate already ran above. Now handle post-stream tracking.
-            await _handle_streaming_response(
+            # Item 4: pre-stream gate already ran above. Track projected
+            # tokens upfront and return a reconciliation-wrapped stream so
+            # the final usage chunk is reconciled post-stream (Bug #8 fix).
+            wrapped = await _handle_streaming_response(
                 sdk, agent_id, session_id, response, model, _projected
             )
-            return response
+            return wrapped
 
         # Observation: audit log + cost track post-call — run concurrently.
         # cost.track must complete before the next check_or_raise to avoid
@@ -451,7 +826,7 @@ def _wrap_async_create(
         # post-call audit log.
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
-        usd = _estimate_usd(str(model), usage)
+        usd = _estimate_usd(sdk, str(model), usage)
 
         post_coros: list[Any] = [
             _safe_audit_log(

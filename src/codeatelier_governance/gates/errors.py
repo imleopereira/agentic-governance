@@ -34,3 +34,17 @@ class ApprovalTimeout(GateError):
 
 class ApprovalTokenError(GateError):
     """Raised when an approval token is invalid: bad signature, expired, reused, or mismatched action_hash."""
+
+
+class TokenVersionTooOldError(ApprovalTokenError):
+    """Raised when a legacy v1 token is parsed past its operator-configured
+    sunset date (``GatesModule(accept_v1_until=...)``).
+
+    Distinct from ``ApprovalTokenError`` (signature mismatch / expired /
+    etc.) so operator UIs can render a specific "this deployment aged
+    out v1 approval tokens on {date} — contact admin for a grace-window
+    override" message instead of a generic invalid-token error.
+
+    Subclass of ``ApprovalTokenError`` so existing ``except ApprovalTokenError``
+    handlers continue to catch this case without code changes on upgrade.
+    """

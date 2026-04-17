@@ -462,8 +462,12 @@ class RoutingModule:
         # a precise cost projection.
         input_tokens = max_tokens // 4
         output_tokens = max_tokens
+        # Routing cost estimation is audit-metadata only (see block comment
+        # above). We deliberately pass ``strict=False`` so an unknown model
+        # name in the requested_model field never crashes the advisory path —
+        # the USD-bypass vector from Bug #7 lives in cost tracking, not here.
         estimated_cost_requested = estimate_cost(
-            requested_model, input_tokens, output_tokens
+            requested_model, input_tokens, output_tokens, strict=False,
         )
 
         reason: str | None = None
@@ -507,7 +511,7 @@ class RoutingModule:
             if constrained != requested_model:
                 reason = "allowed_models_constraint"
                 estimated_cost_selected = estimate_cost(
-                    constrained, input_tokens, output_tokens
+                    constrained, input_tokens, output_tokens, strict=False,
                 )
                 await self._emit_suggestion_event(
                     agent_id=agent_id,
@@ -551,7 +555,9 @@ class RoutingModule:
             if allowed != requested_model:
                 reason = "allowed_models_constraint"
 
-        estimated_cost_selected = estimate_cost(selected, input_tokens, output_tokens)
+        estimated_cost_selected = estimate_cost(
+            selected, input_tokens, output_tokens, strict=False,
+        )
 
         if selected != requested_model:
             await self._emit_suggestion_event(

@@ -54,8 +54,35 @@ class RevocationStore:
     rejected at the API level (the methods simply do not exist).
     """
 
-    def __init__(self, engine: Any = None) -> None:
+    def __init__(self, engine: Any = None, *, strict_chain: bool = True) -> None:
+        """Construct a revocation store.
+
+        Parameters
+        ----------
+        engine:
+            Optional SQLAlchemy ``AsyncEngine``. ``None`` means in-memory.
+        strict_chain:
+            v0.6.2 tamper-evidence hardening (Bug #9). When ``True`` (the
+            default), ``revoke_with_chain_event`` RAISES if the audit chain
+            write fails — no revocation row is appended without a
+            ``chain_event_id``. This closes the silent-failure surface
+            where an operator who can momentarily suppress audit writes
+            (kill signal on audit worker, transient DB hiccup) could land
+            a revocation that is NOT cross-bound to the chain — precisely
+            the tamper surface ``revoke_with_chain_event`` was designed to
+            close.
+
+            Setting ``strict_chain=False`` preserves the v0.6.1 degraded
+            behavior (mirror row written with ``chain_event_id=None``).
+            This is intended for disaster-recovery scenarios where the
+            operator has explicitly accepted the broken linkage. A
+            distinct structured-log event
+            (``identity.revocation_without_chain_event``) is emitted
+            whenever a revocation lands in this mode so the SOC / audit
+            reviewer can reconcile later.
+        """
         self._engine = engine
+        self._strict_chain = strict_chain
         self._records: list[RevocationRecord] = []
         self._by_fingerprint: dict[str, list[RevocationRecord]] = {}
         self._lock = Lock()
@@ -100,6 +127,7 @@ class RevocationStore:
         reason: str,
         operator_id: str,
         revoker_agent_id: str = "governance.operator",
+        strict_chain: bool | None = None,
     ) -> RevocationRecord:
         """Revoke a key AND emit an ``audit.agent_key_revocation`` chain row.
 
@@ -123,16 +151,30 @@ class RevocationStore:
         (e.g. in-memory mode), we use ``0`` which is safe because in-memory
         stores are not the enforcement substrate for production.
 
-        Graceful degradation: on any failure in the chain write or the
-        seq lookup we still append the revocation to the in-memory mirror
-        so the runtime enforcement path (``is_revoked_at``) works; a
-        WARN is logged so operators can reconcile.
+        v0.6.2 Bug #9 hardening: when ``strict_chain`` is True (the store
+        default, overridable per-call), a failure to emit the chain row
+        RAISES and NO revocation row is written. This closes the silent-
+        failure surface where an operator who could momentarily suppress
+        audit writes (kill signal on audit worker, transient DB hiccup)
+        could land a revocation NOT cross-bound to the chain.
+
+        Lax mode (``strict_chain=False``, either at store construction or
+        per-call) preserves the v0.6.1 graceful-degradation behavior:
+        on any failure in the chain write we still append the revocation
+        to the in-memory mirror so the runtime enforcement path
+        (``is_revoked_at``) works; a distinct WARN
+        (``identity.revocation_without_chain_event``) is logged so
+        operators can reconcile.
         """
         import structlog
 
         from ..audit.models import AuditEvent
 
         _log = structlog.get_logger(__name__)
+
+        effective_strict = (
+            self._strict_chain if strict_chain is None else strict_chain
+        )
 
         event = AuditEvent(
             agent_id=revoker_agent_id,
@@ -148,15 +190,39 @@ class RevocationStore:
         try:
             record = await audit_module.log(event)
             chain_event_id = record.event_id
-        except Exception as exc:  # noqa: BLE001 — never block revocation
+        except Exception as exc:  # noqa: BLE001 — handled per strict_chain
+            if effective_strict:
+                # Strict mode (default): no row is appended without a
+                # chain_event_id. Re-raise so the caller sees the
+                # degraded audit substrate instead of a silently
+                # unlinked revocation. See cybersecurity.md
+                # "rotation-unaware verifiers / admin-bypass paths
+                # missing distinct audit markers".
+                _log.error(
+                    "identity.revocation_chain_event_failed",
+                    error_type=type(exc).__name__,
+                    key_fingerprint_prefix=key_fingerprint[:16],
+                    strict_chain=True,
+                    detail=(
+                        "Failed to emit audit.agent_key_revocation chain "
+                        "row; refusing to append an unlinked revocation "
+                        "(strict_chain=True). No row was written."
+                    ),
+                )
+                raise
+            # Lax mode: degraded-mode fallback. Distinct event name so a
+            # SIEM rule can alert on any revocation that lands without a
+            # chain linkage.
             _log.warning(
-                "identity.revocation_chain_event_failed",
+                "identity.revocation_without_chain_event",
                 error_type=type(exc).__name__,
                 key_fingerprint_prefix=key_fingerprint[:16],
+                strict_chain=False,
                 detail=(
                     "Failed to emit audit.agent_key_revocation chain row; "
-                    "the revocation is still recorded in the side table. "
-                    "Operators should manually reconcile the chain."
+                    "the revocation is still recorded in the side table "
+                    "because strict_chain=False. Operators MUST manually "
+                    "reconcile the chain — this row has chain_event_id=None."
                 ),
             )
 

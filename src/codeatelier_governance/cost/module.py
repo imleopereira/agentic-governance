@@ -55,10 +55,30 @@ class CostModule:
         fail_open: bool = False,
         database_url: str | None = None,
         engine: Any = None,
+        strict_unknown_models: bool = True,
+        unknown_model_fallback_usd_per_million: float | None = None,
     ) -> None:
+        """Construct the CostModule.
+
+        Args:
+            strict_unknown_models: When True (default, v0.6.2+), calls that
+                reference a model not in ``MODEL_PRICING`` raise
+                :class:`UnknownModelError`. This closes the silent-zero
+                budget-bypass vector where a fine-tuned or custom model
+                name (``my-ft-gpt4``) would never trip any USD cap. Set to
+                False to opt into lax accounting (a structlog warning
+                ``cost.unknown_model`` still fires).
+            unknown_model_fallback_usd_per_million: In lax mode, the per-1M
+                rate to apply to unknown models. ``None`` means 0.0 (the
+                original foot-gun behavior — warning still emitted).
+        """
         self._audit = audit
         self._store: CostStore = store or InMemoryCostStore()
         self._fail_open = fail_open
+        self._strict_unknown_models = strict_unknown_models
+        self._unknown_model_fallback_usd_per_million = (
+            unknown_model_fallback_usd_per_million
+        )
         self._policies: dict[str, BudgetPolicy] = {}
         self._no_policy_warned: set[str] = set()
         self._database_url = database_url
@@ -259,10 +279,31 @@ class CostModule:
         Convenience wrapper around ``track()`` that looks up the model in
         the built-in pricing table. Users no longer need to pass ``usd=``
         manually for known models.
+
+        Unknown-model handling respects the module-level
+        ``strict_unknown_models`` flag (default True since v0.6.2):
+            * strict=True: raises :class:`UnknownModelError` so the budget
+              bypass is explicit. Tokens are NOT tracked in that case —
+              the call has failed loudly.
+            * strict=False: emits a ``cost.unknown_model`` warning and
+              applies the configured fallback rate (or 0.0) to accumulate
+              USD; tokens are still tracked normally.
         """
+        from .errors import UnknownModelError
         from .pricing import estimate_cost
 
-        usd = estimate_cost(model, input_tokens, output_tokens)
+        try:
+            usd = estimate_cost(
+                model,
+                input_tokens,
+                output_tokens,
+                strict=self._strict_unknown_models,
+                fallback_usd_per_million=self._unknown_model_fallback_usd_per_million,
+            )
+        except UnknownModelError:
+            # Raise so the host sees the misconfiguration; don't
+            # silently accept tokens under an unknown model in strict mode.
+            raise
         await self.track(
             agent_id,
             session_id,
@@ -306,6 +347,66 @@ class CostModule:
                 agent_id=agent_id,
                 session_id=str(session_id),
             )
+
+    async def reconcile(
+        self,
+        agent_id: str,
+        session_id: UUID,
+        *,
+        projected_tokens: int,
+        actual_tokens: int,
+        projected_usd: float = 0.0,
+        actual_usd: float = 0.0,
+        model: str | None = None,
+    ) -> None:
+        """Reconcile projected usage with the provider's final reported usage.
+
+        Used by streaming wrappers (v0.6.2 Bug #8): at stream start we
+        optimistically ``track()`` ``projected_tokens`` (usually
+        ``max_tokens``). When the stream completes, the provider reports
+        the true ``actual_tokens`` count — which can be orders of magnitude
+        larger than ``max_tokens`` when the provider stopped early, OR
+        larger than ``max_tokens`` if the wrapper used a small SDK default.
+
+        This method adds the DELTA (``actual - projected``) to the running
+        counters so the totals match the provider-of-record. We never
+        subtract — counters are monotonic — but the delta MAY exceed the
+        max_tokens cap (hence the reconcile must happen AFTER the stream).
+
+        If ``actual`` is less than ``projected``, we log a warning and
+        DO NOT refund — monotonic counters prevent exploit patterns where
+        an agent issues many cancelled streams to drain below its cap.
+        """
+        token_delta = actual_tokens - projected_tokens
+        usd_delta = actual_usd - projected_usd
+        if token_delta < 0 or usd_delta < 0.0:
+            logger.warning(
+                "cost.reconcile_negative_delta_ignored",
+                agent_id=agent_id,
+                session_id=str(session_id),
+                projected_tokens=projected_tokens,
+                actual_tokens=actual_tokens,
+                projected_usd=projected_usd,
+                actual_usd=actual_usd,
+                detail=(
+                    "Provider reported fewer tokens than projected. "
+                    "Counters are monotonic — no refund is issued. "
+                    "If this is routine, reduce max_tokens to avoid "
+                    "over-reserving budget."
+                ),
+            )
+            # Still track any positive dimension (e.g. tokens negative but usd positive).
+            token_delta = max(0, token_delta)
+            usd_delta = max(0.0, usd_delta)
+        if token_delta == 0 and usd_delta == 0.0:
+            return
+        await self.track(
+            agent_id,
+            session_id,
+            tokens=token_delta,
+            usd=usd_delta,
+            model=model,
+        )
 
     async def model_breakdown(self, agent_id: str) -> dict[str, dict[str, float]]:
         """Return per-model usage for today.

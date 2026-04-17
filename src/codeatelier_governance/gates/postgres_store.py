@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from ..utils import normalize_db_url
 from .errors import ApprovalTokenError, GateError
 from .models import ApprovalRequest
-from .store import GatesStore, Resolution
+from .store import GatesStore, OnCommit, Resolution
 
 
 class PostgresGatesStore(GatesStore):
@@ -114,8 +114,30 @@ class PostgresGatesStore(GatesStore):
         self,
         request_id: UUID,
         resolution: Resolution,
+        *,
+        on_commit: OnCommit | None = None,
     ) -> ApprovalRequest:
         # Atomic UPDATE with single-use guard.
+        #
+        # v0.6.2 P0 atomicity: when ``on_commit`` is supplied, we run
+        # it INSIDE the ``engine.begin()`` block after the UPDATE. If
+        # ``on_commit`` raises, the async context manager rolls back
+        # the UPDATE and the pending row is left in its pre-call state.
+        # This is how we keep gate-resolved + audit-row atomic from
+        # the caller's perspective: either both land, or neither does.
+        #
+        # Caveat: the audit write goes through a BatchingWriter backed
+        # by a SEPARATE engine, so the audit INSERT is NOT literally in
+        # this same Postgres transaction. It is still sufficient for
+        # the threat model: the only failure mode we need to defend
+        # against is "audit.log raises before the gate commits" — if
+        # ``on_commit`` raises, our UPDATE rolls back; if it succeeds
+        # (audit enqueued cleanly), the host crash risk now lives
+        # entirely inside the audit writer's own durability guarantees
+        # (which F6 hardened). Pre-v0.6.2 the gate UPDATE could commit
+        # even when audit.log raised.
+        row = None
+        already_resolved_without_row = False
         try:
             async with self._engine.begin() as conn:
                 res = await conn.execute(
@@ -131,10 +153,43 @@ class PostgresGatesStore(GatesStore):
                     {"rid": str(request_id), "resolution": resolution},
                 )
                 row = res.mappings().first()
+                if row is None:
+                    # Mark it so the surrounding try/except does not
+                    # mis-classify this as a generic postgres error.
+                    already_resolved_without_row = True
+                    # Fall through — context manager will commit the
+                    # no-op transaction and we raise below.
+                elif on_commit is not None:
+                    # Run the caller's commit hook inside the txn so
+                    # any failure rolls back the UPDATE and leaves the
+                    # pending row intact for retry. We re-wrap the row
+                    # as an ApprovalRequest so the hook sees the stable
+                    # public contract, not a SQLAlchemy RowMapping.
+                    req = ApprovalRequest(
+                        request_id=row["request_id"],
+                        agent_id=row["agent_id"],
+                        kind=row["kind"],
+                        action_hash=row["action_hash"],
+                        token=row["token"],
+                        expires_at=row["expires_at"],
+                        payload=row["payload_json"] or {},
+                    )
+                    await on_commit(req)
+        except ApprovalTokenError:
+            # The on_commit hook can raise ApprovalTokenError deliberately
+            # (e.g. signalling an audit store contract violation). Let it
+            # propagate untouched so callers get the real error, not the
+            # generic "postgres gates.resolve failed" wrapper below.
+            raise
         except Exception as exc:
-            raise ApprovalTokenError(
-                f"postgres gates.resolve failed: {type(exc).__name__}"
-            ) from exc
+            if already_resolved_without_row:
+                # Will raise the right-shape error in the distinguish
+                # block below; don't mask with the generic wrapper.
+                row = None
+            else:
+                raise ApprovalTokenError(
+                    f"postgres gates.resolve failed: {type(exc).__name__}"
+                ) from exc
 
         if row is None:
             # Either unknown request_id or already resolved. Distinguish.

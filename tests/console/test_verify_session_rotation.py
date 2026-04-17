@@ -352,3 +352,239 @@ async def test_missing_historical_key_material_surfaces_as_unverified() -> None:
     assert result["events"][0]["verified"] is False
     assert result["verified"] is False
     assert result["first_failure"] == str(pre_event_id)
+
+
+@pytest.mark.asyncio
+async def test_rotation_marker_tampered_hmac_next_is_detected() -> None:
+    """v0.6.2 P0 Bug #1: rotation marker rows MUST be dual-MAC verified.
+
+    Pre-fix, ``verify_session_chain`` routed every row through
+    ``verify_event``, which only checks ``hmac_value`` under one key.
+    A rotation marker's ``hmac_next`` column (the second MAC, anchored
+    under the incoming key) was never checked by the session drawer.
+    An attacker who tampered with ``hmac_next`` to redirect the chain
+    to a key they controlled would NOT be flagged.
+
+    Fix: mark rotation-marker rows and route them through
+    ``verify_rotation_marker`` (dual-MAC). This test corrupts
+    ``hmac_next`` only; if the endpoint still returns verified=True,
+    it regressed to the pre-fix single-key path.
+    """
+    import base64
+    import os
+
+    from codeatelier_governance.audit.chain import (
+        KEY_ROTATION_KIND,
+        compute_rotation_marker_macs,
+    )
+    from codeatelier_governance.console import app as console_app
+
+    outgoing_secret = b"outgoing-secret-is-32-bytes-long"
+    incoming_secret = b"incoming-secret-is-32-bytes-long"
+    assert len(outgoing_secret) == 32 and len(incoming_secret) == 32
+
+    session_id = uuid4()
+    marker_event_id = uuid4()
+    created_at = datetime(2026, 4, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Build a genuine rotation marker: dual-signed under outgoing +
+    # incoming. Canonical MACs via the real helper.
+    outgoing_mac, incoming_mac = compute_rotation_marker_macs(
+        outgoing_secret=outgoing_secret,
+        incoming_secret=incoming_secret,
+        event_id=marker_event_id,
+        session_id=session_id,
+        agent_id="agent-rotator",
+        parent_event_id=None,
+        metadata={"reason": "scheduled-rotation"},
+        prev_hash=None,
+        created_at=created_at,
+    )
+
+    # Corrupt hmac_next. A pre-fix endpoint reads only hmac_value, so
+    # it would still return verified=True. A correct post-fix endpoint
+    # routes rotation markers through verify_rotation_marker and MUST
+    # flag this as verified=False.
+    # Flip the first nibble deterministically so the tamper is guaranteed
+    # to differ from the original MAC (avoids the "00..." self-collision).
+    first = incoming_mac[0]
+    tampered_first = "f" if first != "f" else "0"
+    tampered_hmac_next = tampered_first + incoming_mac[1:]
+    assert tampered_hmac_next != incoming_mac
+
+    rows = [
+        {
+            "chain_seq": 10,
+            "event_id": marker_event_id,
+            "session_id": session_id,
+            "agent_id": "agent-rotator",
+            "parent_event_id": None,
+            "kind": KEY_ROTATION_KIND,
+            "model": None,
+            "input_hash": None,
+            "output_hash": None,
+            "metadata_json": {"reason": "scheduled-rotation"},
+            "prev_hash": None,
+            "hmac_value": outgoing_mac,      # outgoing MAC intact
+            "hmac_next": tampered_hmac_next,  # incoming MAC tampered
+            "created_at": created_at,
+        }
+    ]
+
+    outgoing_fp = fingerprint_key(outgoing_secret)
+    incoming_fp = fingerprint_key(incoming_secret)
+    # Off-by-one rule (see tests/audit/test_chain_rotation.py): marker
+    # at chain_seq=N is the LAST row of the OUTGOING segment. So
+    # outgoing.retired_at = N+1 and incoming.activated_at = N+1.
+    key_versions = [
+        {
+            "key_version": 1,
+            "fingerprint": outgoing_fp,
+            "activated_at_chain_seq": 1,
+            "retired_at_chain_seq": 11,  # outgoing covers 1..10 (includes marker)
+        },
+        {
+            "key_version": 2,
+            "fingerprint": incoming_fp,
+            "activated_at_chain_seq": 11,  # incoming starts right after the marker
+            "retired_at_chain_seq": None,
+        },
+    ]
+
+    engine = _build_engine_mock(rows, key_versions=key_versions)
+
+    # Current AUDIT_SECRET = incoming (post-rotation). Outgoing is
+    # provisioned via GOVERNANCE_CHAIN_KEY_<fp16> env var.
+    env_name = f"GOVERNANCE_CHAIN_KEY_{outgoing_fp[:16]}"
+    os.environ[env_name] = "env://_TEST_OUTGOING_TAMPER_RAW_b64"
+    os.environ["_TEST_OUTGOING_TAMPER_RAW_b64"] = base64.b64encode(
+        outgoing_secret
+    ).decode("ascii")
+
+    from codeatelier_governance.audit.keys import clear_key_cache
+
+    clear_key_cache()
+
+    try:
+        with patch.object(
+            console_app, "AUDIT_SECRET", incoming_secret.decode("utf-8")
+        ), patch.object(console_app, "engine", engine):
+            result = await console_app.verify_session_chain(session_id)
+    finally:
+        os.environ.pop(env_name, None)
+        os.environ.pop("_TEST_OUTGOING_TAMPER_RAW_b64", None)
+        clear_key_cache()
+
+    # Core assertion: the handler MUST detect the tamper. Pre-fix this
+    # returns verified=True (only hmac_value is checked).
+    assert result["verified"] is False, (
+        "rotation marker with tampered hmac_next was accepted — "
+        "verify_session_chain is not routing markers through "
+        "verify_rotation_marker (dual-MAC check)"
+    )
+    assert result["event_count"] == 1
+    assert result["events"][0]["verified"] is False
+    assert result["first_failure"] == str(marker_event_id)
+    # Failure reason must identify this as a rotation-marker problem,
+    # not a generic hmac mismatch (operator needs the signal).
+    reason = result["events"][0].get("failure_reason")
+    assert reason is not None and "rotation" in reason.lower(), (
+        f"expected a rotation-specific failure_reason, got {reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rotation_marker_intact_still_verifies() -> None:
+    """Sanity check: a well-formed dual-MAC marker still verifies.
+
+    Without this companion test, the tamper-detection test above could
+    be passing for the wrong reason (e.g. all markers rejected).
+    """
+    import base64
+    import os
+
+    from codeatelier_governance.audit.chain import (
+        KEY_ROTATION_KIND,
+        compute_rotation_marker_macs,
+    )
+    from codeatelier_governance.console import app as console_app
+
+    outgoing_secret = b"outgoing-secret-is-32-bytes-long"
+    incoming_secret = b"incoming-secret-is-32-bytes-long"
+
+    session_id = uuid4()
+    marker_event_id = uuid4()
+    created_at = datetime(2026, 4, 16, 12, 0, 0, tzinfo=timezone.utc)
+
+    outgoing_mac, incoming_mac = compute_rotation_marker_macs(
+        outgoing_secret=outgoing_secret,
+        incoming_secret=incoming_secret,
+        event_id=marker_event_id,
+        session_id=session_id,
+        agent_id="agent-rotator",
+        parent_event_id=None,
+        metadata={"reason": "scheduled-rotation"},
+        prev_hash=None,
+        created_at=created_at,
+    )
+
+    rows = [
+        {
+            "chain_seq": 10,
+            "event_id": marker_event_id,
+            "session_id": session_id,
+            "agent_id": "agent-rotator",
+            "parent_event_id": None,
+            "kind": KEY_ROTATION_KIND,
+            "model": None,
+            "input_hash": None,
+            "output_hash": None,
+            "metadata_json": {"reason": "scheduled-rotation"},
+            "prev_hash": None,
+            "hmac_value": outgoing_mac,
+            "hmac_next": incoming_mac,  # intact
+            "created_at": created_at,
+        }
+    ]
+
+    outgoing_fp = fingerprint_key(outgoing_secret)
+    incoming_fp = fingerprint_key(incoming_secret)
+    key_versions = [
+        {
+            "key_version": 1,
+            "fingerprint": outgoing_fp,
+            "activated_at_chain_seq": 1,
+            "retired_at_chain_seq": 11,
+        },
+        {
+            "key_version": 2,
+            "fingerprint": incoming_fp,
+            "activated_at_chain_seq": 11,
+            "retired_at_chain_seq": None,
+        },
+    ]
+
+    engine = _build_engine_mock(rows, key_versions=key_versions)
+
+    env_name = f"GOVERNANCE_CHAIN_KEY_{outgoing_fp[:16]}"
+    os.environ[env_name] = "env://_TEST_OUTGOING_INTACT_RAW_b64"
+    os.environ["_TEST_OUTGOING_INTACT_RAW_b64"] = base64.b64encode(
+        outgoing_secret
+    ).decode("ascii")
+
+    from codeatelier_governance.audit.keys import clear_key_cache
+
+    clear_key_cache()
+
+    try:
+        with patch.object(
+            console_app, "AUDIT_SECRET", incoming_secret.decode("utf-8")
+        ), patch.object(console_app, "engine", engine):
+            result = await console_app.verify_session_chain(session_id)
+    finally:
+        os.environ.pop(env_name, None)
+        os.environ.pop("_TEST_OUTGOING_INTACT_RAW_b64", None)
+        clear_key_cache()
+
+    assert result["verified"] is True
+    assert result["events"][0]["verified"] is True

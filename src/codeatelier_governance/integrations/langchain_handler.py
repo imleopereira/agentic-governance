@@ -80,6 +80,11 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
         self._enforce = enforce
         self._session_id = session_id if session_id is not None else uuid4()
         self._last_model: str | None = None
+        # v0.6.2 followup: rate-limit unknown-model warnings to one per
+        # unique model name per handler lifetime. Per-handler set keeps
+        # noise floor bounded even when LangChain callbacks fire many
+        # times per second. Resetting requires building a new handler.
+        self._unknown_model_warned: set[str] = set()
 
     # -- helpers ---------------------------------------------------------------
 
@@ -140,6 +145,74 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
                 tool=tool_name,
                 error_type=type(exc).__name__,
             )
+
+    def _estimate_cost_safe(
+        self, model: str, prompt_tokens: int, completion_tokens: int,
+    ) -> float:
+        """Estimate USD cost but never raise.
+
+        v0.6.2 followup (upgrade-breaker fix): CostModule default flipped
+        to ``strict_unknown_models=True``. Before this helper existed, the
+        LangChain handler called ``estimate_cost(model, in, out)`` with
+        the positional default (strict=True), so every customer with a
+        fine-tuned model name (``my-ft-gpt4``) started crashing inside
+        the callback on every token-usage event.
+
+        Handler invariant: never raise to LangChain. This helper forces
+        ``strict=False`` and inherits the SDK's CostModule opt-in
+        ``unknown_model_fallback_usd_per_million`` when cost module is
+        enabled; falls back to 0.0 otherwise. Emits a structlog warning
+        ``governance.langchain_handler.unknown_model`` at most once per
+        unique model name per handler instance.
+        """
+        from codeatelier_governance.cost.errors import UnknownModelError
+        from codeatelier_governance.cost.pricing import (
+            MODEL_PRICING,
+            estimate_cost,
+        )
+
+        fallback: float = 0.0
+        cost_mod = getattr(self._sdk, "cost", None)
+        if cost_mod is not None:
+            configured = getattr(
+                cost_mod, "_unknown_model_fallback_usd_per_million", None,
+            )
+            if configured is not None:
+                fallback = float(configured)
+
+        # Detect unknown model at handler level so we can emit a
+        # rate-limited handler-scoped warning (one per unique model per
+        # handler instance). The pricing module's own warning fires per
+        # call in lax mode; ours is the noise-floor signal operators read.
+        is_known = any(model.startswith(known) for known in MODEL_PRICING)
+        if not is_known and model not in self._unknown_model_warned:
+            self._unknown_model_warned.add(model)
+            logger.warning(
+                "governance.langchain_handler.unknown_model",
+                model=model,
+                agent_id=self._agent_id,
+                fallback_usd_per_million=fallback,
+            )
+
+        try:
+            return estimate_cost(
+                model,
+                prompt_tokens,
+                completion_tokens,
+                strict=False,
+                fallback_usd_per_million=fallback,
+            )
+        except UnknownModelError:
+            # strict=False should never raise, but defense-in-depth: an
+            # observation surface NEVER crashes the host callback.
+            return 0.0
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "governance.langchain_handler.estimate_cost_failed",
+                model=model,
+                error_type=type(exc).__name__,
+            )
+            return 0.0
 
     async def _cost_track(self, tokens: int, usd: float) -> None:
         """Track cost, swallowing all errors."""
@@ -243,11 +316,14 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             total_tokens = int(token_usage.get("total_tokens", 0))
             usd = 0.0
             if self._last_model and total_tokens > 0:
-                from codeatelier_governance.cost.pricing import estimate_cost
-
                 prompt_tokens = int(token_usage.get("prompt_tokens", 0))
                 completion_tokens = int(token_usage.get("completion_tokens", 0))
-                usd = estimate_cost(self._last_model, prompt_tokens, completion_tokens)
+                # v0.6.2 followup: use safe helper. strict=True default on
+                # estimate_cost would raise UnknownModelError for fine-tuned
+                # names, crashing LangChain's callback on every token event.
+                usd = self._estimate_cost_safe(
+                    self._last_model, prompt_tokens, completion_tokens,
+                )
             _run_async(
                 self._audit_log("llm.result", {"token_usage": token_usage})
             )
@@ -439,11 +515,12 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             total_tokens = int(token_usage.get("total_tokens", 0))
             usd = 0.0
             if self._last_model and total_tokens > 0:
-                from codeatelier_governance.cost.pricing import estimate_cost
-
                 prompt_tokens = int(token_usage.get("prompt_tokens", 0))
                 completion_tokens = int(token_usage.get("completion_tokens", 0))
-                usd = estimate_cost(self._last_model, prompt_tokens, completion_tokens)
+                # v0.6.2 followup: use safe helper (see on_llm_end rationale).
+                usd = self._estimate_cost_safe(
+                    self._last_model, prompt_tokens, completion_tokens,
+                )
             # Run audit log + cost track concurrently (both are observation surfaces)
             coros: list[Any] = [self._audit_log("llm.result", {"token_usage": token_usage})]
             if total_tokens > 0:

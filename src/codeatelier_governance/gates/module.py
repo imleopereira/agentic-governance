@@ -23,8 +23,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import hmac
 import inspect
 import json
+import os
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
@@ -53,6 +55,29 @@ DEFAULT_EXPIRES_IN = timedelta(hours=1)
 MIN_GATES_SECRET_BYTES = 32
 MAX_PAYLOAD_BYTES = 64 * 1024
 
+# v0.6.2-followup — downgrade-safe default for v2 tokens.
+#
+# v0.6.2 introduced the v2 (rotation-aware, key-fingerprint-embedded)
+# token format. Minting v2 by default breaks rolling-deploy scenarios
+# where a v0.6.1 pod is still handling grant/deny for tokens minted by
+# an adjacent v0.6.2 pod: the v0.6.1 parser sees a leading ``v2:<hex>:``
+# and chokes on the UUID parse of the "v2" literal → ``bad request_id``.
+#
+# v0.6.2 ships with ``enable_v2_tokens=False`` default — v2 VERIFICATION
+# still works (back-compat for anyone who minted v2 before the flag
+# existed) but new tokens are minted in v1 format. Flip flips to True in
+# v0.6.3 once all rolling-deploy windows are expected to be ≥v0.6.2.
+DEFAULT_ENABLE_V2_TOKENS = False
+
+# v0.6.2 release date + 90 days. Beyond this cutoff, legacy v1 tokens
+# are REJECTED with TokenVersionTooOldError (closes the "v1 forgery
+# works forever if the secret ever leaks" gap). Operators can override
+# via GOVERNANCE_GATES_ACCEPT_V1_UNTIL=<ISO date> for disaster-recovery.
+# The override is logged at construction time so post-hoc audits can
+# see it was applied.
+_V062_RELEASE_DATE = datetime(2026, 4, 17, tzinfo=timezone.utc)
+DEFAULT_ACCEPT_V1_UNTIL = _V062_RELEASE_DATE + timedelta(days=90)
+
 
 def _hash_action_payload(value: Any) -> str:
     """Stable SHA-256 hash of the action payload, capped at 64 KiB."""
@@ -77,6 +102,8 @@ class GatesModule:
         default_expires_in: timedelta = DEFAULT_EXPIRES_IN,
         store: GatesStore | None = None,
         poll_interval_s: float = 0.5,
+        enable_v2_tokens: bool | None = None,
+        accept_v1_until: datetime | None = None,
     ) -> None:
         from ..audit.module import _check_secret_strength
 
@@ -86,6 +113,66 @@ class GatesModule:
         self._default_expires_in = default_expires_in
         self._store: GatesStore = store or InMemoryGatesStore()
         self._poll_interval_s = poll_interval_s
+        # v0.6.2-followup: downgrade-safe token format.
+        # Env var is read here (not at module import time) per the
+        # project memory rule against module-level os.environ capture
+        # (feedback_no_module_level_env_capture.md). Constructor arg
+        # wins; env var is the deployment escape hatch.
+        if enable_v2_tokens is None:
+            env_flag = os.environ.get(
+                "GOVERNANCE_GATES_ENABLE_V2_TOKENS", ""
+            ).strip().lower()
+            if env_flag in ("1", "true", "yes"):
+                enable_v2_tokens = True
+                logger.info(
+                    "gates.v2_tokens_enabled_via_env",
+                    detail=(
+                        "GOVERNANCE_GATES_ENABLE_V2_TOKENS=true — "
+                        "minting v2 (rotation-aware) tokens. Ensure "
+                        "all deployed pods are on v0.6.2+."
+                    ),
+                )
+            else:
+                enable_v2_tokens = DEFAULT_ENABLE_V2_TOKENS
+        self._enable_v2_tokens = enable_v2_tokens
+        # v1 sunset. Constructor arg > env var > default-90d-post-v0.6.2.
+        if accept_v1_until is None:
+            env_until = os.environ.get(
+                "GOVERNANCE_GATES_ACCEPT_V1_UNTIL", ""
+            ).strip()
+            if env_until:
+                try:
+                    parsed = datetime.fromisoformat(env_until)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    accept_v1_until = parsed
+                    logger.warning(
+                        "gates.v1_sunset_overridden",
+                        new_sunset=parsed.isoformat(),
+                        default_sunset=DEFAULT_ACCEPT_V1_UNTIL.isoformat(),
+                        detail=(
+                            "GOVERNANCE_GATES_ACCEPT_V1_UNTIL override "
+                            "active — v1 legacy tokens accepted past "
+                            "the default cutoff. Grants issued during "
+                            "this window are still single-use and HMAC-"
+                            "verified; the override only delays the "
+                            "TokenVersionTooOldError gate."
+                        ),
+                    )
+                except ValueError:
+                    logger.error(
+                        "gates.v1_sunset_override_malformed",
+                        raw_value=env_until,
+                        detail=(
+                            "GOVERNANCE_GATES_ACCEPT_V1_UNTIL is not "
+                            "parseable as ISO-8601 — falling back to "
+                            "default sunset."
+                        ),
+                    )
+                    accept_v1_until = DEFAULT_ACCEPT_V1_UNTIL
+            else:
+                accept_v1_until = DEFAULT_ACCEPT_V1_UNTIL
+        self._accept_v1_until = accept_v1_until
         # Optional reference to PresenceModule for the v0.5.4 halt switch.
         # Wired by GovernanceSDK after construction via set_presence_module().
         # If None, the agent-facing gate methods (request / wait_for) run
@@ -153,6 +240,7 @@ class GatesModule:
             request_id=request_id,
             action_hash=action_hash,
             expires_at=expires_at,
+            use_v2=self._enable_v2_tokens,
         )
         req = ApprovalRequest(
             request_id=request_id,
@@ -200,27 +288,78 @@ class GatesModule:
 
     async def _resolve(self, token: str, *, granted: bool) -> None:
         request_id, action_hash, _expires = parse_token(
-            secret=self._secret, token=token
+            secret=self._secret,
+            token=token,
+            accept_v1_until=self._accept_v1_until,
         )
-        # Verify action_hash by re-fetching the pending row.
+        # Verify action_hash by re-fetching the pending row. Defense in
+        # depth: parse_token already HMAC-binds the action_hash, but we
+        # cross-check against the persisted copy so a swapped hash in
+        # the pending row (via a compromised DB path) still aborts the
+        # resolve. compare_digest keeps crypto-hygiene consistent with
+        # the audit chain.
         pending = await self._store.get_pending(request_id)
-        if pending is not None and pending.action_hash != action_hash:
+        if pending is not None and not hmac.compare_digest(
+            pending.action_hash, action_hash
+        ):
             raise ApprovalTokenError(
                 "approval token: action_hash mismatch"
             )
-        # Atomic resolution at the store layer (single-use guard).
-        req = await self._store.resolve(
-            request_id, "granted" if granted else "denied"
-        )
-        await self._audit.log(
-            AuditEvent(
-                agent_id=req.agent_id,
-                kind="approval.granted" if granted else "approval.denied",
-                metadata={
-                    "request_id": str(request_id),
-                    "approval_kind": req.kind,
-                },
+        # v0.6.2 P0 "atomicity" (actually: SERIALIZED, window-tight).
+        # Pre-fix ordering was:
+        #     1. self._store.resolve(...)   ← DB commit A
+        #     2. await self._audit.log(...) ← separate DB round-trip B
+        # A worker crash between the two left the gate resolved WITHOUT
+        # an audit row — Article 12 export silently missing the
+        # decision. Anti-pattern called out in .agents/swe.md as
+        # "'Check + write audit' pairs outside a single transaction".
+        #
+        # Fix: run the audit write inside an ``on_commit`` hook supplied
+        # to ``resolve``. The store executes the hook inside its atomic
+        # unit (asyncio lock for InMemory, engine.begin() txn for
+        # Postgres) BEFORE persisting the resolution. If the hook raises,
+        # the resolution is NOT persisted and the pending row stays
+        # intact so the operator can retry with the same token.
+        #
+        # v0.6.2-followup residual risk (KNOWN, DOCUMENTED, TESTED):
+        # The audit write goes through ``AuditModule.log`` which uses
+        # the AUDIT engine's ``insert_with_chain_lock`` — a real DB
+        # round-trip that commits before returning. This is good: the
+        # audit row is durable before ``on_commit`` returns. HOWEVER,
+        # gates and audit run on SEPARATE engines with SEPARATE txns.
+        # The remaining narrow window is:
+        #
+        #     audit txn COMMITs  ← audit row durable
+        #     ... <network blip, OOM, pod SIGKILL> ...
+        #     gates txn COMMIT fails at engine.begin() __aexit__
+        #
+        # Post-fix window = one DB round-trip on a healthy connection
+        # (vs pre-fix window of "BatchingWriter queue depth + 100ms
+        # flush interval"). ~4 orders of magnitude narrower. The reverse
+        # failure produces a GHOST audit row (approval.granted logged)
+        # for a gate that stayed pending. A retry with the same token
+        # will succeed and emit a SECOND audit row — the chain will
+        # record two ``approval.granted`` events for one request_id.
+        # Operators detecting this pattern in the chain should
+        # investigate the adjacent session for a failed commit event.
+        # See tests/gates/test_atomicity_engine_rollback.py for the
+        # characterization test documenting this exact window.
+        async def _emit_audit(req: ApprovalRequest) -> None:
+            await self._audit.log(
+                AuditEvent(
+                    agent_id=req.agent_id,
+                    kind="approval.granted" if granted else "approval.denied",
+                    metadata={
+                        "request_id": str(request_id),
+                        "approval_kind": req.kind,
+                    },
+                )
             )
+
+        await self._store.resolve(
+            request_id,
+            "granted" if granted else "denied",
+            on_commit=_emit_audit,
         )
 
     async def wait_for(self, request_id: UUID, timeout: float) -> bool:

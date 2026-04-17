@@ -72,10 +72,14 @@ async def test_revocation_emits_chain_row() -> None:
 
 
 @pytest.mark.asyncio
-async def test_revocation_survives_chain_write_failure() -> None:
-    """If the chain write fails, the revocation still lands in the mirror so
-    runtime enforcement (``is_revoked_at``) keeps working. A WARN is logged;
-    no exception leaks into caller code.
+async def test_revocation_survives_chain_write_failure_in_lax_mode() -> None:
+    """v0.6.2 Bug #9: strict_chain=False preserves the v0.6.1 degraded
+    behavior. If the chain write fails, the revocation still lands in the
+    mirror so runtime enforcement (``is_revoked_at``) keeps working. A
+    distinct WARN is logged; no exception leaks into caller code.
+
+    v0.6.2 flipped the default to strict_chain=True — tests must pass the
+    opt-in explicitly.
     """
     class _BrokenAudit:
         """Audit surface whose .log() always raises."""
@@ -85,7 +89,7 @@ async def test_revocation_survives_chain_write_failure() -> None:
         async def log(self, event):  # type: ignore[no-untyped-def]
             raise RuntimeError("audit substrate unreachable")
 
-    revocations = RevocationStore()
+    revocations = RevocationStore(strict_chain=False)
     record = await revocations.revoke_with_chain_event(
         audit_module=_BrokenAudit(),
         key_fingerprint="a" * 64,

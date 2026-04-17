@@ -51,7 +51,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from ..audit.chain import canonical_json, verify_event
+from ..audit.chain import (
+    KEY_ROTATION_KIND,
+    ChainVerifyRow,
+    RotationMarkerRow,
+    canonical_json,
+    verify_event,
+    verify_rotation_marker,
+)
 from ..audit.keys import KeyVersion
 from ..audit.models import AuditEvent, AuditEventRecord
 from ..audit.module import AuditModule
@@ -1216,22 +1223,20 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
     secret = AUDIT_SECRET.encode("utf-8")
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
-    async with engine.connect() as conn:
-        res = await conn.execute(
-            text(
-                "SELECT chain_seq, event_id, session_id, agent_id, parent_event_id, "
-                "kind, model, input_hash, output_hash, metadata_json, "
-                "prev_hash, hmac_value, hmac_next, created_at "
-                "FROM governance_audit_events "
-                "WHERE session_id = :sid ORDER BY chain_seq"
-            ),
-            {"sid": str(session_id)},
-        )
-        rows = list(res.mappings())
 
-        # Load registered key versions — if any exist, go down the
-        # rotation-aware path. Table may not exist on pre-v0.6 deployments
-        # that skipped the F6 Track B migration; treat as empty.
+    # Bug #6 (P0): a 600k-event session previously loaded the entire row
+    # set into memory and HMAC'd each row on the event loop. Here we
+    # window the SELECT by chain_seq keyset and hand the synchronous
+    # HMAC chunks to ``asyncio.to_thread`` so the loop keeps serving
+    # other requests. External semantics are unchanged: one verdict,
+    # one ``events`` list, same ``first_failure`` contract.
+    CHUNK_SIZE = 10000
+
+    async with engine.connect() as conn:
+        # Load registered key versions up front — if any exist, we go
+        # down the rotation-aware path. Table may not exist on pre-v0.6
+        # deployments that skipped the F6 Track B migration; treat as
+        # empty.
         key_versions: list[KeyVersion] = []
         try:
             kv_res = await conn.execute(
@@ -1258,118 +1263,286 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 — table absent on old deployments
             key_versions = []
 
-    if not rows:
+        # Build uri_map once for the rotation-aware path (see below).
+        # Done outside the chunk loop so we don't re-scan env per chunk.
+        uri_map: dict[str, str] = {}
+        current_fp: str | None = None
+        if key_versions:
+            from ..audit.keys import fingerprint_key as _fingerprint_key
+
+            current_fp = _fingerprint_key(secret)
+            for kv in key_versions:
+                prefix = kv.fingerprint[:16]
+                env_name = f"GOVERNANCE_CHAIN_KEY_{prefix}"
+                uri = os.environ.get(env_name)
+                if uri:
+                    uri_map[kv.fingerprint] = uri
+            # The current secret is resolved directly by the worker
+            # (via ``current_fp`` short-circuit) — no uri_map entry
+            # needed for it. Historical keys MUST come from operator-
+            # provisioned env vars; anything missing surfaces as
+            # ``verified=False`` (fail-closed, matches pre-fix semantics).
+
+        results: list[dict[str, Any]] = []
+        all_ok = True
+        first_failure_event: str | None = None
+        first_failure_reason: str | None = None
+        total_events = 0
+        last_chain_seq = -1
+
+        # Keyset pagination over chain_seq (unique within a session per
+        # the append-only invariant). LIMIT is bounded per chunk; the
+        # loop terminates when a chunk returns fewer rows than CHUNK_SIZE.
+        while True:
+            res = await conn.execute(
+                text(
+                    "SELECT chain_seq, event_id, session_id, agent_id, "
+                    "parent_event_id, kind, model, input_hash, output_hash, "
+                    "metadata_json, prev_hash, hmac_value, hmac_next, created_at "
+                    "FROM governance_audit_events "
+                    "WHERE session_id = :sid AND chain_seq > :last_seq "
+                    "ORDER BY chain_seq LIMIT :chunk"
+                ),
+                {
+                    "sid": str(session_id),
+                    "last_seq": last_chain_seq,
+                    "chunk": CHUNK_SIZE,
+                },
+            )
+            chunk_rows = list(res.mappings())
+            if not chunk_rows:
+                break
+
+            # Snapshot chunk rows into ChainVerifyRow-shaped tuples for
+            # the worker thread. Doing this on the event loop is cheap
+            # (no HMAC) and keeps the heavy work pure-CPU in the thread.
+            chunk_records: list[ChainVerifyRow] = []
+            for row in chunk_rows:
+                record = AuditEventRecord(
+                    event_id=row["event_id"],
+                    session_id=row["session_id"],
+                    agent_id=row["agent_id"],
+                    parent_event_id=row["parent_event_id"],
+                    kind=row["kind"],
+                    model=row["model"],
+                    input_hash=row["input_hash"],
+                    output_hash=row["output_hash"],
+                    metadata=row["metadata_json"] or {},
+                    prev_hash=row["prev_hash"],
+                    hmac=row["hmac_value"],
+                    created_at=row["created_at"],
+                )
+                cs = int(row["chain_seq"]) if row.get("chain_seq") is not None else 0
+                chunk_records.append(
+                    ChainVerifyRow(
+                        chain_seq=cs,
+                        record=record,
+                        hmac_next=row.get("hmac_next"),
+                    )
+                )
+                last_chain_seq = max(last_chain_seq, cs)
+
+            # Offload the sync HMAC work to a thread. Both paths are
+            # pure-CPU with no DB access inside the worker.
+            chunk_results = await asyncio.to_thread(
+                _verify_chunk,
+                chunk_records,
+                secret,
+                key_versions,
+                uri_map,
+                current_fp,
+            )
+
+            for entry in chunk_results:
+                results.append(entry)
+                if not entry["verified"]:
+                    if all_ok:
+                        first_failure_event = entry["event_id"]
+                        first_failure_reason = entry.get("failure_reason")
+                    all_ok = False
+
+            total_events += len(chunk_rows)
+
+            if len(chunk_rows) < CHUNK_SIZE:
+                break
+
+    if total_events == 0:
         return {"session_id": str(session_id), "event_count": 0, "verified": True}
 
-    # Build records once; both paths reuse them.
-    records: list[tuple[int, AuditEventRecord, str | None]] = []
-    for row in rows:
-        record = AuditEventRecord(
-            event_id=row["event_id"],
-            session_id=row["session_id"],
-            agent_id=row["agent_id"],
-            parent_event_id=row["parent_event_id"],
-            kind=row["kind"],
-            model=row["model"],
-            input_hash=row["input_hash"],
-            output_hash=row["output_hash"],
-            metadata=row["metadata_json"] or {},
-            prev_hash=row["prev_hash"],
-            hmac=row["hmac_value"],
-            created_at=row["created_at"],
-        )
-        chain_seq = int(row["chain_seq"]) if row.get("chain_seq") is not None else 0
-        hmac_next = row.get("hmac_next")
-        records.append((chain_seq, record, hmac_next))
+    out: dict[str, Any] = {
+        "session_id": str(session_id),
+        "event_count": total_events,
+        "verified": all_ok,
+        "events": results,
+        "first_failure": first_failure_event,
+    }
+    if first_failure_reason is not None:
+        out["first_failure_reason"] = first_failure_reason
+    return out
 
-    results: list[dict[str, Any]] = []
-    all_ok = True
+
+def _verify_chunk(
+    rows: list[ChainVerifyRow],
+    secret: bytes,
+    key_versions: list[KeyVersion],
+    uri_map: dict[str, str],
+    current_fp: str | None,
+) -> list[dict[str, Any]]:
+    """Verify one chunk of session rows. Synchronous; called via ``to_thread``.
+
+    - Bug #1 (P0): rotation marker rows (``kind == KEY_ROTATION_KIND``)
+      are dual-MAC verified via ``verify_rotation_marker`` / the shared
+      ``verify_chain_with_rotation`` helper. Previously these rows were
+      routed through ``verify_event`` which only checks ``hmac_value``
+      under one key — tampering with ``hmac_next`` slipped through.
+    - Bug #6 (P0): this function is pure-CPU; callers hand it to
+      ``asyncio.to_thread`` so the event loop is not starved on multi-
+      thousand-event sessions.
+
+    NOTE (post-wave refactor): the rotation-aware inline fallback below
+    duplicates a slice of ``verify_chain_with_rotation``. Intentionally
+    kept inline this wave rather than extracting a shared helper —
+    Tracks B/C/D are editing parallel files and a shared refactor
+    mid-wave would collide (project memory: no-mid-wave-shared-helper).
+    """
+    out: list[dict[str, Any]] = []
 
     if key_versions:
-        # Rotation-aware path: resolve each event under the key active at
-        # its chain_seq. We build an in-memory ``fingerprint -> bytes``
-        # map rather than routing through the uri_map machinery: the
-        # current AUDIT_SECRET material is already in hand and operator-
-        # provisioned historical keys come from
-        # ``GOVERNANCE_CHAIN_KEY_<prefix>`` env vars that
-        # ``audit.keys.resolve_key`` understands.
+        # Rotation-aware path — delegate to the canonical helper so that
+        # rotation markers get dual-MAC checked. The helper returns only
+        # summary counters, so we still need a per-event verdict loop
+        # to feed the UI; re-use its logic row-by-row.
         from ..audit.chain import find_active_key_at_seq
-        from ..audit.keys import (
-            KeyResolution,
-            fingerprint_key,
-            resolve_key,
+        from ..audit.keys import KeyResolution, resolve_key
+
+        sorted_versions = sorted(
+            key_versions, key=lambda k: k.activated_at_chain_seq
         )
 
-        # Build a uri_map from operator-provisioned env vars for
-        # historical keys that are NOT the current secret.
-        current_fp = fingerprint_key(secret)
-        uri_map: dict[str, str] = {}
-        for kv in key_versions:
-            if kv.fingerprint == current_fp:
-                continue  # current secret is resolved directly, below
-            prefix = kv.fingerprint[:16]
-            env_name = f"GOVERNANCE_CHAIN_KEY_{prefix}"
-            uri = os.environ.get(env_name)
-            if uri:
-                uri_map[kv.fingerprint] = uri
+        for row in rows:
+            rec = row.record
+            cs = row.chain_seq
+            active = find_active_key_at_seq(cs, sorted_versions)
+            ok = False
+            reason: str | None = None
 
-        for cs, rec, _hn in records:
-            active = find_active_key_at_seq(cs, key_versions)
             if active is None:
                 # No registered key covers this seq. Pre-rotation events
                 # on a deployment that only registered post-rotation keys
                 # will land here; fall back to the current secret so we
                 # don't mark legitimate events as broken.
                 ok = verify_event(rec, secret)
-            elif active.fingerprint == current_fp:
-                ok = verify_event(rec, secret)
+                if not ok:
+                    reason = "hmac_mismatch_no_active_key"
             else:
-                resolved = resolve_key(active.fingerprint, uri_map)
-                if (
-                    resolved.status is KeyResolution.RESOLVED
-                    and resolved.material is not None
-                ):
-                    ok = verify_event(rec, resolved.material)
+                # Resolve the active (outgoing) key material. The current
+                # secret short-circuits the uri_map — it isn't stored
+                # there because audit.keys has no raw:// scheme.
+                outgoing_material: bytes | None = None
+                if current_fp is not None and active.fingerprint == current_fp:
+                    outgoing_material = secret
                 else:
-                    # Historical key material not mounted — the chain
-                    # cannot be verified for this row. Surface as False
-                    # (matches pre-v0.6.2 session-drawer semantics) and
-                    # keep first_failure accurate for the UI.
+                    resolved = resolve_key(active.fingerprint, uri_map)
+                    if (
+                        resolved.status is KeyResolution.RESOLVED
+                        and resolved.material is not None
+                    ):
+                        outgoing_material = resolved.material
+
+                if outgoing_material is None:
                     ok = False
-            if not ok:
-                all_ok = False
-            results.append(
-                {
-                    "event_id": str(rec.event_id),
-                    "kind": rec.kind,
-                    "verified": ok,
-                }
-            )
+                    reason = f"unresolved_key:{active.fingerprint[:16]}"
+                elif (
+                    rec.kind == KEY_ROTATION_KIND
+                    and row.hmac_next is not None
+                ):
+                    # Bug #1 fix: rotation marker → dual-MAC verify.
+                    incoming_version = find_active_key_at_seq(
+                        cs + 1, sorted_versions
+                    )
+                    if (
+                        incoming_version is None
+                        or incoming_version.fingerprint == active.fingerprint
+                    ):
+                        ok = False
+                        reason = "rotation_marker_no_incoming_key"
+                    else:
+                        incoming_material: bytes | None = None
+                        if (
+                            current_fp is not None
+                            and incoming_version.fingerprint == current_fp
+                        ):
+                            incoming_material = secret
+                        else:
+                            incoming = resolve_key(
+                                incoming_version.fingerprint, uri_map
+                            )
+                            if (
+                                incoming.status is KeyResolution.RESOLVED
+                                and incoming.material is not None
+                            ):
+                                incoming_material = incoming.material
+
+                        if incoming_material is None:
+                            ok = False
+                            reason = (
+                                "rotation_marker_unresolved_incoming:"
+                                f"{incoming_version.fingerprint[:16]}"
+                            )
+                        else:
+                            marker = RotationMarkerRow(
+                                record=rec,
+                                hmac_next=row.hmac_next or "",
+                                outgoing_fingerprint=active.fingerprint,
+                                incoming_fingerprint=incoming_version.fingerprint,
+                            )
+                            ok = verify_rotation_marker(
+                                marker,
+                                outgoing_secret=outgoing_material,
+                                incoming_secret=incoming_material,
+                            )
+                            if not ok:
+                                reason = "rotation_marker_dual_mac_failed"
+                else:
+                    ok = verify_event(rec, outgoing_material)
+                    if not ok:
+                        reason = "hmac_mismatch"
+
+            entry: dict[str, Any] = {
+                "event_id": str(rec.event_id),
+                "kind": rec.kind,
+                "verified": ok,
+            }
+            if reason is not None:
+                entry["failure_reason"] = reason
+            out.append(entry)
     else:
         # Legacy single-key path: no rotation has ever happened on this
         # deployment (governance_audit_chain_keys is empty), so every
-        # row must verify under the current AUDIT_SECRET.
-        for _cs, rec, _hn in records:
-            ok = verify_event(rec, secret)
-            if not ok:
-                all_ok = False
-            results.append(
-                {
-                    "event_id": str(rec.event_id),
-                    "kind": rec.kind,
-                    "verified": ok,
-                }
-            )
+        # row must verify under the current AUDIT_SECRET. A rotation
+        # marker row CAN'T legally exist here (it would have registered
+        # a key version), but defend against a tampered insert anyway.
+        for row in rows:
+            rec = row.record
+            if rec.kind == KEY_ROTATION_KIND and row.hmac_next is not None:
+                # Operator hasn't registered any key versions yet a
+                # rotation marker is present — treat as tamper.
+                ok = False
+                reason = "rotation_marker_without_key_versions"
+            else:
+                ok = verify_event(rec, secret)
+                reason = None if ok else "hmac_mismatch"
 
-    return {
-        "session_id": str(session_id),
-        "event_count": len(rows),
-        "verified": all_ok,
-        "events": results,
-        "first_failure": next(
-            (r["event_id"] for r in results if not r["verified"]), None
-        ),
-    }
+            entry_leg: dict[str, Any] = {
+                "event_id": str(rec.event_id),
+                "kind": rec.kind,
+                "verified": ok,
+            }
+            if reason is not None:
+                entry_leg["failure_reason"] = reason
+            out.append(entry_leg)
+
+    return out
 
 
 @app.get("/api/cost/agents", dependencies=[Depends(authenticate)])
@@ -1432,38 +1605,236 @@ async def cost_sessions(
         ]
 
 
-@app.get("/api/gates/pending", dependencies=[Depends(authenticate), Depends(rate_limit_per_user)])
-async def gates_pending() -> list[dict[str, Any]]:
-    """List all unresolved approval requests."""
+# ---------------------------------------------------------------------------
+# v0.6.2 followup: pending-gates shape is versioned.
+#
+# v0.6.2 changed the response from a plain ``list[GatePending]`` to a paged
+# ``{items, has_more, next_cursor}`` dict on the same URL. External API
+# consumers (CI gate-checkers, cron scripts, customer Python clients)
+# broke silently — a `for g in pending` suddenly iterated dict keys.
+#
+# Fix: keep ``/api/gates/pending`` returning the legacy list shape (capped
+# hard at 500 rows), and add ``/api/v2/gates/pending`` that returns the
+# paged dict. The legacy route emits Deprecation / Sunset / Link headers
+# and logs ``console.gates_pending_deprecated_shape_served`` once per
+# worker process.
+# ---------------------------------------------------------------------------
+
+# Flipped to True after the first legacy-shape request per worker process,
+# so the "deprecated shape served" warning fires once (not per request).
+_GATES_PENDING_LEGACY_WARNED: bool = False
+
+# v0.6.2 followup — ship-blocker: /api/gates/pending had no role check.
+# Any authenticated user (including viewers) could enumerate the cross-agent
+# approval queue — an exfiltration surface. Interim fix for v0.6.2: require
+# admin role on both v1 and v2 routes. v0.6.3 will add a ``reviewer`` role
+# and a per-agent ``reviewer_agent_scope`` table so scoped reviewers can
+# see only their agents' queue. Compensating control: admins are the only
+# role that could ever act on these rows (grant/deny are admin-only at
+# lines 914/947), so restricting read to admin removes the exfiltration
+# surface without breaking any workflow.
+
+
+async def _fetch_pending_gates(
+    limit: int,
+    cursor: str | None,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """Shared SELECT for the v1 and v2 routes.
+
+    Returns ``(items, has_more, next_cursor)`` where ``next_cursor`` is
+    ``None`` when ``has_more`` is False. Clamps ``limit`` to [1, 1000].
+    """
+    # Direct-call fallback: when the handler is invoked by unit tests
+    # (not via the HTTP layer), FastAPI's Query(...) default is not
+    # resolved and ``limit`` arrives as a FieldInfo sentinel. Coerce
+    # to the documented default so both call paths work.
+    if not isinstance(limit, int):
+        limit = 500
+    # Clamp defensively in the direct-call path too (FastAPI enforces
+    # ge/le only on the HTTP layer).
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+
+    cursor_created_at: datetime | None = None
+    cursor_request_id: str | None = None
+    if cursor:
+        try:
+            c_ts, c_rid = cursor.rsplit("|", 1)
+            cursor_created_at = datetime.fromisoformat(c_ts)
+            cursor_request_id = c_rid
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(400, f"Invalid cursor: {exc}") from exc
+
+    fetch_size = limit + 1
+
+    if cursor_created_at is not None and cursor_request_id is not None:
+        query = text(
+            "SELECT request_id, agent_id, kind, action_hash, "
+            "created_at, expires_at, reviewer_id, reviewing_since "
+            "FROM governance_gates_pending "
+            "WHERE resolved_at IS NULL "
+            "AND (created_at < :c_ts "
+            "     OR (created_at = :c_ts AND request_id::text > :c_rid)) "
+            "ORDER BY created_at DESC, request_id "
+            "LIMIT :lim"
+        )
+        params: dict[str, Any] = {
+            "c_ts": cursor_created_at,
+            "c_rid": cursor_request_id,
+            "lim": fetch_size,
+        }
+    else:
+        query = text(
+            "SELECT request_id, agent_id, kind, action_hash, "
+            "created_at, expires_at, reviewer_id, reviewing_since "
+            "FROM governance_gates_pending "
+            "WHERE resolved_at IS NULL "
+            "ORDER BY created_at DESC, request_id "
+            "LIMIT :lim"
+        )
+        params = {"lim": fetch_size}
+
+    async with engine.connect() as conn:  # type: ignore[union-attr]
+        res = await conn.execute(query, params)
+        rows = list(res.mappings())
+
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
+    items = [
+        {
+            "request_id": str(row["request_id"]),
+            "agent_id": row["agent_id"],
+            "kind": row["kind"],
+            "action_hash": row["action_hash"],
+            "created_at": row["created_at"].isoformat()
+            if row["created_at"] else None,
+            "expires_at": row["expires_at"].isoformat()
+            if row["expires_at"] else None,
+            "reviewer_id": str(row["reviewer_id"])
+            if row["reviewer_id"] else None,
+            "reviewing_since": row["reviewing_since"].isoformat()
+            if row.get("reviewing_since") else None,
+        }
+        for row in rows
+    ]
+
+    next_cursor: str | None = None
+    if has_more and rows:
+        last = rows[-1]
+        last_ts = last["created_at"]
+        last_rid = str(last["request_id"])
+        if last_ts is not None:
+            next_cursor = f"{last_ts.isoformat()}|{last_rid}"
+
+    return items, has_more, next_cursor
+
+
+@app.get(
+    "/api/gates/pending",
+    dependencies=[
+        Depends(authenticate),
+        require_role("admin"),
+        Depends(rate_limit_per_user),
+    ],
+)
+async def gates_pending(
+    limit: int = Query(500, ge=1, le=500),
+    cursor: str | None = None,
+) -> Any:
+    """(v1, deprecated) List unresolved approval requests.
+
+    Returns a plain list (legacy v0.6.1-and-earlier shape). v0.6.2+
+    clients should migrate to ``/api/v2/gates/pending`` which returns
+    ``{items, has_more, next_cursor}``.
+
+    Hard cap: 500 rows on this route (v2 allows up to 1000). When the
+    cap is hit, ``X-Truncated: true`` and ``X-Total-Returned`` headers
+    are set so callers that can't see ``has_more`` still have a signal.
+
+    Auth: admin only (v0.6.2 followup ship-blocker fix). Pre-fix this
+    endpoint had only Depends(authenticate), exposing the cross-agent
+    approval queue to every viewer — exfiltration surface.
+
+    Deprecation: ``Deprecation: true``, ``Sunset: <v0.7 date>``, and
+    ``Link: </api/v2/gates/pending>; rel="successor-version"``.
+    """
+    global _GATES_PENDING_LEGACY_WARNED
     if engine is None:
         raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
-    async with engine.connect() as conn:
-        res = await conn.execute(
-            text(
-                "SELECT request_id, agent_id, kind, action_hash, "
-                "created_at, expires_at, reviewer_id, reviewing_since "
-                "FROM governance_gates_pending "
-                "WHERE resolved_at IS NULL "
-                "ORDER BY created_at DESC"
-            )
+
+    if not _GATES_PENDING_LEGACY_WARNED:
+        _GATES_PENDING_LEGACY_WARNED = True
+        _logger.warning(
+            "console.gates_pending_deprecated_shape_served",
+            detail=(
+                "Legacy list-shape of /api/gates/pending served. Clients "
+                "should migrate to /api/v2/gates/pending (paged dict) "
+                "before v0.7."
+            ),
         )
-        return [
-            {
-                "request_id": str(row["request_id"]),
-                "agent_id": row["agent_id"],
-                "kind": row["kind"],
-                "action_hash": row["action_hash"],
-                "created_at": row["created_at"].isoformat()
-                if row["created_at"] else None,
-                "expires_at": row["expires_at"].isoformat()
-                if row["expires_at"] else None,
-                "reviewer_id": str(row["reviewer_id"])
-                if row["reviewer_id"] else None,
-                "reviewing_since": row["reviewing_since"].isoformat()
-                if row.get("reviewing_since") else None,
-            }
-            for row in res.mappings()
-        ]
+
+    items, has_more, _nc = await _fetch_pending_gates(limit=limit, cursor=cursor)
+
+    # Hard cap for legacy route: even if caller asks for >500 we only
+    # serve 500 on v1 to protect non-paginating consumers.
+    if len(items) > 500:
+        items = items[:500]
+        has_more = True
+
+    headers: dict[str, str] = {
+        "Deprecation": "true",
+        "Sunset": "Thu, 01 Oct 2026 00:00:00 GMT",
+        "Link": '</api/v2/gates/pending>; rel="successor-version"',
+    }
+    if has_more:
+        headers["X-Truncated"] = "true"
+        headers["X-Total-Returned"] = str(len(items))
+
+    return JSONResponse(content=items, headers=headers)
+
+
+@app.get(
+    "/api/v2/gates/pending",
+    dependencies=[
+        Depends(authenticate),
+        require_role("admin"),
+        Depends(rate_limit_per_user),
+    ],
+)
+async def gates_pending_v2(
+    limit: int = Query(500, ge=1, le=1000),
+    cursor: str | None = None,
+) -> dict[str, Any]:
+    """List unresolved approval requests (paged).
+
+    Bug #5 (P0): the pre-fix SELECT had no LIMIT — a reviewer OOO plus
+    50k queued rows meant the browser fetched the entire table and
+    OOM'd on render. This endpoint caps responses at ``limit`` rows
+    (default 500, max 1000) and exposes keyset pagination via a
+    ``cursor`` query param. Ordering is ``created_at DESC, request_id``
+    so that the secondary sort makes the cursor deterministic when
+    multiple rows share a ``created_at`` timestamp.
+
+    Cursor format: ``"<created_at_iso>|<request_id>"``. Callers pass
+    back the ``next_cursor`` they got in the prior response to fetch
+    the next page. When ``has_more`` is ``false`` the caller has
+    reached the end.
+
+    Auth: admin only (v0.6.2 followup ship-blocker fix). A ``reviewer``
+    role with per-agent scope is planned for v0.6.3.
+    """
+    if engine is None:
+        raise HTTPException(503, "Console backend is starting up. Try again in a moment.")
+    items, has_more, next_cursor = await _fetch_pending_gates(limit=limit, cursor=cursor)
+    return {
+        "items": items,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+    }
 
 
 @app.get("/api/gates/recent", dependencies=[Depends(authenticate), Depends(rate_limit_per_user)])
