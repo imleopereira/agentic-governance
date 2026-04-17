@@ -51,6 +51,9 @@ scripts/automation/install-cron.sh
 # Internal planning docs (PRDs, strategy, roadmaps) — never commit to this repo
 decisions/
 
+# Agent/persona definitions — local operational setup, not shipped artifact
+.agents/
+
 # Playwright test output
 console/test-results/
 console/playwright-report/
