@@ -52,6 +52,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from ..audit.chain import canonical_json, verify_event
+from ..audit.keys import KeyVersion
 from ..audit.models import AuditEvent, AuditEventRecord
 from ..audit.module import AuditModule
 from ..gates.errors import ApprovalTokenError
@@ -1196,6 +1197,16 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
     The HMAC secret is used server-side only. The frontend receives a
     boolean per event + an overall pass/fail. The secret itself is NEVER
     returned.
+
+    Rotation-aware (v0.6.2 P0). If ``governance_audit_chain_keys`` has
+    rows, each event is verified under the key active at ITS chain_seq
+    rather than under a single current AUDIT_SECRET. Without this, any
+    session spanning a ``cga rotate-chain-key`` would show legitimate
+    pre-rotation events as ``verified=false`` in the UI session drawer
+    — the same bug that bit the v0.6.2 demo seed. Rotation markers use
+    dual-MAC verification (outgoing + incoming keys) via the shared
+    ``verify_chain_with_rotation`` helper. Sessions that don't span a
+    rotation see identical output to the pre-v0.6.2 single-key path.
     """
     if not AUDIT_SECRET:
         raise HTTPException(
@@ -1208,9 +1219,9 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
     async with engine.connect() as conn:
         res = await conn.execute(
             text(
-                "SELECT event_id, session_id, agent_id, parent_event_id, "
+                "SELECT chain_seq, event_id, session_id, agent_id, parent_event_id, "
                 "kind, model, input_hash, output_hash, metadata_json, "
-                "prev_hash, hmac_value, created_at "
+                "prev_hash, hmac_value, hmac_next, created_at "
                 "FROM governance_audit_events "
                 "WHERE session_id = :sid ORDER BY chain_seq"
             ),
@@ -1218,11 +1229,40 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
         )
         rows = list(res.mappings())
 
+        # Load registered key versions — if any exist, go down the
+        # rotation-aware path. Table may not exist on pre-v0.6 deployments
+        # that skipped the F6 Track B migration; treat as empty.
+        key_versions: list[KeyVersion] = []
+        try:
+            kv_res = await conn.execute(
+                text(
+                    "SELECT key_version, fingerprint, "
+                    "activated_at_chain_seq, retired_at_chain_seq "
+                    "FROM governance_audit_chain_keys "
+                    "ORDER BY activated_at_chain_seq"
+                )
+            )
+            key_versions = [
+                KeyVersion(
+                    key_version=int(r["key_version"]),
+                    fingerprint=str(r["fingerprint"]),
+                    activated_at_chain_seq=int(r["activated_at_chain_seq"]),
+                    retired_at_chain_seq=(
+                        int(r["retired_at_chain_seq"])
+                        if r["retired_at_chain_seq"] is not None
+                        else None
+                    ),
+                )
+                for r in kv_res.mappings()
+            ]
+        except Exception:  # noqa: BLE001 — table absent on old deployments
+            key_versions = []
+
     if not rows:
         return {"session_id": str(session_id), "event_count": 0, "verified": True}
 
-    results: list[dict[str, Any]] = []
-    all_ok = True
+    # Build records once; both paths reuse them.
+    records: list[tuple[int, AuditEventRecord, str | None]] = []
     for row in rows:
         record = AuditEventRecord(
             event_id=row["event_id"],
@@ -1238,16 +1278,88 @@ async def verify_session_chain(session_id: UUID) -> dict[str, Any]:
             hmac=row["hmac_value"],
             created_at=row["created_at"],
         )
-        ok = verify_event(record, secret)
-        if not ok:
-            all_ok = False
-        results.append(
-            {
-                "event_id": str(row["event_id"]),
-                "kind": row["kind"],
-                "verified": ok,
-            }
+        chain_seq = int(row["chain_seq"]) if row.get("chain_seq") is not None else 0
+        hmac_next = row.get("hmac_next")
+        records.append((chain_seq, record, hmac_next))
+
+    results: list[dict[str, Any]] = []
+    all_ok = True
+
+    if key_versions:
+        # Rotation-aware path: resolve each event under the key active at
+        # its chain_seq. We build an in-memory ``fingerprint -> bytes``
+        # map rather than routing through the uri_map machinery: the
+        # current AUDIT_SECRET material is already in hand and operator-
+        # provisioned historical keys come from
+        # ``GOVERNANCE_CHAIN_KEY_<prefix>`` env vars that
+        # ``audit.keys.resolve_key`` understands.
+        from ..audit.chain import find_active_key_at_seq
+        from ..audit.keys import (
+            KeyResolution,
+            fingerprint_key,
+            resolve_key,
         )
+
+        # Build a uri_map from operator-provisioned env vars for
+        # historical keys that are NOT the current secret.
+        current_fp = fingerprint_key(secret)
+        uri_map: dict[str, str] = {}
+        for kv in key_versions:
+            if kv.fingerprint == current_fp:
+                continue  # current secret is resolved directly, below
+            prefix = kv.fingerprint[:16]
+            env_name = f"GOVERNANCE_CHAIN_KEY_{prefix}"
+            uri = os.environ.get(env_name)
+            if uri:
+                uri_map[kv.fingerprint] = uri
+
+        for cs, rec, _hn in records:
+            active = find_active_key_at_seq(cs, key_versions)
+            if active is None:
+                # No registered key covers this seq. Pre-rotation events
+                # on a deployment that only registered post-rotation keys
+                # will land here; fall back to the current secret so we
+                # don't mark legitimate events as broken.
+                ok = verify_event(rec, secret)
+            elif active.fingerprint == current_fp:
+                ok = verify_event(rec, secret)
+            else:
+                resolved = resolve_key(active.fingerprint, uri_map)
+                if (
+                    resolved.status is KeyResolution.RESOLVED
+                    and resolved.material is not None
+                ):
+                    ok = verify_event(rec, resolved.material)
+                else:
+                    # Historical key material not mounted — the chain
+                    # cannot be verified for this row. Surface as False
+                    # (matches pre-v0.6.2 session-drawer semantics) and
+                    # keep first_failure accurate for the UI.
+                    ok = False
+            if not ok:
+                all_ok = False
+            results.append(
+                {
+                    "event_id": str(rec.event_id),
+                    "kind": rec.kind,
+                    "verified": ok,
+                }
+            )
+    else:
+        # Legacy single-key path: no rotation has ever happened on this
+        # deployment (governance_audit_chain_keys is empty), so every
+        # row must verify under the current AUDIT_SECRET.
+        for _cs, rec, _hn in records:
+            ok = verify_event(rec, secret)
+            if not ok:
+                all_ok = False
+            results.append(
+                {
+                    "event_id": str(rec.event_id),
+                    "kind": rec.kind,
+                    "verified": ok,
+                }
+            )
 
     return {
         "session_id": str(session_id),
@@ -1518,7 +1630,14 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
             if parsed_rid != request_id:
                 raise HTTPException(400, "Token HMAC verification failed.")
             stored_ah = row["action_hash"]
-            if stored_ah is not None and parsed_action_hash != stored_ah:
+            # v0.6.2 security defense-in-depth: parsed_action_hash was already
+            # HMAC-bound via parse_token's compare_digest check, so a timing
+            # oracle here cannot leak attacker-chosen bytes. We still use
+            # compare_digest to keep crypto-hygiene consistent and close any
+            # future drift if this path is ever reached via a non-HMAC branch.
+            if stored_ah is not None and not hmac.compare_digest(
+                parsed_action_hash, stored_ah
+            ):
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
@@ -1675,7 +1794,13 @@ async def deny_gate(
             if parsed_rid != request_id:
                 raise HTTPException(400, "Token HMAC verification failed.")
             stored_ah = row["action_hash"]
-            if stored_ah is not None and parsed_action_hash != stored_ah:
+            # v0.6.2 security defense-in-depth: see ``grant_gate`` for the
+            # full rationale. compare_digest keeps crypto-hygiene consistent
+            # even though parse_token's HMAC bind already makes timing here
+            # non-exploitable.
+            if stored_ah is not None and not hmac.compare_digest(
+                parsed_action_hash, stored_ah
+            ):
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)

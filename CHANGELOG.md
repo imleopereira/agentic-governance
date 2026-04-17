@@ -1,14 +1,32 @@
 # Changelog
 
-## v0.6.2 (unreleased) — v4 console default flip + 3 P0 enforcement fixes
+## v0.6.2 (unreleased) — v4 console default flip + 5 P0 enforcement fixes
 
 Patch release. Lands the four parked Wave 1.5 worktrees from the v0.6.1
 polish sprint, flips the default console UI from v3 to v4, and bundles
-three P0 fixes uncovered during the v0.6.1 post-ship team review:
-wheel-packaged migrations, grant/deny TOCTOU hardening, and expanded
-halt enforcement across cost + gates + LLM wrappers. No public SDK API
-changes and no new migrations — the fixes change internal behaviour,
-not signatures or schema.
+five P0 fixes uncovered during the v0.6.1 post-ship team review and a
+subsequent live demo walkthrough:
+
+1. Wheel-packaged migrations (fresh installs were silently skipping alembic).
+2. Grant/deny TOCTOU hardening (mirror of v0.6.1 escalate fix).
+3. Halt enforcement expanded across cost + gates + LLM wrappers.
+4. Grant/deny token HMAC verification (broken since v0.2, caught live).
+5. Session-drawer chain verify is now rotation-aware (pre-rotation events
+   no longer render as `verified=false` after `rotate-chain-key`).
+
+No public SDK API changes and no new migrations — the fixes change
+internal behaviour, not signatures or schema.
+
+> **BREAKING BEHAVIOUR (halt enforcement):** Calling any enforcement
+> path — `cost.check_or_raise`, `gates.request`, `wrap_openai`,
+> `wrap_anthropic` — against a halted agent now raises
+> `AgentHaltedError`. On v0.5.4–v0.6.1 these paths silently succeeded
+> because only `scope.check` was wired into halt. If your application
+> catches and ignores enforcement errors to allow graceful
+> degradation, add an explicit `except AgentHaltedError` guard
+> before upgrading. Tokens minted BEFORE the halt still resolve
+> through `gates.grant`/`gates.deny`, since the reviewer — not the
+> agent — is the principal on resolution.
 
 > **BREAKING DEFAULT**: The console now loads v4 on first visit. Set
 > `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` before upgrading if your team
@@ -51,6 +69,29 @@ not signatures or schema.
   agent. Exception: operator-facing `gates.grant()` / `gates.deny()` on
   tokens minted BEFORE the halt still resolve, because the reviewer —
   not the agent — is the principal on grant/deny.
+- **Grant/deny token HMAC verification (P0, silently broken since v0.2).**
+  The console's `grant_gate` / `deny_gate` handlers were comparing the
+  full signed token (`{uuid}:{action_hash}:{iso}:{hmac_hex}`) against a
+  self-computed HMAC of just the `request_id` — two different shapes,
+  always mismatched, so any real SDK-minted token rejected with
+  "Token HMAC verification failed." Invisible to every unit test because
+  every mock gate row used `token: None`, skipping the verify branch.
+  Caught during a live demo walkthrough. Fix: dogfood the SDK's own
+  `parse_token` from `gates.tokens` and cross-check `request_id` AND
+  `action_hash` on both grant and deny. Security strengthened: now
+  rejects signature tampering, expiration, wrong-request, AND
+  action_hash tampering. +5 regression tests in
+  `tests/console/test_gates_token_verification.py`.
+- **Session-drawer chain verify is rotation-aware (P0).**
+  `GET /api/session/{id}/verify` now loads `governance_audit_chain_keys`
+  and verifies each row under the key active at ITS `chain_seq` rather
+  than under the single current `AUDIT_SECRET`. Pre-fix, any customer
+  who ran `cga rotate-chain-key` would see legitimate pre-rotation
+  events as `verified=false` in the UI session drawer — the same bug
+  that bit the v0.6.2 demo seed before rotation was dropped from it.
+  Sessions that don't span a rotation see identical output. Missing
+  historical key material surfaces as `verified=false` without raising.
+  +3 regression tests in `tests/console/test_verify_session_rotation.py`.
 - **v4 is the default console UI.** `next.config.ts`, middleware, and
   the v4 layout all fall through to `v4` when
   `NEXT_PUBLIC_CONSOLE_UI_VERSION` is unset. `/` rewrites to `/agents`
@@ -76,6 +117,29 @@ not signatures or schema.
   `?ui=v3` cookie). A new `console-e2e-smoke` CI job runs it on
   console-touching PRs with `continue-on-error: true` while we collect
   flake stats. Promote to blocking in v0.7.
+- **UTC timestamps across the console.** `LiveBadge`, `/cost`
+  last-updated, v3 root agent-card, `/stream` event timestamps, and
+  the compliance page all render UTC uniformly (DB + audit chain are
+  UTC; mixing local time in the UI was rehearsal-bait). New shared
+  `console/src/lib/formatDate.ts` helper (`formatUtcTimestamp`,
+  `formatUtcDateForFilename`).
+- **Sidebar approval-count badge always visible.** Previously the
+  count rendered only when `/gates` was the active route. `Sidebar.tsx`
+  now runs its own `useQuery` for `api.gatesPending` (shared queryKey,
+  no double-fetch), 30-s refetch, gated on `!!user`; failure renders
+  no badge (never `?`); count=0 renders no badge. `font-mono`,
+  `var(--warn)` bg, 9px rounded, AA contrast.
+- **Compliance page redesign.** Hero-first IA: `Article 12 evidence`
+  eyebrow → H1 `Chain integrity: verified` (color-coded) → single-line
+  fact row → promoted Export button → inline download confirmation.
+  Dev-voice leak removed (`enable_coverage=True` Python flag →
+  compliance-officer phrasing). Export filename format:
+  `compliance-evidence-YYYY-MM-DD_to_YYYY-MM-DD.json`.
+- **Walkthrough refreshed for v0.6.2.** 6 dev-voice steps → 5
+  compliance-officer-voice steps. v3 route anchors replaced with v4
+  (`/agents`, `/gates`, `/compliance`, compliance-header-pill). Halt
+  described via pill red-state (the drawer halt button was removed
+  for a11y pre-v0.6; API-only today).
 
 ### Changed
 
