@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { LiveBadge } from "@/components/LiveBadge";
 import { CardSkeleton, TableSkeleton } from "@/components/Skeleton";
+import { formatUtcTimestamp } from "@/lib/formatDate";
 
 /**
  * Built-in model pricing reference (mirrors the SDK's pricing.py).
@@ -255,9 +256,7 @@ export default function CostPage() {
                       {s.tokens_used.toLocaleString()}
                     </td>
                     <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
-                      {s.last_updated
-                        ? new Date(s.last_updated).toISOString().replace("T", " ").slice(0, 19) + " UTC"
-                        : "-"}
+                      {s.last_updated ? formatUtcTimestamp(s.last_updated) : "-"}
                     </td>
                   </tr>
                 ))}
@@ -336,9 +335,7 @@ export default function CostPage() {
                             {m.tokens_used_today.toLocaleString()}
                           </td>
                           <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
-                            {m.last_updated
-                              ? new Date(m.last_updated).toISOString().replace("T", " ").slice(0, 19) + " UTC"
-                              : "-"}
+                            {m.last_updated ? formatUtcTimestamp(m.last_updated) : "-"}
                           </td>
                         </tr>
                       );

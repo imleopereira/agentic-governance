@@ -212,33 +212,67 @@ export default function GatesPage() {
   const setPendingApprovals = useEventStreamStore((s) => s.setPendingApprovals);
   const qc = useQueryClient();
 
+  // v0.6.2 followup: pending is now a GatesPendingPage; accumulate pages
+  // client-side on Load-More. Initial page is the top-500 by created_at
+  // DESC (matches the server's default LIMIT + ORDER BY).
+  const [extraPages, setExtraPages] = useState<GatePending[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+
   const { data: pending, isLoading: pendingLoading } = useQuery({
     queryKey: ["gates-pending"],
-    queryFn: api.gatesPending,
+    queryFn: () => api.gatesPending(),
     refetchInterval: 5_000,
   });
+
+  // Sync cursor state from the first page — refetch can flip has_more
+  // from true→false (backlog drained) or false→true (new burst arrived).
+  useEffect(() => {
+    setNextCursor(pending?.has_more ? pending.next_cursor : null);
+  }, [pending?.has_more, pending?.next_cursor]);
+
   const { data: recent, isLoading: recentLoading } = useQuery({
     queryKey: ["gates-recent"],
     queryFn: () => api.gatesRecent(50),
     refetchInterval: 10_000,
   });
 
-  // Keep sidebar badge in sync
+  const items = pending?.items ?? [];
+  const allPending = extraPages.length > 0 ? [...items, ...extraPages] : items;
+
+  // Keep sidebar badge in sync with the FIRST page count — Load-More
+  // accumulations are a display concern, not a "needs attention" count.
   useEffect(() => {
-    setPendingApprovals(pending?.length ?? 0);
+    setPendingApprovals(items.length);
     return () => setPendingApprovals(0);
-  }, [pending?.length, setPendingApprovals]);
+  }, [items.length, setPendingApprovals]);
 
   // Update tab title with pending count
   useEffect(() => {
-    const count = pending?.length ?? 0;
+    const count = items.length;
     document.title = count > 0
       ? `(${count}) Approval Queue — Governance`
       : "Approval Queue — Governance";
     return () => { document.title = "Governance Console — Code Atelier"; };
-  }, [pending?.length]);
+  }, [items.length]);
 
-  const sorted = (pending ?? []).slice().sort(urgencySort);
+  const sorted = allPending.slice().sort(urgencySort);
+
+  async function loadMore() {
+    if (!nextCursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await api.gatesPending(nextCursor);
+      setExtraPages((prev) => [...prev, ...page.items]);
+      setNextCursor(page.has_more ? page.next_cursor : null);
+    } catch (err) {
+      // Non-fatal: Load-More is an escape-hatch. Show in console; the
+      // 5s refetch of the first page will resync state.
+      console.error("load more failed", err);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   async function invalidate() {
     await Promise.all([
@@ -268,12 +302,17 @@ export default function GatesPage() {
         <div>
           <h1 style={{ fontSize: "1.375rem", fontWeight: 700, marginBottom: "0.25rem" }}>
             Approval Queue
-            {(pending?.length ?? 0) > 0 && (
-              <span aria-label={`${pending!.length} pending`}
+            {items.length > 0 && (
+              <span aria-label={
+                pending?.has_more
+                  ? `${items.length}+ pending (more available)`
+                  : `${items.length} pending`
+              }
+                title={pending?.has_more ? "500+ pending — click Load More to paginate" : undefined}
                 style={{ marginLeft: 10, background: "var(--danger)", color: "#fff",
                   fontSize: "0.75rem", fontWeight: 700, padding: "2px 8px",
                   borderRadius: 10, verticalAlign: "middle" }}>
-                {pending!.length}
+                {items.length}{pending?.has_more ? "+" : ""}
               </span>
             )}
           </h1>
@@ -300,13 +339,34 @@ export default function GatesPage() {
             </p>
           </div>
         ) : (
-          <ul role="list" aria-label={`${sorted.length} pending approval${sorted.length !== 1 ? "s" : ""}`}
-            onKeyDown={handleListKey}
-            style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "0.75rem" }}>
-            {sorted.map((gate) => (
-              <ApprovalCard key={gate.request_id} gate={gate} onResolved={invalidate} />
-            ))}
-          </ul>
+          <>
+            <ul role="list" aria-label={`${sorted.length} pending approval${sorted.length !== 1 ? "s" : ""}`}
+              onKeyDown={handleListKey}
+              style={{ listStyle: "none", padding: 0, margin: 0, display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              {sorted.map((gate) => (
+                <ApprovalCard key={gate.request_id} gate={gate} onResolved={invalidate} />
+              ))}
+            </ul>
+            {nextCursor && (
+              <div style={{ display: "flex", justifyContent: "center", marginTop: "1rem" }}>
+                <button
+                  type="button"
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  aria-label="Load more pending approvals"
+                  style={{
+                    padding: "0.5rem 1rem", fontSize: "0.8125rem",
+                    border: "1px solid var(--border)", borderRadius: "var(--radius-sm)",
+                    background: "var(--surface)", color: "var(--text-primary)",
+                    cursor: loadingMore ? "wait" : "pointer",
+                    opacity: loadingMore ? 0.6 : 1,
+                  }}
+                >
+                  {loadingMore ? "Loading…" : "Load more"}
+                </button>
+              </div>
+            )}
+          </>
         )}
       </section>
 

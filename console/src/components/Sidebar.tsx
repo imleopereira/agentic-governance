@@ -71,11 +71,15 @@ export function Sidebar() {
   // fails (`data` undefined), we render no badge rather than `?`.
   const { data: pendingGates } = useQuery({
     queryKey: ["gates-pending"],
-    queryFn: api.gatesPending,
+    queryFn: () => api.gatesPending(),
     refetchInterval: 30_000,
     enabled: !!user,
   });
-  const pendingCount = pendingGates?.length ?? 0;
+  // v0.6.2 followup: /api/v2/gates/pending returns a page wrapper now.
+  // When ``has_more`` is true the badge shows "500+" with an accurate
+  // tooltip so operators know the count is capped, not authoritative.
+  const pendingCount = pendingGates?.items.length ?? 0;
+  const pendingHasMore = pendingGates?.has_more ?? false;
   const [collapsed, setCollapsed] = useState(false);
   const w = collapsed ? 48 : 260;
 
@@ -145,15 +149,18 @@ export function Sidebar() {
                 <Icon size={16} aria-hidden="true"
                   style={{ color: active ? "var(--accent-light)" : "inherit" }} />
                 {badge > 0 && collapsed && (
-                  <span aria-label={`${badge} pending`} style={{
-                    position: "absolute", top: -4, right: -4,
-                    background: "var(--warn)", color: "#1a1a1a",
-                    fontFamily: "var(--font-mono)",
-                    fontSize: "0.625rem", fontWeight: 700, minWidth: 14, height: 14,
-                    borderRadius: 7, display: "flex", alignItems: "center",
-                    justifyContent: "center", padding: "0 2px",
-                  }}>
-                    {badge > 99 ? "99+" : badge}
+                  <span
+                    aria-label={pendingHasMore ? `${badge}+ pending (more available)` : `${badge} pending`}
+                    title={pendingHasMore ? `${badge}+ pending — click to see full queue` : undefined}
+                    style={{
+                      position: "absolute", top: -4, right: -4,
+                      background: "var(--warn)", color: "#1a1a1a",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.625rem", fontWeight: 700, minWidth: 14, height: 14,
+                      borderRadius: 7, display: "flex", alignItems: "center",
+                      justifyContent: "center", padding: "0 2px",
+                    }}>
+                    {pendingHasMore ? `${badge > 99 ? "99" : badge}+` : (badge > 99 ? "99+" : badge)}
                   </span>
                 )}
               </span>
@@ -161,14 +168,17 @@ export function Sidebar() {
                 <>
                   <span style={{ flex: 1 }}>{item.label}</span>
                   {badge > 0 && (
-                    <span aria-label={`${badge} pending`} style={{
-                      background: "var(--warn)", color: "#1a1a1a",
-                      fontFamily: "var(--font-mono)",
-                      fontSize: "0.6875rem", fontWeight: 600, minWidth: 18, height: 18,
-                      borderRadius: 9, display: "inline-flex", alignItems: "center",
-                      justifyContent: "center", padding: "0 6px", flexShrink: 0,
-                    }}>
-                      {badge > 99 ? "99+" : badge}
+                    <span
+                      aria-label={pendingHasMore ? `${badge}+ pending (more available)` : `${badge} pending`}
+                      title={pendingHasMore ? `${badge}+ pending — click to see full queue` : undefined}
+                      style={{
+                        background: "var(--warn)", color: "#1a1a1a",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "0.6875rem", fontWeight: 600, minWidth: 18, height: 18,
+                        borderRadius: 9, display: "inline-flex", alignItems: "center",
+                        justifyContent: "center", padding: "0 6px", flexShrink: 0,
+                      }}>
+                      {pendingHasMore ? `${badge > 99 ? "99" : badge}+` : (badge > 99 ? "99+" : badge)}
                     </span>
                   )}
                 </>

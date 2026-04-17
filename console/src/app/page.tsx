@@ -6,6 +6,7 @@ import { useEventStreamStore } from "@/lib/store";
 import { TimeAgo } from "@/components/TimeAgo";
 import { CardSkeleton } from "@/components/Skeleton";
 import { useAuth } from "@/lib/auth";
+import { formatUtcTimestamp } from "@/lib/formatDate";
 import {
   Circle, AlertTriangle, X, Minus, Activity,
   DollarSign, ShieldAlert, Zap,
@@ -100,7 +101,8 @@ function AgentCard({ agent, selected, onSelect }: AgentCardProps) {
   const status = deriveStatus(agent);
   const { color, label, Icon } = STATUS_CONFIG[status];
   return (
-    <article role="article" aria-label={`${agent.agent_id}, status ${label}`}
+    <article role="button" aria-label={`${agent.agent_id}, status ${label}`}
+      aria-pressed={selected}
       onClick={onSelect}
       onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(); } }}
       tabIndex={0}
@@ -195,7 +197,7 @@ function DetailPanel({ agent, onClose }: { agent: PostureAgent; onClose: () => v
         <MetricItem label="Tokens today"      value={agent.cost.tokens_today.toLocaleString()} />
         <MetricItem label="Scope violations"  value={String(agent.scope.violations_today)} warn={agent.scope.violations_today > 0} />
         <MetricItem label="Pending approvals" value={String(agent.gates.pending)} warn={agent.gates.pending > 0} />
-        {agent.last_active && <MetricItem label="Last active" value={new Date(agent.last_active).toISOString().slice(11, 19) + " UTC"} />}
+        {agent.last_active && <MetricItem label="Last active" value={formatUtcTimestamp(agent.last_active)} />}
       </div>
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
         <a href={`/events?agent_id=${encodeURIComponent(agent.agent_id)}`} className="btn-ghost"

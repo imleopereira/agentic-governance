@@ -49,11 +49,11 @@ const STORAGE_KEY = "governance_walkthrough_completed";
 
 function ProgressDots({ current, total }: { current: number; total: number }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-1.5" aria-hidden="true">
       {Array.from({ length: total }, (_, i) => (
-        <button
+        <span
           key={i}
-          className="transition-all"
+          className="transition-all inline-block"
           style={{
             width: i === current ? "16px" : "6px",
             height: "6px",
@@ -61,8 +61,6 @@ function ProgressDots({ current, total }: { current: number; total: number }) {
             background: i === current ? "var(--accent)" : i < current ? "var(--accent-light)" : "var(--border)",
             opacity: i === current ? 1 : i < current ? 0.6 : 0.4,
           }}
-          aria-label={`Step ${i + 1}`}
-          tabIndex={-1}
         />
       ))}
     </div>
@@ -111,6 +109,69 @@ function TargetHighlight({ target }: { target: string }) {
   );
 }
 
+/* Backdrop with a transparent spotlight cutout over the target element.
+   Uses a single positioned div whose box-shadow fills the entire viewport
+   while the div itself stays transparent, creating a "hole" effect. */
+function SpotlightBackdrop({
+  target,
+  onClick,
+}: {
+  target: string;
+  onClick: () => void;
+}) {
+  const [rect, setRect] = useState<DOMRect | null>(null);
+
+  const measure = useCallback(() => {
+    const el = document.querySelector(target);
+    if (el) {
+      setRect(el.getBoundingClientRect());
+    } else {
+      setRect(null);
+    }
+  }, [target]);
+
+  useEffect(() => {
+    measure();
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure, true);
+    };
+  }, [measure]);
+
+  const padding = 8;
+
+  return (
+    <button
+      type="button"
+      aria-label="Dismiss walkthrough"
+      className="fixed inset-0 cursor-default"
+      style={{ background: "transparent", border: "none", padding: 0, zIndex: 50 }}
+      onClick={onClick}
+    >
+      {rect ? (
+        /* Spotlight: transparent box over target, massive shadow covers rest */
+        <div
+          className="fixed transition-all duration-200 ease-out"
+          style={{
+            top: rect.top - padding,
+            left: rect.left - padding,
+            width: rect.width + padding * 2,
+            height: rect.height + padding * 2,
+            borderRadius: "var(--radius-md)",
+            boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.65)",
+            pointerEvents: "none",
+          }}
+        />
+      ) : (
+        /* Fallback: solid dark overlay if target not found */
+        <div className="absolute inset-0" style={{ background: "rgba(0, 0, 0, 0.65)" }} />
+      )}
+    </button>
+  );
+}
+
 export function WalkthroughProvider({ children }: { children: ReactNode }) {
   const [active, setActive] = useState(false);
   const [step, setStep] = useState(0);
@@ -122,6 +183,20 @@ export function WalkthroughProvider({ children }: { children: ReactNode }) {
       setDismissed(false);
     }
   }, []);
+
+  // Keyboard dismissal: Esc closes the overlay so keyboard-only users
+  // are not stranded behind the backdrop when "Skip tour" isn't focused.
+  useEffect(() => {
+    if (!active) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finish();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
 
   function startTour() {
     setActive(true);
@@ -203,17 +278,14 @@ export function WalkthroughProvider({ children }: { children: ReactNode }) {
 
       {/* Tour overlay */}
       {active && (
-        <div className="fixed inset-0 z-50">
-          {/* Blurred backdrop */}
-          <div
-            className="absolute inset-0"
-            style={{
-              background: "rgba(0, 0, 0, 0.65)",
-              backdropFilter: "blur(6px)",
-              WebkitBackdropFilter: "blur(6px)",
-            }}
-            onClick={finish}
-          />
+        <div
+          className="fixed inset-0 z-50"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="walkthrough-step-title"
+        >
+          {/* Spotlight backdrop with transparent cutout over target */}
+          <SpotlightBackdrop target={current.target} onClick={finish} />
 
           {/* Target highlight */}
           <TargetHighlight target={current.target} />
@@ -250,7 +322,7 @@ export function WalkthroughProvider({ children }: { children: ReactNode }) {
               >
                 Step {step + 1} of {STEPS.length}
               </p>
-              <h3 className="font-bold text-lg mb-2">{current.title}</h3>
+              <h3 id="walkthrough-step-title" className="font-bold text-lg mb-2">{current.title}</h3>
               <p className="text-sm leading-relaxed mb-5" style={{ color: "var(--text-secondary)" }}>
                 {current.body}
               </p>
