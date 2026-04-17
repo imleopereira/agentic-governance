@@ -14,8 +14,102 @@ subsequent live demo walkthrough:
 5. Session-drawer chain verify is now rotation-aware (pre-rotation events
    no longer render as `verified=false` after `rotate-chain-key`).
 
-No public SDK API changes and no new migrations — the fixes change
-internal behaviour, not signatures or schema.
+Phase 2 (creative-audit follow-up) additionally lands: rotation-marker
+dual-MAC in session verify, bounded/paginated `/api/gates/pending` (+
+new `/api/v2` paged route), chunked verify off the event loop, serialized
+gate+audit, end-of-stream reconciliation for Anthropic + OpenAI wrappers
+(closes abandonment, cancellation, and double-reconcile vectors),
+`claude-opus-4-7` pricing, strict-by-default `CostModule`/`RevocationStore`/
+`InMemoryAuditStore`, and v2 gate tokens (opt-in in v0.6.2).
+
+No new migrations. **Several public SDK defaults flip this release.**
+See the four BREAKING blocks below before upgrading.
+
+> **BREAKING DEFAULTS** — four defaults flipped to fail-closed instead
+> of silent-degrade. If your code caught exceptions broadly or relied
+> on silent-zero accounting, review these before upgrading.
+>
+> - `CostModule.strict_unknown_models=True` — unknown model names raise
+>   `UnknownModelError` instead of returning `0.0`. Add pricing entries
+>   (`cost/pricing.py::MODEL_PRICING`) or set
+>   `cost_strict_unknown_models=False` with a fallback rate. LangChain
+>   handler is already wired to observe-only mode (never raises);
+>   direct SDK callers see the raise. New env vars:
+>   `GOVERNANCE_COST_STRICT_UNKNOWN_MODELS`,
+>   `GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION`.
+> - `InMemoryAuditStore.on_full="raise"` — hitting `max_events` raises
+>   `StoreUnavailableError` instead of silently evicting. Callers
+>   needing ring-buffer semantics must pass `on_full="evict"`.
+>   `BatchingWriter`'s internal fallback opts into eviction automatically.
+>   `.stats()` + `.verify_not_truncated()` are new.
+> - `RevocationStore.strict_chain=True` — when the audit write inside
+>   `revoke_with_chain_event` fails, the revocation now RAISES
+>   (previously it wrote the row with `chain_event_id=None`). Pass
+>   `strict_chain=False` to preserve degraded-mode behavior; WARN is
+>   logged as `identity.revocation_without_chain_event`.
+> - Gate resolve + audit event now run through a single serialized
+>   path (`on_commit` hook). The narrow residual window (audit
+>   commits, gates rolls back) is documented and detectable via
+>   duplicate `approval.granted` chain rows on one `request_id`.
+>   True cross-engine atomicity is a v0.7+ target.
+
+> **BREAKING WIRE CONTRACT** — `/api/gates/pending` + verify failure
+> reasons.
+>
+> - `/api/gates/pending` (v1) is now admin-only and caps at 500 rows.
+>   Response shape is unchanged (plain array) but carries
+>   `Deprecation: true`, `Sunset: Thu, 01 Oct 2026`, and
+>   `X-Truncated: true` when the cap is hit. Migrate to
+>   `/api/v2/gates/pending` which returns `{items, has_more, next_cursor}`
+>   with keyset pagination (cursor format: `"<iso_ts>|<request_id>"`).
+> - Per-agent reviewer scope is deferred to v0.6.3; `admin` is the
+>   only role with access today. Grant/deny were already admin-only,
+>   so read-scope now matches act-scope.
+> - `GET /api/session/{id}/verify` may return new `failure_reason`
+>   values (`rotation_marker_dual_mac_failed`,
+>   `rotation_marker_no_incoming_key`,
+>   `rotation_marker_unresolved_incoming:<fp16>`,
+>   `rotation_marker_without_key_versions`,
+>   `unresolved_key:<fp16>`, `hmac_mismatch`). New top-level
+>   `first_failure_reason` field scopes the first breaking event.
+
+> **BREAKING BEHAVIOUR (gate token format)** — gate approval tokens
+> gain a v2 format (opt-in in v0.6.2, default in v0.6.3).
+>
+> - `GatesModule(enable_v2_tokens=False)` is the default in v0.6.2.
+>   Tokens mint in legacy v1 format. Set `enable_v2_tokens=True`
+>   (or env `GOVERNANCE_GATES_ENABLE_V2_TOKENS=true`) to opt in to
+>   the `v2:<key_prefix>:…` format, which binds tokens to the HMAC
+>   key version active at issue time — pre-rotation tokens keep
+>   verifying after `rotate-chain-key`. Both formats verify in v0.6.2.
+> - v1 tokens accepted until `accept_v1_until` (default: ~2026-07-17,
+>   90 days post-release). After that cutoff, v1 tokens raise
+>   `TokenVersionTooOldError`. Override via
+>   `GatesModule(accept_v1_until=...)` or env
+>   `GOVERNANCE_GATES_ACCEPT_V1_UNTIL`. Pre-cutoff parses emit
+>   `DeprecationWarning` and `gates.legacy_token_parsed` INFO events.
+> - v0.6.3 will flip `enable_v2_tokens=True` as the default. Rolling
+>   deploys spanning that boundary should set the flag explicitly.
+
+> **BREAKING BEHAVIOUR (streaming accounting)** — Anthropic + OpenAI
+> wrappers.
+>
+> - Streaming responses reconcile actual token usage at end-of-stream.
+>   Previous releases tracked only the projected `max_tokens` value.
+>   Customers with hard USD caps should expect more accurate (and
+>   often higher) cost numbers.
+> - Abandoned streams (proxy returned but never iterated) emit
+>   `governance.stream.abandoned_without_reconcile` WARN and
+>   best-effort reconcile.
+> - Mid-stream exceptions and `asyncio.CancelledError` reconcile with
+>   a conservative `chunks × 8` token estimate instead of silent
+>   projected-wins — closes an agent-initiated budget-bypass vector.
+> - OpenAI `chat.completions.create` wrappers auto-inject
+>   `stream_options={"include_usage": True}` unless the caller
+>   explicitly sets it. Explicit `include_usage=False` is honored
+>   but logs a one-shot WARN.
+> - Reconciling proxy preserves `isinstance()` identity with the
+>   wrapped stream class.
 
 > **BREAKING BEHAVIOUR (halt enforcement):** Calling any enforcement
 > path — `cost.check_or_raise`, `gates.request`, `wrap_openai`,
@@ -28,14 +122,21 @@ internal behaviour, not signatures or schema.
 > through `gates.grant`/`gates.deny`, since the reviewer — not the
 > agent — is the principal on resolution.
 
-> **BREAKING DEFAULT**: The console now loads v4 on first visit. Set
-> `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` before upgrading if your team
-> has existing documentation or training materials that reference the
-> v3 layout. **Note: `NEXT_PUBLIC_*` variables are inlined at build
-> time; set before `next build`, not at container run time.** For a
-> run-time-configurable opt-out, use the `?ui=v3` URL override — it
-> persists via a `console_ui_version` cookie (SameSite=Lax, Secure in
-> production, 30-day max-age). v3 is removed in v0.7.
+> **BREAKING DEFAULT**: The console now loads v4 on first visit.
+>
+> **Run-time rollback (recommended):** append `?ui=v3` to any console
+> URL. This persists via a `console_ui_version` cookie (SameSite=Lax,
+> Secure in production, 30-day max-age) and works on pre-built Docker
+> images and bundled PyPI wheel assets. This is the escape hatch if
+> you cannot rebuild the console.
+>
+> **Build-time rollback (only if you rebuild the console from source):**
+> set `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` BEFORE `next build`.
+> `NEXT_PUBLIC_*` variables are inlined at build time — setting this
+> as a container/runtime env var on a pre-built image is silently
+> ignored.
+>
+> v3 is removed in v0.7.
 
 ### Added
 
