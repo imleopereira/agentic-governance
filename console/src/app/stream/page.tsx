@@ -90,9 +90,12 @@ function getSeverity(kind: string): Severity {
 }
 
 function formatTimestamp(iso: string): string {
+  // UTC everywhere — DB stores UTC, console renders UTC so operators in
+  // different timezones see the same wall-clock as their chain data.
   const d = new Date(iso);
-  return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" }) +
-    "." + String(d.getMilliseconds()).padStart(3, "0");
+  const hms = d.toISOString().slice(11, 19);
+  const ms = String(d.getUTCMilliseconds()).padStart(3, "0");
+  return `${hms}.${ms}`;
 }
 
 // ─── Event Row ────────────────────────────────────────────────────────────────

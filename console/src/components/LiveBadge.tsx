@@ -18,8 +18,10 @@ export function LiveBadge() {
     return now - lastActive < 5 * 60 * 1000;
   });
 
+  // Always UTC across the console — DB is UTC, compliance/audit/bundle all
+  // UTC. Shows HH:MM:SS UTC, no locale drift between operators.
   const lastRefreshed = dataUpdatedAt
-    ? new Date(dataUpdatedAt).toLocaleTimeString()
+    ? new Date(dataUpdatedAt).toISOString().slice(11, 19) + " UTC"
     : null;
 
   if (isLive) {

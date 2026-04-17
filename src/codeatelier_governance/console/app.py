@@ -54,6 +54,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from ..audit.chain import canonical_json, verify_event
 from ..audit.models import AuditEvent, AuditEventRecord
 from ..audit.module import AuditModule
+from ..gates.errors import ApprovalTokenError
+from ..gates.tokens import parse_token
 from .auth import create_session_id, hash_password, session_expires_at, verify_password
 from .models.responses import (
     AgentPoliciesResponse,
@@ -1492,13 +1494,31 @@ async def grant_gate(request_id: UUID, request: Request) -> dict[str, Any]:
                 "Wait for the reviewer to act or for the claim to expire.",
             )
 
-        # Verify the HMAC signature on the token
+        # Verify the HMAC signature on the stored token. The token
+        # format is defined by ``gates.tokens.make_token``:
+        #     f"{request_id}:{action_hash}:{expires_at_iso}:{hmac_hex}"
+        # Dogfood the SDK's own ``parse_token`` so the verification path
+        # is identical to the one used by agents calling ``sdk.gates.grant``.
+        # ``parse_token`` checks:
+        #   (a) HMAC signature matches under the current audit secret
+        #   (b) token has not expired
+        # and returns the parsed (request_id, action_hash, expires_at).
+        # We additionally cross-check that the parsed request_id matches
+        # the URL path param and that the parsed action_hash matches the
+        # stored ``action_hash`` column — the two v0.1 bindings that
+        # prevent token-swap and action-hash-swap attacks.
         token_value = row["token"]
         if token_value:
-            expected = hmac.new(
-                secret, str(request_id).encode("utf-8"), hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(token_value, expected):
+            try:
+                parsed_rid, parsed_action_hash, _exp = parse_token(
+                    secret=secret, token=token_value
+                )
+            except ApprovalTokenError as exc:
+                raise HTTPException(400, f"Token HMAC verification failed: {exc}") from exc
+            if parsed_rid != request_id:
+                raise HTTPException(400, "Token HMAC verification failed.")
+            stored_ah = row["action_hash"]
+            if stored_ah is not None and parsed_action_hash != stored_ah:
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
@@ -1642,12 +1662,20 @@ async def deny_gate(
                 "Wait for the reviewer to act or for the claim to expire.",
             )
 
+        # Verify the HMAC signature on the stored token — same logic as
+        # ``grant_gate``. See the comment there for the full rationale.
         token_value = row["token"]
         if token_value:
-            expected = hmac.new(
-                secret, str(request_id).encode("utf-8"), hashlib.sha256
-            ).hexdigest()
-            if not hmac.compare_digest(token_value, expected):
+            try:
+                parsed_rid, parsed_action_hash, _exp = parse_token(
+                    secret=secret, token=token_value
+                )
+            except ApprovalTokenError as exc:
+                raise HTTPException(400, f"Token HMAC verification failed: {exc}") from exc
+            if parsed_rid != request_id:
+                raise HTTPException(400, "Token HMAC verification failed.")
+            stored_ah = row["action_hash"]
+            if stored_ah is not None and parsed_action_hash != stored_ah:
                 raise HTTPException(400, "Token HMAC verification failed.")
 
         now = datetime.now(timezone.utc)
@@ -3508,7 +3536,10 @@ async def _compliance_report_body(
             # returned view has the correct types (UUID, datetime) — NOT
             # ``model_construct`` which would hand back a view whose
             # ``report_id`` is a ``str``, breaking downstream invariants.
-            return ComplianceReportView.model_validate(cached)
+            # strict=False to accept ISO-string datetimes that mode="json"
+            # dumped into the cache; the model itself is strict=True which
+            # would otherwise reject string-to-datetime coercion.
+            return ComplianceReportView.model_validate(cached, strict=False)
 
     generator = _build_report_generator()
     if generator is None:
@@ -3524,7 +3555,7 @@ async def _compliance_report_body(
             if cache_key is not None:
                 cached = _compliance_cache_get(cache_key)
                 if cached is not None:
-                    return ComplianceReportView.model_validate(cached)
+                    return ComplianceReportView.model_validate(cached, strict=False)
             # BLOCKER C3: wall-clock timeout. The report generator opens
             # its own engine for verify; we cannot SET LOCAL on it from
             # here, so we bound the whole call instead. Default 30 s.
@@ -3612,7 +3643,7 @@ async def _compliance_verify_chain_body(
         if cached is not None:
             # Re-validate (not ``model_construct``) so the returned view
             # carries the correct ``datetime`` type on ``verified_at_utc``.
-            return VerifyChainResponse.model_validate(cached)
+            return VerifyChainResponse.model_validate(cached, strict=False)
 
     generator = _build_report_generator()
     if generator is None:
@@ -3626,7 +3657,7 @@ async def _compliance_verify_chain_body(
             if cache_key is not None:
                 cached = _compliance_cache_get(cache_key)
                 if cached is not None:
-                    return VerifyChainResponse.model_validate(cached)
+                    return VerifyChainResponse.model_validate(cached, strict=False)
             (
                 status_raw,
                 resolved_from,

@@ -256,7 +256,7 @@ export default function CostPage() {
                     </td>
                     <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                       {s.last_updated
-                        ? new Date(s.last_updated).toLocaleString()
+                        ? new Date(s.last_updated).toISOString().replace("T", " ").slice(0, 19) + " UTC"
                         : "-"}
                     </td>
                   </tr>
@@ -337,7 +337,7 @@ export default function CostPage() {
                           </td>
                           <td className="py-2 pr-3 text-xs" style={{ color: "var(--text-tertiary)" }}>
                             {m.last_updated
-                              ? new Date(m.last_updated).toLocaleString()
+                              ? new Date(m.last_updated).toISOString().replace("T", " ").slice(0, 19) + " UTC"
                               : "-"}
                           </td>
                         </tr>

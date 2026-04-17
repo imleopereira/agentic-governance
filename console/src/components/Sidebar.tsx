@@ -2,8 +2,9 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/lib/auth";
-import { useEventStreamStore } from "@/lib/store";
+import { api } from "@/lib/api";
 import {
   LayoutGrid, Activity, CheckSquare, ScrollText,
   DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield, FileCheck,
@@ -62,7 +63,19 @@ function isActive(href: string, pathname: string, exact?: boolean): boolean {
 export function Sidebar() {
   const pathname = usePathname();
   const { user, logout } = useAuth();
-  const pendingApprovals = useEventStreamStore((s) => s.pendingApprovals);
+  // v0.6.2: badge must be visible on ALL routes, not just when `/gates` is
+  // active. The Approvals page also owns `["gates-pending"]` and refetches
+  // every 5s, so when the operator is on that page the shared query cache
+  // stays fresh; from any other page the Sidebar's own 30s refetch keeps
+  // the count reasonably current without hammering the API. If the fetch
+  // fails (`data` undefined), we render no badge rather than `?`.
+  const { data: pendingGates } = useQuery({
+    queryKey: ["gates-pending"],
+    queryFn: api.gatesPending,
+    refetchInterval: 30_000,
+    enabled: !!user,
+  });
+  const pendingCount = pendingGates?.length ?? 0;
   const [collapsed, setCollapsed] = useState(false);
   const w = collapsed ? 48 : 260;
 
@@ -101,7 +114,7 @@ export function Sidebar() {
         {NAV_ITEMS.filter((item) => !item.adminOnly || user?.role === "admin").map((item) => {
           const active = isActive(item.href, pathname, item.exact);
           const Icon = item.icon;
-          const badge = item.showBadge && pendingApprovals > 0 ? pendingApprovals : 0;
+          const badge = item.showBadge && pendingCount > 0 ? pendingCount : 0;
           return (
             <Link
               key={item.href}
@@ -134,7 +147,8 @@ export function Sidebar() {
                 {badge > 0 && collapsed && (
                   <span aria-label={`${badge} pending`} style={{
                     position: "absolute", top: -4, right: -4,
-                    background: "var(--danger)", color: "#fff",
+                    background: "var(--warn)", color: "#1a1a1a",
+                    fontFamily: "var(--font-mono)",
                     fontSize: "0.625rem", fontWeight: 700, minWidth: 14, height: 14,
                     borderRadius: 7, display: "flex", alignItems: "center",
                     justifyContent: "center", padding: "0 2px",
@@ -148,10 +162,11 @@ export function Sidebar() {
                   <span style={{ flex: 1 }}>{item.label}</span>
                   {badge > 0 && (
                     <span aria-label={`${badge} pending`} style={{
-                      background: "var(--danger)", color: "#fff",
-                      fontSize: "0.625rem", fontWeight: 700, minWidth: 18, height: 18,
+                      background: "var(--warn)", color: "#1a1a1a",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.6875rem", fontWeight: 600, minWidth: 18, height: 18,
                       borderRadius: 9, display: "inline-flex", alignItems: "center",
-                      justifyContent: "center", padding: "0 4px", flexShrink: 0,
+                      justifyContent: "center", padding: "0 6px", flexShrink: 0,
                     }}>
                       {badge > 99 ? "99+" : badge}
                     </span>
