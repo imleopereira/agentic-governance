@@ -8,11 +8,18 @@ import { api } from "@/lib/api";
 import {
   LayoutGrid, Activity, CheckSquare, ScrollText,
   DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield, FileCheck,
+  Lock, KeyRound,
 } from "lucide-react";
+import { useTier } from "@/lib/tierContext";
+import type { TierFeature } from "@/lib/tierContext";
 
 interface NavItem {
   label: string; href: string; icon: React.ElementType;
   exact?: boolean; adminOnly?: boolean; showBadge?: boolean;
+  /** When set, Starter renders a lock hint with this tooltip. */
+  starterLockHint?: string;
+  /** When set, the nav item is only visible when `hasFeature(requires)` is true. */
+  requires?: TierFeature;
 }
 
 // FIX 5: when `NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4"`, the middleware
@@ -41,10 +48,13 @@ const NAV_ITEMS: NavItem[] = IS_V4
       { label: "Agents", href: "/agents", icon: LayoutGrid },
       { label: "Compliance", href: "/compliance", icon: FileCheck },
       { label: "Event Stream", href: "/stream", icon: Activity },
-      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
+      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true,
+        starterLockHint: "Review only" },
       { label: "Audit Log", href: "/events", icon: ScrollText },
-      { label: "Cost", href: "/cost", icon: DollarSign },
+      { label: "Cost", href: "/cost", icon: DollarSign,
+        starterLockHint: "Premium features inside" },
       { label: "Users", href: "/admin/users", icon: Users, adminOnly: true },
+      { label: "SSO & SCIM", href: "/admin/sso", icon: KeyRound, requires: "sso_scim" },
     ]
   : [
       { label: "Topology", href: "/", icon: LayoutGrid, exact: true },
@@ -63,6 +73,7 @@ function isActive(href: string, pathname: string, exact?: boolean): boolean {
 export function Sidebar() {
   const pathname = usePathname();
   const { user, logout } = useAuth();
+  const { tier, hasFeature } = useTier();
   // v0.6.2: badge must be visible on ALL routes, not just when `/gates` is
   // active. The Approvals page also owns `["gates-pending"]` and refetches
   // every 5s, so when the operator is on that page the shared query cache
@@ -115,10 +126,14 @@ export function Sidebar() {
 
       {/* Nav items */}
       <nav style={{ flex: 1, padding: "8px 0", overflowY: "auto" }} aria-label="Main navigation">
-        {NAV_ITEMS.filter((item) => !item.adminOnly || user?.role === "admin").map((item) => {
+        {NAV_ITEMS
+          .filter((item) => !item.adminOnly || user?.role === "admin")
+          .filter((item) => !item.requires || hasFeature(item.requires))
+          .map((item) => {
           const active = isActive(item.href, pathname, item.exact);
           const Icon = item.icon;
           const badge = item.showBadge && pendingCount > 0 ? pendingCount : 0;
+          const showStarterLock = tier === "starter" && !!item.starterLockHint && !collapsed;
           return (
             <Link
               key={item.href}
@@ -166,7 +181,22 @@ export function Sidebar() {
               </span>
               {!collapsed && (
                 <>
-                  <span style={{ flex: 1 }}>{item.label}</span>
+                  <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    {item.label}
+                    {showStarterLock && (
+                      <span
+                        title={item.starterLockHint}
+                        aria-label={`${item.label} — ${item.starterLockHint}`}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          color: "var(--text-tertiary)",
+                        }}
+                      >
+                        <Lock size={10} aria-hidden="true" />
+                      </span>
+                    )}
+                  </span>
                   {badge > 0 && (
                     <span
                       aria-label={pendingHasMore ? `${badge}+ pending (more available)` : `${badge} pending`}

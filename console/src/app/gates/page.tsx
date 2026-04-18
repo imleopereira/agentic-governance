@@ -12,6 +12,7 @@ import { useEventStreamStore } from "@/lib/store";
 import { TimeAgo } from "@/components/TimeAgo";
 import { TableSkeleton, CardSkeleton } from "@/components/Skeleton";
 import { CheckCircle, XCircle, AlertTriangle, Minus, Check, X } from "lucide-react";
+import { TierGate } from "@/components/TierGate";
 
 // ─── Urgency ──────────────────────────────────────────────────────────────────
 
@@ -140,6 +141,7 @@ function ApprovalCard({ gate, onResolved }: { gate: GatePending; onResolved: () 
       )}
 
       {/* Action buttons */}
+      <TierGate feature="reviewer_actions" minHeight={40}>
       <div style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap", alignItems: "center" }}>
         {mode === "confirmApprove" ? (
           <>
@@ -202,6 +204,21 @@ function ApprovalCard({ gate, onResolved }: { gate: GatePending; onResolved: () 
         )}
         {apiError && <span style={{ fontSize: "0.75rem", color: "var(--danger)" }}>{apiError}</span>}
       </div>
+      </TierGate>
+      <TierGate feature="multi_approver_hitl" fallback="hidden">
+        <p
+          style={{
+            marginTop: 8,
+            fontSize: "0.6875rem",
+            color: "var(--accent-gold)",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+          }}
+        >
+          <span aria-hidden="true">◆</span> Multi-approver required (2 of 3)
+        </p>
+      </TierGate>
     </li>
   );
 }

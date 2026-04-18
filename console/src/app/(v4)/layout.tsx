@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 
 import { ErrorBoundary } from "@/components/v4/ErrorBoundary";
 import { ComplianceHeaderPill } from "@/components/v4/ComplianceHeaderPill";
+import { TierBadge } from "@/components/TierBadge";
 import { rankWorst, type Health } from "@/components/DisconnectBanner.utils";
 import { useConnectionStore } from "@/lib/connectionStore";
 import { useEventStreamStore } from "@/lib/store";
@@ -95,8 +96,12 @@ function PillSlot() {
         right: 16,
         zIndex: 20,
         transition: "top 120ms ease",
+        display: "flex",
+        alignItems: "center",
+        gap: 8,
       }}
     >
+      <TierBadge />
       <ComplianceHeaderPill />
     </div>
   );

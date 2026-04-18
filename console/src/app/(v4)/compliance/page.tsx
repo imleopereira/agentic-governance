@@ -24,7 +24,8 @@
  */
 
 import { useEffect, useState } from "react";
-import { CheckCircle2, Download } from "lucide-react";
+import { CheckCircle2, Download, ShieldCheck } from "lucide-react";
+import { TierGate } from "@/components/TierGate";
 import { translateCoverageCaveat } from "@/lib/caveats";
 import { api, type ComplianceReportView } from "@/lib/api";
 import {
@@ -236,20 +237,46 @@ export default function ComplianceReportPage() {
               as "the thing to click" without fighting the hero metric
               for weight. */}
           <div className="flex flex-col items-start gap-2 sm:items-end">
-            <button
-              type="button"
-              onClick={handleDownloadBundle}
-              disabled={bundleLoading}
-              aria-busy={bundleLoading}
-              aria-describedby="evidence-bundle-help evidence-bundle-error evidence-bundle-status evidence-bundle-confirmation"
-              data-testid="download-evidence-bundle"
-              className="btn-primary"
-            >
-              <Download size={14} aria-hidden="true" />
-              {bundleLoading
-                ? "Preparing evidence\u2026"
-                : "Export Article 12 evidence"}
-            </button>
+            <TierGate feature="article12_csv_unsigned" minHeight={40}>
+              <button
+                type="button"
+                onClick={handleDownloadBundle}
+                disabled={bundleLoading}
+                aria-busy={bundleLoading}
+                aria-describedby="evidence-bundle-help evidence-bundle-error evidence-bundle-status evidence-bundle-confirmation"
+                data-testid="download-evidence-bundle"
+                className="btn-primary"
+              >
+                <Download size={14} aria-hidden="true" />
+                {bundleLoading
+                  ? "Preparing evidence\u2026"
+                  : "Export Article 12 evidence"}
+              </button>
+            </TierGate>
+            <TierGate feature="article12_csv_signed" fallback="hidden">
+              <button
+                type="button"
+                onClick={handleDownloadBundle}
+                disabled={bundleLoading}
+                aria-label="Export signed Ed25519 attestation"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  padding: "6px 12px",
+                  background: "rgba(242, 185, 75, 0.08)",
+                  border: "1px solid rgba(242, 185, 75, 0.4)",
+                  color: "var(--accent-gold)",
+                  borderRadius: "var(--radius-sm)",
+                  fontSize: "0.8125rem",
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                <ShieldCheck size={13} aria-hidden="true" />
+                Signed attestation (Ed25519)
+              </button>
+            </TierGate>
             {/* Inline confirmation shown after a successful download
                 (Designer A owned this surface). Kept under the button
                 so sighted users can verify the file on disk matches. */}

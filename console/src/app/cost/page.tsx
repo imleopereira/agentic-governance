@@ -6,6 +6,8 @@ import { api } from "@/lib/api";
 import { LiveBadge } from "@/components/LiveBadge";
 import { CardSkeleton, TableSkeleton } from "@/components/Skeleton";
 import { formatUtcTimestamp } from "@/lib/formatDate";
+import { TierGate } from "@/components/TierGate";
+import { TrendingUp, Webhook, GitBranch } from "lucide-react";
 
 /**
  * Built-in model pricing reference (mirrors the SDK's pricing.py).
@@ -119,7 +121,29 @@ export default function CostPage() {
             Per-agent and per-session spend tracking for today (UTC).
           </p>
         </div>
-        <LiveBadge />
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <TierGate feature="cost_forecast" fallback="hidden">
+            <span
+              aria-label="Projected to hit cap in 3.2 days"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "4px 10px",
+                fontSize: "0.75rem",
+                fontWeight: 500,
+                background: "rgba(234, 179, 8, 0.1)",
+                color: "var(--warn)",
+                border: "1px solid rgba(234, 179, 8, 0.35)",
+                borderRadius: 999,
+              }}
+            >
+              <TrendingUp size={12} aria-hidden="true" />
+              Cap in 3.2 days
+            </span>
+          </TierGate>
+          <LiveBadge />
+        </div>
       </div>
 
       <section>
@@ -361,6 +385,95 @@ export default function CostPage() {
           The SDK automatically estimates costs using built-in pricing for major providers.
         </p>
         <PricingReference />
+      </section>
+
+      {/* Reconciliation delta tree — Team+ */}
+      <section>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <GitBranch size={16} aria-hidden="true" style={{ color: "var(--text-secondary)" }} />
+          <h2 className="text-lg font-semibold">Reconciliation Delta</h2>
+        </div>
+        <TierGate feature="cost_reconciliation" minHeight={140}>
+          <div
+            className="border p-4"
+            style={{
+              borderColor: "var(--border)",
+              background: "var(--card)",
+              borderRadius: "var(--radius-md)",
+              fontFamily: "var(--font-mono)",
+              fontSize: "0.8125rem",
+            }}
+          >
+            <p style={{ color: "var(--text-secondary)", marginBottom: 10, fontSize: "0.75rem" }}>
+              Governance-recorded cost vs. provider invoice (today).
+            </p>
+            <ul style={{ listStyle: "none", padding: 0, margin: 0, lineHeight: 1.7 }}>
+              <li>├─ openai/gpt-4o <span style={{ color: "var(--text-tertiary)" }}>· governance $4.82 · invoice $4.84 · </span><span style={{ color: "var(--success)" }}>Δ +$0.02</span></li>
+              <li>├─ anthropic/claude-sonnet-4-6 <span style={{ color: "var(--text-tertiary)" }}>· governance $3.41 · invoice $3.40 · </span><span style={{ color: "var(--success)" }}>Δ -$0.01</span></li>
+              <li>└─ gemini/flash-2.0 <span style={{ color: "var(--text-tertiary)" }}>· governance $0.18 · invoice $0.22 · </span><span style={{ color: "var(--warn)" }}>Δ +$0.04</span></li>
+            </ul>
+          </div>
+        </TierGate>
+      </section>
+
+      {/* Budget alert webhook — Team+ */}
+      <section>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Webhook size={16} aria-hidden="true" style={{ color: "var(--text-secondary)" }} />
+          <h2 className="text-lg font-semibold">Budget Alert Webhook</h2>
+        </div>
+        <TierGate feature="webhook_config" minHeight={120}>
+          <div
+            className="border p-4"
+            style={{
+              borderColor: "var(--border)",
+              background: "var(--card)",
+              borderRadius: "var(--radius-md)",
+            }}
+          >
+            <label
+              htmlFor="demo-webhook-url"
+              style={{ fontSize: "0.75rem", color: "var(--text-secondary)", display: "block", marginBottom: 6 }}
+            >
+              POST when daily budget crosses threshold
+            </label>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                id="demo-webhook-url"
+                type="url"
+                defaultValue="https://hooks.example.com/governance/cost"
+                style={{
+                  flex: 1,
+                  padding: "7px 10px",
+                  background: "var(--elevated)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius-sm)",
+                  color: "var(--fg)",
+                  fontSize: "0.8125rem",
+                  fontFamily: "var(--font-mono)",
+                }}
+              />
+              <button
+                type="button"
+                style={{
+                  padding: "7px 14px",
+                  background: "var(--accent)",
+                  border: "1px solid var(--accent)",
+                  color: "#fff",
+                  fontSize: "0.8125rem",
+                  fontWeight: 500,
+                  borderRadius: "var(--radius-sm)",
+                  cursor: "pointer",
+                }}
+              >
+                Save
+              </button>
+            </div>
+            <p style={{ marginTop: 8, fontSize: "0.6875rem", color: "var(--text-tertiary)" }}>
+              HMAC-signed with your webhook secret. Retries 3× with exponential backoff.
+            </p>
+          </div>
+        </TierGate>
       </section>
     </div>
   );
