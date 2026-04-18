@@ -80,6 +80,10 @@
   --sidebar-width: 260px;
   --sidebar-collapsed: 48px;
   --sidebar-bg: #11131A;
+
+  /* -- Tier accents (demo tier switcher) -- */
+  --accent-violet: #9B4FFF;
+  --accent-gold: #F2B94B;
 }
 
 /* ============================================
@@ -377,6 +381,23 @@ textarea {
 }
 
 /* ============================================
+   TIER SWITCHER
+   ============================================ */
+@keyframes tier-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(130, 40, 245, 0.0);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(130, 40, 245, 0.35);
+    transform: scale(1.05);
+  }
+}
+.tier-pulse {
+  animation: tier-pulse 0.8s ease-in-out 2;
+}
+
+/* ============================================
    REDUCED MOTION
    ============================================ */
 @media (prefers-reduced-motion: reduce) {
@@ -390,3 +411,5 @@ textarea {
     transition-duration: 0.01ms !important;
   }
 }
+
+

@@ -18,8 +18,12 @@ export type CoveragePctReason =
 
 const KNOWN: Record<string, string | null> = {
   ok: null,
+  // v0.6: compliance-officer voice. The v3 copy referenced
+  // ``enable_coverage=True`` — a Python flag name leaking into the
+  // v4 Article 12 surface. The SDK-config phrasing keeps the caveat
+  // actionable without turning the compliance page into developer docs.
   registry_disabled:
-    "Wrapper coverage tracking is off by default. Enable with `enable_coverage=True` to measure what fraction of agents are covered.",
+    "Not measured. Enable wrapper coverage in SDK config to track agent coverage.",
   no_scope_policies_registered:
     "No scope policies exist in this deployment, so coverage is undefined.",
 };

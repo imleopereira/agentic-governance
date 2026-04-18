@@ -1,9 +1,13 @@
 /**
  * Centralized empty-state copy for v4 drill panels.
  *
- * Single source of truth so the v0.6.1 i18n pass is a one-file change.
+ * Single source of truth so the v0.6.2 i18n pass is a one-file change.
  * Every panel in `components/v4/drill/*` imports from here; do NOT
  * hardcode strings in panel components.
+ *
+ * Voice: officer-voice. These strings are read by compliance officers
+ * who know SOC 2 but do not know Python. No version callouts, no raw
+ * code snippets, no dev-team in-jokes. One actionable sentence.
  */
 
 export interface EmptyStateCopy {
@@ -20,21 +24,23 @@ export interface EmptyStates {
 
 export const EMPTY_STATES: EmptyStates = {
   scopePanel: {
-    title: "Allowlist enforced by SDK",
+    title: "No scope policy set for this agent",
     description:
-      "This agent's tool allowlist is fail-closing on every call. Full policy read-back ships in v0.6.",
+      "Until a policy is defined, every tool call is denied by default. A developer can set allowed tools via the governance SDK or from the Approvals page.",
   },
   sessionsPanel: {
     title: "No sessions yet",
-    description: "This agent hasn't logged any activity today.",
+    description: "This agent has not logged any activity today.",
   },
   budgetPanel: {
-    title: "No activity today",
-    description: "Spend will appear once this agent makes its first call.",
+    title: "No spend recorded today",
+    description:
+      "Token and USD spend will appear here once this agent makes its first call.",
   },
   trailPanel: {
-    title: "No events yet",
-    description: "This agent has not logged any events.",
+    title: "No audit events yet",
+    description:
+      "Events will appear here once this agent is wrapped with the governance SDK and begins making calls.",
   },
 } as const;
 

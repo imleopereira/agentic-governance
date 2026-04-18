@@ -169,15 +169,42 @@ async def _run_migrate(database_url: str) -> None:
         )
         return
 
-    _alembic_ini = Path(__file__).resolve().parent.parent.parent.parent / "alembic.ini"
-    if not _alembic_ini.is_file():
+    # Resolve ``alembic.ini`` + ``migrations/`` via the package's own
+    # resource tree. v0.6.0/0.6.1 resolved this via
+    # ``Path(__file__).parent.parent.parent.parent`` — fine for editable
+    # checkouts where the parent dirs walk out to the repo root that
+    # contains ``alembic.ini``, but broken for every ``pip install``: the
+    # walk lands in ``site-packages/`` which has no ``alembic.ini``, the
+    # CLI emitted a warning and returned, and fresh installs silently
+    # stayed on the v0.5 schema. First audit write then failed with
+    # ``StoreUnavailableError`` against the missing ``signature_status``
+    # column. v0.6.2 fix: ship ``alembic.ini`` + ``migrations/`` as
+    # package data under ``codeatelier_governance/`` and locate them via
+    # ``importlib.resources`` so the same code path works for both the
+    # wheel-installed case and editable checkouts.
+    from importlib import resources
+
+    _alembic_ini_path: Path | None = None
+    try:
+        _res = resources.files("codeatelier_governance") / "alembic.ini"
+        # ``Traversable.is_file()`` returns ``False`` for resources that
+        # do exist but live inside a zip — the ``as_file`` context below
+        # materialises them to a real path. For the classic file-on-disk
+        # wheel install we hit is_file()==True immediately.
+        if _res.is_file():
+            _alembic_ini_path = Path(str(_res))
+    except (FileNotFoundError, ModuleNotFoundError, AttributeError):
+        _alembic_ini_path = None
+
+    if _alembic_ini_path is None or not _alembic_ini_path.is_file():
         sys.stderr.write(
-            f"Warning: alembic.ini not found at {_alembic_ini}; "
-            "skipping post-DDL migrations.\n"
+            "Warning: alembic.ini not found inside the codeatelier_governance "
+            "package; skipping post-DDL migrations. This should not happen "
+            "with a pip-installed wheel — please report as a packaging bug.\n"
         )
         return
 
-    cfg = _AlembicConfig(str(_alembic_ini))
+    cfg = _AlembicConfig(str(_alembic_ini_path))
     cfg.set_main_option("sqlalchemy.url", _normalize_url_sync(database_url))
     _alembic_command.upgrade(cfg, "head")
     sys.stdout.write("Applied: alembic upgrade head\n")

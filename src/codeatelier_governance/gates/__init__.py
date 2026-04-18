@@ -14,6 +14,7 @@ from .errors import (
     ApprovalTimeout,
     ApprovalTokenError,
     GateError,
+    TokenVersionTooOldError,
 )
 from .models import ApprovalRequest
 from .module import GatesModule
@@ -26,4 +27,5 @@ __all__ = [
     "ApprovalTokenError",
     "GateError",
     "GatesModule",
+    "TokenVersionTooOldError",
 ]

@@ -2,32 +2,59 @@
 import { useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@/lib/auth";
-import { useEventStreamStore } from "@/lib/store";
+import { api } from "@/lib/api";
 import {
   LayoutGrid, Activity, CheckSquare, ScrollText,
-  DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield,
+  DollarSign, Users, ChevronLeft, ChevronRight, LogOut, Shield, FileCheck,
+  Lock, KeyRound,
 } from "lucide-react";
+import { useTier } from "@/lib/tierContext";
+import type { TierFeature } from "@/lib/tierContext";
 
 interface NavItem {
   label: string; href: string; icon: React.ElementType;
   exact?: boolean; adminOnly?: boolean; showBadge?: boolean;
+  /** When set, Starter renders a lock hint with this tooltip. */
+  starterLockHint?: string;
+  /** When set, the nav item is only visible when `hasFeature(requires)` is true. */
+  requires?: TierFeature;
 }
 
 // FIX 5: when `NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4"`, the middleware
 // rewrites `/` to `/agents`, so a Topology link at `href: "/"` never
 // highlights. Replace it with a proper "Agents" entry in v4; leave the
 // v3 nav untouched.
+//
+// v0.6.2 (Agent E): add `Compliance` entry to the v4 nav so
+// the Article 12 report is reachable from the primary IA, not just the
+// header pill. The route `/compliance` is the only v4-only page beyond
+// `/agents`; the rest of the v4 nav items (`/stream`, `/gates`,
+// `/events`, `/cost`, `/admin/users`) do NOT have `(v4)/*` counterparts
+// yet and transparently hand off to the v3 pages at `app/<route>/`
+// because route-group parentheses don't change URL paths. The v4 shell
+// (fixed header pill, ErrorBoundary, DisconnectBanner) does NOT wrap
+// those handoff pages — this is acceptable for Wave 1.5; Wave 2+ will
+// re-parent routes under `(v4)/` one by one.
+//
+// v3 nav deliberately does NOT include Compliance: `(v4)/compliance`'s
+// layout calls `notFound()` when `NEXT_PUBLIC_CONSOLE_UI_VERSION !== "v4"`,
+// so a Compliance entry in v3 would route v3 users straight to a 404.
 const IS_V4 = process.env.NEXT_PUBLIC_CONSOLE_UI_VERSION === "v4";
 
 const NAV_ITEMS: NavItem[] = IS_V4
   ? [
       { label: "Agents", href: "/agents", icon: LayoutGrid },
+      { label: "Compliance", href: "/compliance", icon: FileCheck },
       { label: "Event Stream", href: "/stream", icon: Activity },
-      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true },
+      { label: "Approvals", href: "/gates", icon: CheckSquare, showBadge: true,
+        starterLockHint: "Review only" },
       { label: "Audit Log", href: "/events", icon: ScrollText },
-      { label: "Cost", href: "/cost", icon: DollarSign },
+      { label: "Cost", href: "/cost", icon: DollarSign,
+        starterLockHint: "Premium features inside" },
       { label: "Users", href: "/admin/users", icon: Users, adminOnly: true },
+      { label: "SSO & SCIM", href: "/admin/sso", icon: KeyRound, requires: "sso_scim" },
     ]
   : [
       { label: "Topology", href: "/", icon: LayoutGrid, exact: true },
@@ -46,7 +73,24 @@ function isActive(href: string, pathname: string, exact?: boolean): boolean {
 export function Sidebar() {
   const pathname = usePathname();
   const { user, logout } = useAuth();
-  const pendingApprovals = useEventStreamStore((s) => s.pendingApprovals);
+  const { tier, hasFeature } = useTier();
+  // v0.6.2: badge must be visible on ALL routes, not just when `/gates` is
+  // active. The Approvals page also owns `["gates-pending"]` and refetches
+  // every 5s, so when the operator is on that page the shared query cache
+  // stays fresh; from any other page the Sidebar's own 30s refetch keeps
+  // the count reasonably current without hammering the API. If the fetch
+  // fails (`data` undefined), we render no badge rather than `?`.
+  const { data: pendingGates } = useQuery({
+    queryKey: ["gates-pending"],
+    queryFn: () => api.gatesPending(),
+    refetchInterval: 30_000,
+    enabled: !!user,
+  });
+  // v0.6.2 followup: /api/v2/gates/pending returns a page wrapper now.
+  // When ``has_more`` is true the badge shows "500+" with an accurate
+  // tooltip so operators know the count is capped, not authoritative.
+  const pendingCount = pendingGates?.items.length ?? 0;
+  const pendingHasMore = pendingGates?.has_more ?? false;
   const [collapsed, setCollapsed] = useState(false);
   const w = collapsed ? 48 : 260;
 
@@ -82,10 +126,14 @@ export function Sidebar() {
 
       {/* Nav items */}
       <nav style={{ flex: 1, padding: "8px 0", overflowY: "auto" }} aria-label="Main navigation">
-        {NAV_ITEMS.filter((item) => !item.adminOnly || user?.role === "admin").map((item) => {
+        {NAV_ITEMS
+          .filter((item) => !item.adminOnly || user?.role === "admin")
+          .filter((item) => !item.requires || hasFeature(item.requires))
+          .map((item) => {
           const active = isActive(item.href, pathname, item.exact);
           const Icon = item.icon;
-          const badge = item.showBadge && pendingApprovals > 0 ? pendingApprovals : 0;
+          const badge = item.showBadge && pendingCount > 0 ? pendingCount : 0;
+          const showStarterLock = tier === "starter" && !!item.starterLockHint && !collapsed;
           return (
             <Link
               key={item.href}
@@ -116,28 +164,51 @@ export function Sidebar() {
                 <Icon size={16} aria-hidden="true"
                   style={{ color: active ? "var(--accent-light)" : "inherit" }} />
                 {badge > 0 && collapsed && (
-                  <span aria-label={`${badge} pending`} style={{
-                    position: "absolute", top: -4, right: -4,
-                    background: "var(--danger)", color: "#fff",
-                    fontSize: "0.625rem", fontWeight: 700, minWidth: 14, height: 14,
-                    borderRadius: 7, display: "flex", alignItems: "center",
-                    justifyContent: "center", padding: "0 2px",
-                  }}>
-                    {badge > 99 ? "99+" : badge}
+                  <span
+                    aria-label={pendingHasMore ? `${badge}+ pending (more available)` : `${badge} pending`}
+                    title={pendingHasMore ? `${badge}+ pending — click to see full queue` : undefined}
+                    style={{
+                      position: "absolute", top: -4, right: -4,
+                      background: "var(--warn)", color: "#1a1a1a",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "0.625rem", fontWeight: 700, minWidth: 14, height: 14,
+                      borderRadius: 7, display: "flex", alignItems: "center",
+                      justifyContent: "center", padding: "0 2px",
+                    }}>
+                    {pendingHasMore ? `${badge > 99 ? "99" : badge}+` : (badge > 99 ? "99+" : badge)}
                   </span>
                 )}
               </span>
               {!collapsed && (
                 <>
-                  <span style={{ flex: 1 }}>{item.label}</span>
+                  <span style={{ flex: 1, display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    {item.label}
+                    {showStarterLock && (
+                      <span
+                        title={item.starterLockHint}
+                        aria-label={`${item.label} — ${item.starterLockHint}`}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          color: "var(--text-tertiary)",
+                        }}
+                      >
+                        <Lock size={10} aria-hidden="true" />
+                      </span>
+                    )}
+                  </span>
                   {badge > 0 && (
-                    <span aria-label={`${badge} pending`} style={{
-                      background: "var(--danger)", color: "#fff",
-                      fontSize: "0.625rem", fontWeight: 700, minWidth: 18, height: 18,
-                      borderRadius: 9, display: "inline-flex", alignItems: "center",
-                      justifyContent: "center", padding: "0 4px", flexShrink: 0,
-                    }}>
-                      {badge > 99 ? "99+" : badge}
+                    <span
+                      aria-label={pendingHasMore ? `${badge}+ pending (more available)` : `${badge} pending`}
+                      title={pendingHasMore ? `${badge}+ pending — click to see full queue` : undefined}
+                      style={{
+                        background: "var(--warn)", color: "#1a1a1a",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: "0.6875rem", fontWeight: 600, minWidth: 18, height: 18,
+                        borderRadius: 9, display: "inline-flex", alignItems: "center",
+                        justifyContent: "center", padding: "0 6px", flexShrink: 0,
+                      }}>
+                      {pendingHasMore ? `${badge > 99 ? "99" : badge}+` : (badge > 99 ? "99+" : badge)}
                     </span>
                   )}
                 </>

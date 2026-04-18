@@ -83,12 +83,38 @@ export interface AuditEvent {
   created_at: string | null;
 }
 
+/**
+ * v0.6.2 followup: extended failure_reason enum to cover the new
+ * rotation-aware / HMAC-compare_digest paths on session/verify.
+ *
+ * The ``<fp16>`` suffix on some variants is a 16-hex-char fingerprint
+ * of the (unresolved) signing key — use ``.split(":")[0]`` to strip
+ * when only the category matters.
+ */
+export type VerifyFailureReason =
+  | "rotation_marker_dual_mac_failed"
+  | "rotation_marker_no_incoming_key"
+  | `rotation_marker_unresolved_incoming:${string}`
+  | "rotation_marker_without_key_versions"
+  | `unresolved_key:${string}`
+  | "hmac_mismatch"
+  | string;  // back-compat: server may emit new reasons ahead of the client.
+
 export interface VerifyResult {
   session_id: string;
   event_count: number;
   verified: boolean;
-  events: Array<{ event_id: string; kind: string; verified: boolean }>;
+  events: Array<{
+    event_id: string;
+    kind: string;
+    verified: boolean;
+    failure_reason?: VerifyFailureReason;
+  }>;
   first_failure: string | null;
+  /** v0.6.2 followup: top-level category of the first failure (if any).
+   *  Undefined when all events verified. Same vocabulary as
+   *  ``VerifyFailureReason`` but scoped to the first breaking event. */
+  first_failure_reason?: VerifyFailureReason;
 }
 
 export interface CostAgent {
@@ -120,6 +146,17 @@ export interface GatePending {
   action_hash: string;
   created_at: string | null;
   expires_at: string | null;
+  reviewer_id?: string | null;
+  reviewing_since?: string | null;
+}
+
+/** v0.6.2 followup: paged response from /api/v2/gates/pending.
+ *  Page size default 500, max 1000. ``next_cursor`` is null when
+ *  ``has_more`` is false. Cursor format: ``"<iso_ts>|<request_id>"``. */
+export interface GatesPendingPage {
+  items: GatePending[];
+  has_more: boolean;
+  next_cursor: string | null;
 }
 
 export interface GateResolved {
@@ -288,7 +325,18 @@ export const api = {
       agentId ? { agent_id: agentId } : {}
     ),
   costModels: () => get<CostModel[]>("/api/cost/models"),
-  gatesPending: () => get<GatePending[]>("/api/gates/pending"),
+  /**
+   * v0.6.2 followup: now hits /api/v2/gates/pending (paged shape) and
+   * returns the full page instead of unwrapping ``items``. Consumers
+   * that previously destructured an array need to use ``.items`` now
+   * (gates/page.tsx + Sidebar.tsx both do so explicitly). Supports
+   * cursor pagination via the optional ``cursor`` argument.
+   */
+  gatesPending: async (cursor?: string): Promise<GatesPendingPage> =>
+    get<GatesPendingPage>(
+      "/api/v2/gates/pending",
+      cursor ? { cursor } : undefined,
+    ),
   gatesRecent: (limit = 50) =>
     get<GateResolved[]>("/api/gates/recent", { limit: String(limit) }),
   posture: () => get<Posture>("/api/posture"),

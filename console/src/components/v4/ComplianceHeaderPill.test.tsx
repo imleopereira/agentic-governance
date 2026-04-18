@@ -30,6 +30,15 @@ vi.mock("@/lib/api", () => ({
   },
 }));
 
+// Mock next/navigation so useRouter() returns a push spy we can assert on.
+// v0.6.2 Wave 1.5 (Agent E): the pill's onClick now NAVIGATES to
+// /compliance rather than silently re-verifying, so we need to capture
+// router.push calls.
+const pushMock = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: pushMock }),
+}));
+
 import { api } from "@/lib/api";
 import { ComplianceHeaderPill } from "./ComplianceHeaderPill";
 
@@ -107,6 +116,7 @@ describe("ComplianceHeaderPill — runtime render", () => {
 
   beforeEach(() => {
     verifyChain.mockReset();
+    pushMock.mockReset();
   });
 
   afterEach(() => {
@@ -134,15 +144,22 @@ describe("ComplianceHeaderPill — runtime render", () => {
     });
   });
 
-  it("renders 'Chain unverified' when verifyChain rejects (DA: never show stale verified)", async () => {
+  it("sets status=unverified on verifyChain reject (DA: never show stale verified)", async () => {
     verifyChain.mockRejectedValueOnce(new Error("boom"));
     render(<ComplianceHeaderPill />);
+    // After a rejected verify, verifiedAtMs stays null so the pill is
+    // stale-neutral and the visible label is "Verifying..." (the label
+    // resolver returns that string when stale). The DA invariant —
+    // "never show a stale verified badge" — is enforced via the
+    // data-status attribute on the pill, which we assert directly.
+    const pill = await screen.findByTestId("compliance-header-pill");
     await waitFor(() => {
-      expect(screen.getByText("Chain unverified")).toBeInTheDocument();
+      expect(pill).toHaveAttribute("data-status", "unverified");
+      expect(pill).toHaveAttribute("data-stale", "true");
     });
   });
 
-  it("click triggers a re-verify and surfaces the new status", async () => {
+  it("pill click navigates to /compliance (Agent E v0.6.2)", async () => {
     const user = userEvent.setup();
     verifyChain.mockResolvedValueOnce(
       verifiedResponse(new Date().toISOString(), "verified"),
@@ -151,18 +168,41 @@ describe("ComplianceHeaderPill — runtime render", () => {
     await waitFor(() => {
       expect(screen.getByText("Chain verified")).toBeInTheDocument();
     });
+    const pill = screen.getByTestId("compliance-header-pill");
+    await user.click(pill);
+    expect(pushMock).toHaveBeenCalledTimes(1);
+    expect(pushMock).toHaveBeenCalledWith("/compliance");
+    // Clicking the pill MUST NOT trigger an additional verify — the
+    // adjacent re-verify button owns that action now.
+    expect(verifyChain).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-verify button has an accessible name and triggers a fresh verify", async () => {
+    const user = userEvent.setup();
+    verifyChain.mockResolvedValueOnce(
+      verifiedResponse(new Date().toISOString(), "verified"),
+    );
+    render(<ComplianceHeaderPill />);
+    await waitFor(() => {
+      expect(screen.getByText("Chain verified")).toBeInTheDocument();
+    });
+    // Second verify returns halted so we can observe the transition.
     verifyChain.mockResolvedValueOnce(
       verifiedResponse(new Date().toISOString(), "halted"),
     );
-    const pill = screen.getByTestId("compliance-header-pill");
-    await user.click(pill);
+    const reverify = screen.getByRole("button", {
+      name: /re-verify chain integrity/i,
+    });
+    await user.click(reverify);
     await waitFor(() => {
       expect(screen.getByText("Chain halted")).toBeInTheDocument();
     });
     expect(verifyChain).toHaveBeenCalledTimes(2);
+    // The re-verify button must NOT also navigate — that's the pill's job.
+    expect(pushMock).not.toHaveBeenCalled();
   });
 
-  it("in-flight guard collapses a burst of clicks onto a single verify", async () => {
+  it("in-flight guard collapses a burst of re-verify clicks onto a single verify", async () => {
     const user = userEvent.setup();
     // Keep the first verify pending for the duration of the click burst.
     let resolveFirst: (value: VerifyChainResult) => void = () => {};
@@ -171,12 +211,15 @@ describe("ComplianceHeaderPill — runtime render", () => {
     });
     verifyChain.mockReturnValueOnce(firstInFlight);
     render(<ComplianceHeaderPill />);
-    // Initial mount kicks off the first verify; click three more times
-    // while it's in-flight. The guard should drop all three.
-    const pill = await screen.findByTestId("compliance-header-pill");
-    await user.click(pill);
-    await user.click(pill);
-    await user.click(pill);
+    // Initial mount kicks off the first verify; click the re-verify
+    // button three more times while it's in-flight. The guard should
+    // drop all three.
+    const reverify = await screen.findByRole("button", {
+      name: /re-verify chain integrity/i,
+    });
+    await user.click(reverify);
+    await user.click(reverify);
+    await user.click(reverify);
     expect(verifyChain).toHaveBeenCalledTimes(1);
     // Resolve the in-flight verify and let the component settle.
     await act(async () => {
@@ -190,13 +233,17 @@ describe("ComplianceHeaderPill — runtime render", () => {
     });
   });
 
-  it("renders aria-live=polite on the pill (a11y)", async () => {
+  it("renders aria-live=polite on the pill group (a11y)", async () => {
     verifyChain.mockResolvedValueOnce(
       verifiedResponse(new Date().toISOString(), "verified"),
     );
     render(<ComplianceHeaderPill />);
-    const pill = await screen.findByTestId("compliance-header-pill");
-    expect(pill).toHaveAttribute("aria-live", "polite");
+    // v0.6.2: aria-live moved to the outer wrapper (now a group with
+    // two buttons — pill + re-verify) so status transitions still
+    // announce politely without the SR losing focus when the user
+    // tabs between the two actions.
+    const group = await screen.findByTestId("compliance-header-pill-group");
+    expect(group).toHaveAttribute("aria-live", "polite");
   });
 
   it("passes axe-core accessibility smoke", async () => {

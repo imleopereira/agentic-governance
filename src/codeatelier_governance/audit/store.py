@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections import deque
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 import structlog
 
-from .errors import StoreUnavailableError
+from .errors import ChainIntegrityError, StoreUnavailableError
 from .models import AuditEventRecord
 
 ChainBuilder = Callable[[str | None], Awaitable[AuditEventRecord]]
@@ -106,14 +106,35 @@ class AuditStore(ABC):
 class InMemoryAuditStore(AuditStore):
     """In-memory store. Used by tests, local dev, and the degraded-mode buffer.
 
-    Bounded in size; evicts oldest events when the cap is reached.
+    Bounded in size; behavior at the cap is controlled by ``on_full``.
+
+    v0.6.2 Bug #11 hardening: prior to v0.6.2 this store silently evicted
+    the oldest event on overflow, which meant tests running against the
+    in-memory store gave false-green on any code path that would break in
+    Postgres (which enforces append-only via triggers). A session with
+    > ``max_events`` events had its HMAC chain silently truncated.
+
+    Default behavior is now ``on_full="raise"`` — tests and production
+    code see the bug immediately. ``on_full="evict"`` preserves ring-
+    buffer semantics for callers who legitimately want a bounded buffer
+    (e.g. the degraded-mode fallback under ``BatchingWriter``); on every
+    eviction a structlog WARN is emitted AND a counter
+    (``stats()["evicted_total"]``) is incremented so the truncation is
+    never silent.
     """
 
-    def __init__(self, max_events: int = 100_000) -> None:
+    def __init__(
+        self,
+        max_events: int = 100_000,
+        *,
+        on_full: Literal["evict", "raise"] = "raise",
+    ) -> None:
         self._events: dict[UUID, AuditEventRecord] = {}
         self._by_session: dict[UUID, list[UUID]] = {}
         self._order: deque[UUID] = deque()
         self._max = max_events
+        self._on_full = on_full
+        self._evicted_total = 0
         self._lock = asyncio.Lock()
         self._session_locks: dict[UUID, asyncio.Lock] = {}
 
@@ -129,10 +150,14 @@ class InMemoryAuditStore(AuditStore):
             prev_hash = self._events[ids[-1]].hmac if ids else None
             record = await builder(prev_hash)
             async with self._lock:
+                # v0.6.2 Bug #11: check the cap BEFORE landing the
+                # record so on_full='raise' refuses the write cleanly
+                # without leaving a partially-appended row that would
+                # later trip verify_chain at a bogus index.
+                self._enforce_cap_before_append(record.event_id)
                 self._events[record.event_id] = record
                 self._by_session.setdefault(session_id, []).append(record.event_id)
                 self._order.append(record.event_id)
-                self._evict_if_full()
         return record
 
     async def write_batch(self, events: list[AuditEventRecord]) -> None:
@@ -143,21 +168,109 @@ class InMemoryAuditStore(AuditStore):
                 # Idempotent: writing the same event_id twice is a no-op.
                 if event.event_id in self._events:
                     continue
+                # v0.6.2 Bug #11: same pre-append gate as the chain
+                # path. If the cap is exceeded under on_full='raise' we
+                # refuse the entire remaining batch (the caller's
+                # ``all-or-nothing`` contract), leaving prior loop
+                # iterations visible — documented by the raise semantic.
+                self._enforce_cap_before_append(event.event_id)
                 self._events[event.event_id] = event
                 self._by_session.setdefault(event.session_id, []).append(
                     event.event_id
                 )
                 self._order.append(event.event_id)
-                self._evict_if_full()
 
-    def _evict_if_full(self) -> None:
-        while len(self._order) > self._max:
+    def _enforce_cap_before_append(self, incoming_event_id: UUID) -> None:
+        """Check the cap BEFORE the incoming write lands.
+
+        Under on_full='raise' this refuses the write cleanly with no
+        partial-state side effects. Under on_full='evict' this pops the
+        oldest event(s) to make room so the incoming write fits without
+        exceeding the cap.
+        """
+        if len(self._order) < self._max:
+            return
+        if self._on_full == "raise":
+            raise StoreUnavailableError(
+                "InMemoryAuditStore: max_events cap reached "
+                f"({self._max}). Default on_full='raise' refuses to "
+                "silently evict — a silently-truncated HMAC chain would "
+                "make tests false-green on code paths that fail in "
+                "Postgres (which enforces append-only).\n"
+                "Fix: either raise max_events, or explicitly opt in to "
+                "ring-buffer semantics with "
+                "InMemoryAuditStore(max_events=N, on_full='evict').",
+                recovery_hint=(
+                    "Increase max_events or pass on_full='evict' if you "
+                    "really want a bounded ring buffer."
+                ),
+            )
+        # Eviction path: pop enough oldest events to leave room for the
+        # incoming write. In practice the loop body runs once, but the
+        # ``while`` shape tolerates out-of-band state (e.g. a mutated
+        # _max between constructions).
+        while len(self._order) >= self._max:
             oldest_id = self._order.popleft()
             evicted = self._events.pop(oldest_id, None)
             if evicted is not None:
                 bucket = self._by_session.get(evicted.session_id)
                 if bucket and oldest_id in bucket:
                     bucket.remove(oldest_id)
+            self._evicted_total += 1
+            logger.warning(
+                "audit.memory_store_evicted",
+                oldest_event_id=str(oldest_id),
+                evicted_count=self._evicted_total,
+                max_events=self._max,
+                incoming_event_id=str(incoming_event_id),
+                detail=(
+                    "InMemoryAuditStore evicted the oldest event to "
+                    "keep size <= max_events. The HMAC chain on this "
+                    "store is now truncated — verify_chain / "
+                    "verify_not_truncated will report the gap."
+                ),
+            )
+
+    def stats(self) -> dict[str, Any]:
+        """Observability hook for the v0.6.2 Bug #11 eviction counter.
+
+        Returns a dict with at least:
+          * ``evicted_total`` — number of events dropped by the ring
+            buffer since the store was constructed. ``> 0`` means the
+            HMAC chain has been truncated and any verify_chain pass
+            against this store is unsound.
+          * ``max_events`` — configured cap.
+          * ``on_full`` — ``"evict"`` or ``"raise"``.
+          * ``size`` — current event count.
+        """
+        return {
+            "evicted_total": self._evicted_total,
+            "max_events": self._max,
+            "on_full": self._on_full,
+            "size": len(self._events),
+        }
+
+    def verify_not_truncated(self) -> bool:
+        """Chain-verifier hook: raise if the store has been truncated.
+
+        The existing ``AuditModule.verify_chain`` only inspects HMAC
+        linkage between CONSECUTIVE events returned by
+        ``get_session_events`` — it cannot see that earlier events were
+        dropped by a ring-buffer eviction. v0.6.2 Bug #11 closes that
+        gap by making truncation an explicit failure signal on the
+        store itself. Callers who want a full chain proof should call
+        both ``AuditModule.verify_chain`` (HMAC + linkage) AND
+        ``InMemoryAuditStore.verify_not_truncated`` (no silent drops).
+        """
+        if self._evicted_total > 0:
+            raise ChainIntegrityError(
+                "InMemoryAuditStore chain truncated: "
+                f"{self._evicted_total} event(s) evicted by the ring "
+                "buffer. verify_chain cannot reconstruct the dropped "
+                "prefix — the earliest remaining event has no "
+                "verifiable prev_hash linkage to the original root."
+            )
+        return True
 
     async def get_event(self, event_id: UUID) -> AuditEventRecord | None:
         return self._events.get(event_id)
@@ -218,8 +331,14 @@ class BatchingWriter:
         primary_timeout_s: float = DEFAULT_PRIMARY_TIMEOUT_S,
     ) -> None:
         self._primary = primary
+        # Degraded-mode fallback: explicitly opt in to ring-buffer
+        # semantics. The BatchingWriter's job is to never silently drop,
+        # and if the fallback's cap is exceeded it handles spillover
+        # upstream — so eviction here is a tolerated last-resort signal,
+        # not a false-green. The per-eviction WARN from the store still
+        # fires so operators see the truncation.
         self._fallback: AuditStore = fallback or InMemoryAuditStore(
-            max_events=buffer_max
+            max_events=buffer_max, on_full="evict"
         )
         self._batch_size = batch_size
         self._flush_interval_s = flush_interval_s

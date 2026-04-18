@@ -43,7 +43,13 @@ class RoutingPolicy(BaseModel):
         RoutingPolicy(
             agent_id="customer-agent",
             strategy="rules",
-            model_rules={"claude-opus-4-6": "claude-sonnet-4-6"},
+            # Map the current expensive tiers to sonnet. Keep both 4-6 and
+            # 4-7 — 4-7 became GA in v0.6.2 and older host code may still
+            # request 4-6 for deterministic behavior.
+            model_rules={
+                "claude-opus-4-7": "claude-sonnet-4-6",
+                "claude-opus-4-6": "claude-sonnet-4-6",
+            },
         )
     """
 

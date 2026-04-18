@@ -1,5 +1,307 @@
 # Changelog
 
+## v0.6.2 (unreleased) — v4 console default flip + 5 P0 enforcement fixes
+
+Patch release. Lands the four parked Wave 1.5 worktrees from the v0.6.1
+polish sprint, flips the default console UI from v3 to v4, and bundles
+five P0 fixes uncovered during the v0.6.1 post-ship team review and a
+subsequent live demo walkthrough:
+
+1. Wheel-packaged migrations (fresh installs were silently skipping alembic).
+2. Grant/deny TOCTOU hardening (mirror of v0.6.1 escalate fix).
+3. Halt enforcement expanded across cost + gates + LLM wrappers.
+4. Grant/deny token HMAC verification (broken since v0.2, caught live).
+5. Session-drawer chain verify is now rotation-aware (pre-rotation events
+   no longer render as `verified=false` after `rotate-chain-key`).
+
+Phase 2 (creative-audit follow-up) additionally lands: rotation-marker
+dual-MAC in session verify, bounded/paginated `/api/gates/pending` (+
+new `/api/v2` paged route), chunked verify off the event loop, serialized
+gate+audit, end-of-stream reconciliation for Anthropic + OpenAI wrappers
+(closes abandonment, cancellation, and double-reconcile vectors),
+`claude-opus-4-7` pricing, strict-by-default `CostModule`/`RevocationStore`/
+`InMemoryAuditStore`, and v2 gate tokens (opt-in in v0.6.2).
+
+No new migrations. **Several public SDK defaults flip this release.**
+See the four BREAKING blocks below before upgrading.
+
+> **BREAKING DEFAULTS** — four defaults flipped to fail-closed instead
+> of silent-degrade. If your code caught exceptions broadly or relied
+> on silent-zero accounting, review these before upgrading.
+>
+> - `CostModule.strict_unknown_models=True` — unknown model names raise
+>   `UnknownModelError` instead of returning `0.0`. Add pricing entries
+>   (`cost/pricing.py::MODEL_PRICING`) or set
+>   `cost_strict_unknown_models=False` with a fallback rate. LangChain
+>   handler is already wired to observe-only mode (never raises);
+>   direct SDK callers see the raise. New env vars:
+>   `GOVERNANCE_COST_STRICT_UNKNOWN_MODELS`,
+>   `GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION`.
+> - `InMemoryAuditStore.on_full="raise"` — hitting `max_events` raises
+>   `StoreUnavailableError` instead of silently evicting. Callers
+>   needing ring-buffer semantics must pass `on_full="evict"`.
+>   `BatchingWriter`'s internal fallback opts into eviction automatically.
+>   `.stats()` + `.verify_not_truncated()` are new.
+> - `RevocationStore.strict_chain=True` — when the audit write inside
+>   `revoke_with_chain_event` fails, the revocation now RAISES
+>   (previously it wrote the row with `chain_event_id=None`). Pass
+>   `strict_chain=False` to preserve degraded-mode behavior; WARN is
+>   logged as `identity.revocation_without_chain_event`.
+> - Gate resolve + audit event now run through a single serialized
+>   path (`on_commit` hook). The narrow residual window (audit
+>   commits, gates rolls back) is documented and detectable via
+>   duplicate `approval.granted` chain rows on one `request_id`.
+>   True cross-engine atomicity is a v0.7+ target.
+
+> **BREAKING WIRE CONTRACT** — `/api/gates/pending` + verify failure
+> reasons.
+>
+> - `/api/gates/pending` (v1) is now admin-only and caps at 500 rows.
+>   Response shape is unchanged (plain array) but carries
+>   `Deprecation: true`, `Sunset: Thu, 01 Oct 2026`, and
+>   `X-Truncated: true` when the cap is hit. Migrate to
+>   `/api/v2/gates/pending` which returns `{items, has_more, next_cursor}`
+>   with keyset pagination (cursor format: `"<iso_ts>|<request_id>"`).
+> - Per-agent reviewer scope is deferred to v0.6.3; `admin` is the
+>   only role with access today. Grant/deny were already admin-only,
+>   so read-scope now matches act-scope.
+> - `GET /api/session/{id}/verify` may return new `failure_reason`
+>   values (`rotation_marker_dual_mac_failed`,
+>   `rotation_marker_no_incoming_key`,
+>   `rotation_marker_unresolved_incoming:<fp16>`,
+>   `rotation_marker_without_key_versions`,
+>   `unresolved_key:<fp16>`, `hmac_mismatch`). New top-level
+>   `first_failure_reason` field scopes the first breaking event.
+
+> **BREAKING BEHAVIOUR (gate token format)** — gate approval tokens
+> gain a v2 format (opt-in in v0.6.2, default in v0.6.3).
+>
+> - `GatesModule(enable_v2_tokens=False)` is the default in v0.6.2.
+>   Tokens mint in legacy v1 format. Set `enable_v2_tokens=True`
+>   (or env `GOVERNANCE_GATES_ENABLE_V2_TOKENS=true`) to opt in to
+>   the `v2:<key_prefix>:…` format, which binds tokens to the HMAC
+>   key version active at issue time — pre-rotation tokens keep
+>   verifying after `rotate-chain-key`. Both formats verify in v0.6.2.
+> - v1 tokens accepted until `accept_v1_until` (default: ~2026-07-17,
+>   90 days post-release). After that cutoff, v1 tokens raise
+>   `TokenVersionTooOldError`. Override via
+>   `GatesModule(accept_v1_until=...)` or env
+>   `GOVERNANCE_GATES_ACCEPT_V1_UNTIL`. Pre-cutoff parses emit
+>   `DeprecationWarning` and `gates.legacy_token_parsed` INFO events.
+> - v0.6.3 will flip `enable_v2_tokens=True` as the default. Rolling
+>   deploys spanning that boundary should set the flag explicitly.
+
+> **BREAKING BEHAVIOUR (streaming accounting)** — Anthropic + OpenAI
+> wrappers.
+>
+> - Streaming responses reconcile actual token usage at end-of-stream.
+>   Previous releases tracked only the projected `max_tokens` value.
+>   Customers with hard USD caps should expect more accurate (and
+>   often higher) cost numbers.
+> - Abandoned streams (proxy returned but never iterated) emit
+>   `governance.stream.abandoned_without_reconcile` WARN and
+>   best-effort reconcile.
+> - Mid-stream exceptions and `asyncio.CancelledError` reconcile with
+>   a conservative `chunks × 8` token estimate instead of silent
+>   projected-wins — closes an agent-initiated budget-bypass vector.
+> - OpenAI `chat.completions.create` wrappers auto-inject
+>   `stream_options={"include_usage": True}` unless the caller
+>   explicitly sets it. Explicit `include_usage=False` is honored
+>   but logs a one-shot WARN.
+> - Reconciling proxy preserves `isinstance()` identity with the
+>   wrapped stream class.
+
+> **BREAKING BEHAVIOUR (halt enforcement):** Calling any enforcement
+> path — `cost.check_or_raise`, `gates.request`, `wrap_openai`,
+> `wrap_anthropic` — against a halted agent now raises
+> `AgentHaltedError`. On v0.5.4–v0.6.1 these paths silently succeeded
+> because only `scope.check` was wired into halt. If your application
+> catches and ignores enforcement errors to allow graceful
+> degradation, add an explicit `except AgentHaltedError` guard
+> before upgrading. Tokens minted BEFORE the halt still resolve
+> through `gates.grant`/`gates.deny`, since the reviewer — not the
+> agent — is the principal on resolution.
+
+> **BREAKING DEFAULT**: The console now loads v4 on first visit.
+>
+> **Run-time rollback (recommended):** append `?ui=v3` to any console
+> URL. This persists via a `console_ui_version` cookie (SameSite=Lax,
+> Secure in production, 30-day max-age) and works on pre-built Docker
+> images and bundled PyPI wheel assets. This is the escape hatch if
+> you cannot rebuild the console.
+>
+> **Build-time rollback (only if you rebuild the console from source):**
+> set `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` BEFORE `next build`.
+> `NEXT_PUBLIC_*` variables are inlined at build time — setting this
+> as a container/runtime env var on a pre-built image is silently
+> ignored.
+>
+> v3 is removed in v0.7.
+
+### Upgrade from v0.5.x
+
+1. **Run `governance migrate`.** v0.6.0 added `signature_status` + Ed25519 columns; v0.6.0/v0.6.1 wheels failed to package the alembic files. v0.6.2 fixes that, but you still need to run the migration. **Without this, the first audit write raises `StoreUnavailableError` against the missing column.**
+2. **Preserve v0.5.x cost behavior** (if you use fine-tuned or non-catalog model names — they used to silently price at `$0`, now they raise):
+   ```python
+   GovernanceSDK(
+       cost_strict_unknown_models=False,
+       cost_unknown_model_fallback_usd_per_million=10.0,
+   )
+   # or via env:
+   #   GOVERNANCE_COST_STRICT_UNKNOWN_MODELS=false
+   #   GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION=10.0
+   ```
+3. **Preserve v0.5.x in-memory ring-buffer semantics** (if anything relies on silent eviction at `max_events`):
+   ```python
+   store = InMemoryAuditStore(on_full="evict", max_events=100_000)
+   ```
+4. **Preserve v0.5.x revocation degraded-mode** (if you tolerate unlinked revocations when the audit write fails):
+   ```python
+   RevocationStore(strict_chain=False)
+   ```
+5. **Add `except AgentHaltedError` guards** around any code that catches enforcement exceptions for graceful degradation. v0.5.x only raised on `scope.check`; v0.6.2 raises on `cost.check_or_raise`, `gates.request`, `wrap_openai`, and `wrap_anthropic` too.
+6. **Streaming cost numbers will go up.** End-of-stream reconciliation corrects the previous `max_tokens`-only projection. Hard-USD-capped customers may see `BudgetExceeded` on workloads that passed before — this is the bypass vector closing, not a regression.
+
+### Upgrade from v0.6.0 / v0.6.1
+
+Steps 2–6 from the v0.5.x path apply. Skip step 1 if you already ran `governance migrate` against a live DB (alembic is idempotent).
+
+Additional v0.6.2-only migration step to avoid a flip-day scramble when v0.6.3 flips gate tokens to v2 default:
+```python
+GatesModule(enable_v2_tokens=True)
+# or:
+#   GOVERNANCE_GATES_ENABLE_V2_TOKENS=true
+```
+
+### Added
+
+- **Wheel-packaged migrations (P0).** `alembic.ini` and the full
+  `migrations/` tree now ship inside the `codeatelier_governance`
+  package and are resolved via `importlib.resources` at
+  `governance migrate` time. v0.6.0 and v0.6.1 wheels omitted these
+  files — fresh `pip install` users ran the base DDL, the alembic step
+  silently no-op'd, the schema stayed on v0.5, and the first audit
+  write raised `StoreUnavailableError` against the missing
+  `signature_status` column. Anyone who already ran `governance migrate`
+  on v0.6.0/0.6.1 against a live DB is unaffected (alembic is
+  idempotent); fresh installs and test fixtures are the ones the fix
+  unblocks.
+- **Grant/deny TOCTOU closed (P0).** `POST /api/gates/:id/grant` and
+  `/deny` now pin the UPDATE to the `reviewer_id` read during the
+  authz check (`IS NOT DISTINCT FROM` handles the unclaimed case) and
+  use `RETURNING` to detect a racing claim. A lost race now returns
+  409 instead of silently granting/denying on a claim owned by a
+  different reviewer. Admins bypass the reviewer pin so
+  incident-response flows still work when a gate is claimed
+  mid-request. Mirrors the v0.6.1 escalate hardening to the remaining
+  two resolution paths; `approval.granted` / `approval.denied` audit
+  rows are emitted only on a successful UPDATE.
+- **Halt enforcement expanded.** `sdk.presence.halt()` now fail-closes
+  every SDK enforcement path — scope, cost, gates, and the
+  `wrap_openai` / `wrap_anthropic` wrappers. v0.5.4 shipped scope-only;
+  the other paths retained a gap where halted agents could keep burning
+  budget, claiming gates, and making LLM calls. Closes that gap.
+  `AgentHaltedError` raised on any enforcement call against a halted
+  agent. Exception: operator-facing `gates.grant()` / `gates.deny()` on
+  tokens minted BEFORE the halt still resolve, because the reviewer —
+  not the agent — is the principal on grant/deny.
+- **Grant/deny token HMAC verification (P0, silently broken since v0.2).**
+  The console's `grant_gate` / `deny_gate` handlers were comparing the
+  full signed token (`{uuid}:{action_hash}:{iso}:{hmac_hex}`) against a
+  self-computed HMAC of just the `request_id` — two different shapes,
+  always mismatched, so any real SDK-minted token rejected with
+  "Token HMAC verification failed." Invisible to every unit test because
+  every mock gate row used `token: None`, skipping the verify branch.
+  Caught during a live demo walkthrough. Fix: dogfood the SDK's own
+  `parse_token` from `gates.tokens` and cross-check `request_id` AND
+  `action_hash` on both grant and deny. Security strengthened: now
+  rejects signature tampering, expiration, wrong-request, AND
+  action_hash tampering. +5 regression tests in
+  `tests/console/test_gates_token_verification.py`.
+- **Session-drawer chain verify is rotation-aware (P0).**
+  `GET /api/session/{id}/verify` now loads `governance_audit_chain_keys`
+  and verifies each row under the key active at ITS `chain_seq` rather
+  than under the single current `AUDIT_SECRET`. Pre-fix, any customer
+  who ran `cga rotate-chain-key` would see legitimate pre-rotation
+  events as `verified=false` in the UI session drawer — the same bug
+  that bit the v0.6.2 demo seed before rotation was dropped from it.
+  Sessions that don't span a rotation see identical output. Missing
+  historical key material surfaces as `verified=false` without raising.
+  +3 regression tests in `tests/console/test_verify_session_rotation.py`.
+- **v4 is the default console UI.** `next.config.ts`, middleware, and
+  the v4 layout all fall through to `v4` when
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION` is unset. `/` rewrites to `/agents`
+  under v4.
+- **Compliance entry in the v4 sidebar.** `FileCheck` icon, routes to
+  `/compliance`, lands on the Article 12 report with the Export button
+  Wave 1 shipped.
+- **ComplianceHeaderPill navigates to /compliance on click.** The
+  pill's primary affordance is now navigation; re-verify moves to an
+  adjacent keyboard-reachable icon button with an explicit
+  `aria-label="Re-verify chain integrity"`. Auto-reverify on stale and
+  the in-flight guard are unchanged.
+- **Officer-voice empty-state copy** for the v4 drill panels
+  (`empty-states.ts`): no version callouts, no raw Python, one
+  actionable sentence per state targeted at compliance officers.
+- **`console_ui_version` cookie persistence.** The `?ui=v3` / `?ui=v4`
+  query override now survives subsequent navigations via a 30-day
+  `SameSite=Lax` cookie. Precedence: query → cookie → env var →
+  default `v4`. The query param is stripped from the URL on the
+  persist-redirect.
+- **Playwright v4-default smoke test.** `tests/e2e/v4-default.spec.ts`
+  (three tests: default `/` → v4, Compliance nav + export button,
+  `?ui=v3` cookie). A new `console-e2e-smoke` CI job runs it on
+  console-touching PRs with `continue-on-error: true` while we collect
+  flake stats. Promote to blocking in v0.7.
+- **UTC timestamps across the console.** `LiveBadge`, `/cost`
+  last-updated, v3 root agent-card, `/stream` event timestamps, and
+  the compliance page all render UTC uniformly (DB + audit chain are
+  UTC; mixing local time in the UI was rehearsal-bait). New shared
+  `console/src/lib/formatDate.ts` helper (`formatUtcTimestamp`,
+  `formatUtcDateForFilename`).
+- **Sidebar approval-count badge always visible.** Previously the
+  count rendered only when `/gates` was the active route. `Sidebar.tsx`
+  now runs its own `useQuery` for `api.gatesPending` (shared queryKey,
+  no double-fetch), 30-s refetch, gated on `!!user`; failure renders
+  no badge (never `?`); count=0 renders no badge. `font-mono`,
+  `var(--warn)` bg, 9px rounded, AA contrast.
+- **Compliance page redesign.** Hero-first IA: `Article 12 evidence`
+  eyebrow → H1 `Chain integrity: verified` (color-coded) → single-line
+  fact row → promoted Export button → inline download confirmation.
+  Dev-voice leak removed (`enable_coverage=True` Python flag →
+  compliance-officer phrasing). Export filename format:
+  `compliance-evidence-YYYY-MM-DD_to_YYYY-MM-DD.json`.
+- **Walkthrough refreshed for v0.6.2.** 6 dev-voice steps → 5
+  compliance-officer-voice steps. v3 route anchors replaced with v4
+  (`/agents`, `/gates`, `/compliance`, compliance-header-pill). Halt
+  described via pill red-state (the drawer halt button was removed
+  for a11y pre-v0.6; API-only today).
+
+### Changed
+
+- **V3DeprecationBanner copy flipped.** Banner (still
+  `NEXT_PUBLIC_SHOW_V3_BANNER`-gated) now shows only when
+  `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` is explicitly set, warning
+  forced-v3 operators that v3 is removed in v0.7. Default-install
+  users never see it because they land on v4.
+- **Sidebar "Topology" → "Agents"** in v4 (`/agents` is the v4
+  landing). v3 nav untouched to preserve the exact shipped v0.6.1
+  layout for escape-hatch users.
+- **ContractsPanel copy.** Removed the stale "ships in v0.6" line;
+  contracts have been registerable in-process since v0.6.0. The new
+  text points at the SDK registration API and notes that a per-agent
+  read endpoint is on the v0.7 roadmap.
+- **`console/src/app/page.tsx`** (v3 root landing) renamed the page
+  component from `TopologyPage` to `AgentsPage`, fixed the H1, and
+  moved the Python onboarding snippet behind `<details>` so the v3
+  empty state stops shouting at non-dev visitors.
+
+### Opt-out
+
+- Set `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` at build time to keep v3 as
+  the default. The `?ui=v3` URL param flips the `console_ui_version`
+  cookie and persists across navigations. v3 is removed in v0.7.
+
 ## v0.6.1 (unreleased) — security sweep fixes
 
 Patch release driven by a 5-agent security sweep against v0.6.0 and a

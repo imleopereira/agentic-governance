@@ -8,6 +8,7 @@ import { MetadataViewer } from "@/components/MetadataViewer";
 import { TimeAgo } from "@/components/TimeAgo";
 import { LiveBadge } from "@/components/LiveBadge";
 import { TableSkeleton } from "@/components/Skeleton";
+import { TierGate } from "@/components/TierGate";
 
 function VerifyButton({ sessionId, prominent }: { sessionId: string; prominent?: boolean }) {
   const [result, setResult] = useState<VerifyResult | null>(null);
@@ -412,7 +413,29 @@ export default function EventsPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Audit Log Explorer</h1>
-        <LiveBadge />
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <TierGate feature="command_palette_halt" minHeight={26}>
+            <span
+              aria-label="Command-K opens the halt palette"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "3px 8px",
+                fontSize: "0.6875rem",
+                fontFamily: "var(--font-mono)",
+                color: "var(--text-secondary)",
+                background: "var(--elevated)",
+                border: "1px solid var(--border)",
+                borderRadius: 999,
+              }}
+            >
+              <kbd style={{ fontFamily: "inherit" }}>⌘K</kbd>
+              <span>halt palette</span>
+            </span>
+          </TierGate>
+          <LiveBadge />
+        </div>
       </div>
 
       {/* Filter bar */}

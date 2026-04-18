@@ -39,8 +39,14 @@ from codeatelier_governance.audit.chain import compute_event_hmac, verify_event
 from codeatelier_governance.audit.models import AuditEventRecord
 
 
+# v0.6.2 relocated ``migrations/`` into the package (P1 wheel-packaging
+# fix) so pip-installed users get the revision files shipped inside the
+# wheel. The repo-root copy is gone; tests resolve revisions via the
+# src-layout path.
 _MIGRATION = (
     Path(__file__).resolve().parents[2]
+    / "src"
+    / "codeatelier_governance"
     / "migrations"
     / "versions"
     / "f251_kill_to_halt_metadata.py"

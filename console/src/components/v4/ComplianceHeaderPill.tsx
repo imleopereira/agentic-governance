@@ -23,9 +23,18 @@
  *
  * Pure helpers live in ``ComplianceHeaderPill.utils.ts`` so vitest can
  * test them without a JSX transform.
+ *
+ * v0.6.2 (Agent E): the pill is the primary visible
+ * affordance for compliance; its onClick now NAVIGATES to
+ * ``/compliance`` instead of silently re-verifying. The re-verify
+ * action moves to an adjacent icon button (↻) so both are keyboard
+ * reachable. Auto-reverify on stale + the in-flight guard are
+ * preserved unchanged.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { RefreshCw } from "lucide-react";
 import { Pill } from "./Pill";
 import { api } from "@/lib/api";
 import {
@@ -47,6 +56,7 @@ export {
 export type { ComplianceChainStatus } from "./ComplianceHeaderPill.utils";
 
 export function ComplianceHeaderPill() {
+  const router = useRouter();
   const [status, setStatus] = useState<ComplianceChainStatus>("unverified");
   const [verifiedAtMs, setVerifiedAtMs] = useState<number | null>(null);
   const [verifiedAtIso, setVerifiedAtIso] = useState<string | null>(null);
@@ -102,23 +112,43 @@ export function ComplianceHeaderPill() {
   const pulse = !reducedMotion && status === "halted" && !stale;
 
   return (
-    <button
-      type="button"
-      onClick={reverify}
+    <div
+      className="inline-flex items-center gap-1"
       aria-live="polite"
-      aria-label={`Compliance ${label}, last verified ${ts}`}
-      title={`Last verified ${ts} — click to re-verify`}
-      className={`inline-flex items-center gap-2 border-0 bg-transparent p-0 ${
-        pulse ? "animate-pulse" : ""
-      }`}
-      data-testid="compliance-header-pill"
-      data-status={status}
-      data-stale={stale ? "true" : "false"}
+      data-testid="compliance-header-pill-group"
     >
-      <Pill tone={tone} title={`Last verified ${ts}`}>
-        {label}
-        <span className="ml-2 opacity-70">{ts}</span>
-      </Pill>
-    </button>
+      <button
+        type="button"
+        onClick={() => router.push("/compliance")}
+        aria-label={`Open compliance report — ${label}, last verified ${ts}`}
+        title={`${label} · last verified ${ts} — open compliance report`}
+        className={`inline-flex items-center gap-2 border-0 bg-transparent p-0 cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--accent)] rounded-md ${
+          pulse ? "animate-pulse" : ""
+        }`}
+        data-testid="compliance-header-pill"
+        data-status={status}
+        data-stale={stale ? "true" : "false"}
+      >
+        <Pill tone={tone} title={`Last verified ${ts}`}>
+          {label}
+          <span className="ml-2 opacity-70">{ts}</span>
+        </Pill>
+      </button>
+      <button
+        type="button"
+        onClick={reverify}
+        disabled={pending}
+        aria-label="Re-verify chain integrity"
+        title="Re-verify chain integrity"
+        className="inline-flex items-center justify-center border-0 bg-transparent p-1 rounded-md text-[color:var(--text-tertiary)] hover:text-[color:var(--fg)] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-[color:var(--accent)]"
+        data-testid="compliance-header-pill-reverify"
+      >
+        <RefreshCw
+          size={12}
+          aria-hidden="true"
+          className={pending ? "animate-spin" : ""}
+        />
+      </button>
+    </div>
   );
 }

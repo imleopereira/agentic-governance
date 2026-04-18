@@ -13,13 +13,31 @@ from __future__ import annotations
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 from uuid import UUID
 
 from .errors import ApprovalTokenError
 from .models import ApprovalRequest
 
 Resolution = Literal["granted", "denied"]
+
+# v0.6.2 P0 — atomic resolve + audit.
+#
+# ``on_commit`` is an async hook invoked by ``resolve`` AFTER the
+# single-use / unknown-request_id checks have passed but BEFORE the
+# resolution is made visible (in-memory mutation committed, DB txn
+# committed). It receives the pending :class:`ApprovalRequest` and may
+# raise. If it raises, the resolution MUST NOT become visible: the
+# in-memory store does not mutate its dicts, the postgres store rolls
+# back the UPDATE via its transaction context. Either way the pending
+# row is left intact so a retry can succeed.
+#
+# This closes the pre-v0.6.2 hole where ``_resolve`` did
+# ``store.resolve()`` (committed) and THEN ``audit.log()`` (separate
+# round-trip). If the worker died between the two, the gate was
+# resolved with no audit row — Article 12 export silently missing the
+# decision.
+OnCommit = Callable[[ApprovalRequest], Awaitable[None]]
 
 
 class GatesStore(ABC):
@@ -41,11 +59,22 @@ class GatesStore(ABC):
         self,
         request_id: UUID,
         resolution: Resolution,
+        *,
+        on_commit: OnCommit | None = None,
     ) -> ApprovalRequest:
         """Atomically resolve a pending request as granted or denied.
 
         Single-use semantics enforced at the database via
         ``WHERE resolved_at IS NULL``. Raises if already resolved.
+
+        When ``on_commit`` is provided, it runs inside the same atomic
+        unit as the state mutation: for :class:`InMemoryGatesStore` that
+        means inside the per-store asyncio lock AND before the resolved
+        dicts are mutated; for :class:`PostgresGatesStore` that means
+        inside the same ``engine.begin()`` transaction that runs the
+        single-use UPDATE. If ``on_commit`` raises, the resolution is
+        NOT persisted and the pending row remains intact. See the
+        module-level ``OnCommit`` docstring for the threat model.
         """
 
     @abstractmethod
@@ -106,6 +135,8 @@ class InMemoryGatesStore(GatesStore):
         self,
         request_id: UUID,
         resolution: Resolution,
+        *,
+        on_commit: OnCommit | None = None,
     ) -> ApprovalRequest:
         async with self._lock:
             if request_id in self._resolutions:
@@ -117,6 +148,14 @@ class InMemoryGatesStore(GatesStore):
                 raise ApprovalTokenError(
                     "approval token: unknown request_id"
                 )
+            # v0.6.2 P0 atomicity: run the audit-emit hook BEFORE mutating
+            # resolution state. If it raises, the pending row stays in
+            # ``self._pending`` and the resolution dicts are not written,
+            # so a retry (same token, after operator fixes the audit
+            # layer) can succeed. Matches the txn-rollback behaviour of
+            # the postgres backend.
+            if on_commit is not None:
+                await on_commit(req)
             self._resolutions[request_id] = resolution
             self._resolved_requests[request_id] = req
             self._pending.pop(request_id, None)

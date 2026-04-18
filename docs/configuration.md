@@ -369,29 +369,6 @@ Per-user request rate limit on the six endpoints wired by F6#4:
 `/api/agents/presence`, `/api/gates/pending`, `/api/gates/recent`.
 Returns HTTP 429 with `Retry-After` when exceeded.
 
-### `GOVERNANCE_COMPLIANCE_RATE_LIMIT`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `1` (requests per 60 seconds per user) |
-| **Read in** | `src/codeatelier_governance/console/app.py:3116` |
-| **Status** | **New in v0.6.0** |
-
-Per-user rate limit on the compliance endpoints (`GET /api/compliance/report`,
-`POST /api/compliance/verify-chain`, `POST /api/compliance/export`). Compliance
-calls are expensive — they verify the HMAC chain over the requested window
-(default last 1000 events) — and should not be treated as cheap polling
-endpoints.
-
-The 1-req-per-60-seconds default is deliberately tight. Raise it only for
-deployments where an auditor or compliance officer legitimately needs to
-export bundles across multiple windows within the rate-limit window.
-
-Returns HTTP 429 with `Retry-After` when exceeded. Rate-limit state is
-process-local (in-memory dict keyed on user id) — multi-worker uvicorn
-deployments multiply the effective limit by worker count.
-
 ---
 
 ## Frontend variables
@@ -403,14 +380,17 @@ Read by the Next.js console UI in `console/`.
 | Property | Value |
 |---|---|
 | **Required** | No |
-| **Default** | `v3` |
-| **Read in** | `console/src/app/(v3)/layout.tsx`, `console/src/components/V3DeprecationBanner.tsx` |
-| **Status** | **New in v0.6** |
+| **Default** | `v4` (flipped from `v3` in v0.6.2) |
+| **Read in** | `console/next.config.ts`, `console/src/middleware.ts`, `console/src/app/(v4)/layout.tsx`, `console/src/components/Sidebar.tsx`, `console/src/components/V3DeprecationBanner.tsx` |
+| **Status** | **Default flipped in v0.6.2** |
 
-Selects which IA shell renders. `v3` (default) keeps the v0.5 console
-UI; `v4` opts into the new IA shell shipped under
-`console/src/app/(v4)/`. The default flips to `v4` once F1 wires the
-F3 backend consumers and un-stubs `useAgentPolicy`.
+Selects which IA shell renders. `v4` (default as of v0.6.2) is the new
+agents-first IA under `console/src/app/(v4)/`; `v3` is the legacy v0.5
+console, still available as an escape hatch and scheduled for removal
+in v0.7. The `?ui=v3` / `?ui=v4` query override handled by
+`middleware.ts` persists via the `console_ui_version` cookie
+(`SameSite=Lax`, path `/`, 30 days); precedence is query → cookie →
+env var → default `v4`.
 
 > ## CRITICAL: this is a build-time variable, not runtime
 >
@@ -454,10 +434,12 @@ F3 backend consumers and un-stubs `useAgentPolicy`.
 | **Status** | **New in v0.6** |
 
 Gate for the v3-deprecation amber banner. Hidden by default because
-there is no telemetry pipeline yet and the team review found it was
-adding noise to the default v3 experience. Set to `1` locally if you
-want to preview the banner. Same `NEXT_PUBLIC_*` build-time caveat as
-above applies.
+there is no telemetry pipeline yet. As of v0.6.2 the banner, when
+enabled, shows ONLY when `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` is set
+explicitly — warning operators who have forced v3 that it will be
+removed in v0.7. Default-install users (now on v4) never see it. Set
+to `1` locally if you want to preview. Same `NEXT_PUBLIC_*` build-time
+caveat as above applies.
 
 ---
 

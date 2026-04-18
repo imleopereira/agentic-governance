@@ -5,6 +5,8 @@ import { Providers } from "./providers";
 import { WalkthroughProvider } from "@/components/Walkthrough";
 import { AppShell } from "@/components/AppShell";
 import { V3DeprecationBanner } from "@/components/V3DeprecationBanner";
+import { TierProvider } from "@/lib/tierContext";
+import { TierSwitcher } from "@/components/TierSwitcher";
 
 const inter = Inter({
   variable: "--font-inter",
@@ -50,10 +52,13 @@ export default function RootLayout({
       </head>
       <body className="min-h-screen antialiased">
         <Providers>
-          <WalkthroughProvider>
-            <V3DeprecationBanner />
-            <AppShell>{children}</AppShell>
-          </WalkthroughProvider>
+          <TierProvider>
+            <WalkthroughProvider>
+              <V3DeprecationBanner />
+              <AppShell>{children}</AppShell>
+              <TierSwitcher />
+            </WalkthroughProvider>
+          </TierProvider>
         </Providers>
       </body>
     </html>

@@ -122,6 +122,53 @@ jobs:
         working-directory: console
         run: npm run typecheck
 
+  console-e2e-smoke:
+    name: console E2E smoke (Playwright)
+    runs-on: ubuntu-latest
+    # v0.6.2 (Wave 1.5 from v0.6.1) — hero smoke for the v4-default flip.
+    # Covers: `/` -> v4, Compliance nav -> export button, ?ui=v3 escape hatch.
+    #
+    # continue-on-error: true is deliberate for this first version.
+    # Rationale: (1) Playwright on a fresh CI runner has known flake
+    # surfaces (browser download, Next dev-server cold start,
+    # network-timing races on redirects); (2) v0.6.2 is a polish
+    # release, and a single flaky E2E must not block a
+    # security/docs/copy fix PR; (3) we want the SIGNAL (red check on
+    # the PR) without the hard gate. Promote to a blocking check in
+    # v0.7 once we have flake stats from 10+ green runs.
+    #
+    # Path filter mirrors console-typecheck so non-console PRs don't
+    # pay the Playwright install cost.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect console changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            console:
+              - 'console/**'
+              - '.github/workflows/test.yml'
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: console/package-lock.json
+      - name: install console deps
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        working-directory: console
+        run: npm ci
+      - name: install Playwright browser (chromium only)
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        working-directory: console
+        run: npx playwright install --with-deps chromium
+      - name: playwright test
+        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
+        working-directory: console
+        run: npm run e2e
+
   console-llm-theater-tripwire:
     name: console LLM-theater tripwire (source-grep tests)
     runs-on: ubuntu-latest

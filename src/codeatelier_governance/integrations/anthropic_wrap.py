@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import weakref
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -44,6 +45,50 @@ logger = structlog.get_logger(__name__)
 # Sentinel tool name used for scope checks at the LLM-call interception point.
 # Anthropic calls have no explicit tool name here, so we use a stable sentinel.
 _MESSAGES_CREATE_SENTINEL = "messages.create"
+
+# v0.6.2-followup (Bug #8 hardening): conservative per-chunk token estimate used
+# when a stream is torn down (cancelled / mid-stream exception) and the provider
+# never exposed final usage. We err on the HIGH side — under-counting is a
+# silent budget bypass, over-counting is a self-DoS recoverable by operator.
+# See _reconcile_stream_usage_async for the full formula.
+STREAM_CHUNK_TOKEN_ESTIMATE = 8
+
+# v0.6.2-followup: strong references to pending reconcile tasks spawned from
+# sync __exit__ / __iter__ paths. Python's asyncio.create_task() docs state:
+# "Save a reference to the result of this function, to avoid a task
+# disappearing mid-execution." Without this set, reconcile tasks spawned from
+# a sync exit may be GC'd before they complete, silently dropping the delta.
+_PENDING_RECONCILES: "set[asyncio.Task[Any]]" = set()
+
+
+def _spawn_tracked_reconcile(loop: asyncio.AbstractEventLoop, coro: Any) -> None:
+    """Spawn a reconcile coroutine as a task, holding a strong ref until done.
+
+    v0.6.2-followup fix: previously ``loop.create_task(_run_reconcile())`` was
+    called fire-and-forget with no reference held. Under load the task could
+    be GC'd before execution, leaving the next ``check_or_raise`` reading
+    stale totals. Now every spawned task is added to ``_PENDING_RECONCILES``
+    and removed via ``add_done_callback``.
+    """
+    task = loop.create_task(coro)
+    _PENDING_RECONCILES.add(task)
+    task.add_done_callback(_PENDING_RECONCILES.discard)
+
+
+async def _halt_check_if_wired(sdk: Any, agent_id: str) -> None:
+    """Fail-closed halt check, run before every enforcement gate (v0.6.2 P0).
+
+    If the SDK has a PresenceModule wired, call ``assert_not_halted(agent_id)``
+    so an operator halt blocks the LLM call BEFORE it touches the network.
+    Silent no-op if presence is not configured (back-compat with SDKs built
+    without ``enable_presence``). Closes the v0.5.4 bypass where halt only
+    fired via scope.check and therefore only hit agents with a registered
+    scope policy.
+    """
+    presence = getattr(sdk, "presence", None)
+    if presence is None:
+        return
+    await presence.assert_not_halted(agent_id)
 
 
 async def _scope_check_if_registered(sdk: Any, agent_id: str, tool_name: str) -> None:
@@ -95,16 +140,47 @@ def _extract_token_usage(response: Any) -> dict[str, int]:
     return usage
 
 
-def _estimate_usd(model: str, usage: dict[str, int]) -> float:
+def _estimate_usd(sdk: Any, model: str, usage: dict[str, int]) -> float:
     """Estimate USD cost using the built-in pricing table.
 
-    Returns 0.0 if the model is unknown or usage is empty.
+    Post-call observation surface — MUST NOT raise by contract. We respect
+    the CostModule's ``strict_unknown_models`` flag but catch
+    :class:`UnknownModelError` and log at ``error`` level so the caller
+    sees the misconfiguration without breaking the host call. In strict
+    mode on unknown model we return 0.0 AND log an error (operator visibility).
+    Callers that want the USD component to be non-zero for unknown models
+    must construct ``CostModule(strict_unknown_models=False,
+    unknown_model_fallback_usd_per_million=X)``.
     """
+    from codeatelier_governance.cost.errors import UnknownModelError
     from codeatelier_governance.cost.pricing import estimate_cost
 
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
-    return estimate_cost(model, input_tokens, output_tokens)
+    cost = getattr(sdk, "cost", None)
+    strict = bool(getattr(cost, "_strict_unknown_models", False))
+    fallback = getattr(cost, "_unknown_model_fallback_usd_per_million", None)
+    try:
+        return estimate_cost(
+            model,
+            input_tokens,
+            output_tokens,
+            strict=strict,
+            fallback_usd_per_million=fallback,
+        )
+    except UnknownModelError as exc:
+        logger.error(
+            "governance.anthropic_wrap.unknown_model",
+            model=model,
+            error=str(exc),
+            detail=(
+                "Unknown model name encountered in post-call cost accounting. "
+                "USD budget caps will not count this call. Add the model to "
+                "MODEL_PRICING or set strict_unknown_models=False with a "
+                "non-zero fallback rate on CostModule."
+            ),
+        )
+        return 0.0
 
 
 def _has_running_loop() -> bool:
@@ -166,49 +242,61 @@ async def _handle_streaming_response(
     stream: Any,
     model: str,
     projected_tokens: int | None,
-) -> None:
-    """Log the streaming audit event with cost_tracked=True.
+) -> Any:
+    """Track projected tokens at stream start; reconcile when stream completes.
 
-    For async streaming responses we cannot iterate the stream inside the wrapper
-    (the caller needs the iterable).  Instead we immediately use ``projected_tokens``
-    (max_tokens from the call kwargs or SDK default) as the tracked usage and emit
-    a ``llm.result`` event with ``cost_tracked=True``.
+    Two-phase cost accounting for streams (v0.6.2 Bug #8 fix):
+      1. At stream start: track ``projected_tokens`` (max_tokens or SDK default)
+         so forward-looking budget gates see this call's projected spend.
+      2. At stream end (via :func:`_wrap_stream_for_reconciliation`): read
+         the provider's final usage and track the DELTA so totals match
+         the provider-of-record.
 
-    If ``projected_tokens`` is unavailable, a warning is emitted and
-    ``cost_tracked=False`` is recorded — the operator must call
-    ``sdk.cost.track()`` manually.
+    Previously the wrapper trusted ``max_tokens`` forever — a stream that
+    overran (early-stop providers), or one where the caller passed a
+    conservative max_tokens=10 but the response was 10k tokens, would be
+    undercounted by 1000x. That's the silent USD-cap bypass.
 
-    Args:
-        sdk: The GovernanceSDK instance.
-        agent_id: The agent identifier.
-        session_id: The current session UUID.
-        stream: The streaming response object (not consumed here).
-        model: The model name used for this call.
-        projected_tokens: The declared max_tokens or SDK default, if available.
+    If ``projected_tokens`` is unavailable, tokens are NOT tracked at
+    stream start but we STILL wrap for reconciliation — so the final
+    provider-reported usage lands in the counters.
+
+    Returns:
+        The stream object, wrapped with a reconciliation proxy. The caller
+        is expected to use this proxy in place of the raw stream.
     """
     if projected_tokens is not None and projected_tokens > 0:
         await _safe_cost_track(sdk, agent_id, session_id, projected_tokens, 0.0)
         await _safe_audit_log(
             sdk, agent_id, "llm.result",
             {"model": model, "streaming": True, "cost_tracked": True,
-             "projected_tokens_tracked": projected_tokens},
+             "projected_tokens_tracked": projected_tokens,
+             "reconciliation": "pending"},
             model=str(model), session_id=session_id,
         )
-    else:
-        logger.warning(
-            "governance.anthropic_wrap.streaming_no_usage",
-            agent_id=agent_id,
-            detail=(
-                "Streaming call with no max_tokens declared and no SDK default. "
-                "Cost not tracked for this call. Pass max_tokens= in your API "
-                "call or set GovernanceSDK(..., default_max_tokens=N)."
-            ),
+        return _wrap_stream_for_reconciliation(
+            stream, sdk, agent_id, session_id, model, projected_tokens,
         )
-        await _safe_audit_log(
-            sdk, agent_id, "llm.result",
-            {"model": model, "streaming": True, "cost_tracked": False},
-            model=str(model), session_id=session_id,
-        )
+    logger.warning(
+        "governance.anthropic_wrap.streaming_no_usage",
+        agent_id=agent_id,
+        detail=(
+            "Streaming call with no max_tokens declared and no SDK default. "
+            "Cost not tracked for this call. Pass max_tokens= in your API "
+            "call or set GovernanceSDK(..., default_max_tokens=N)."
+        ),
+    )
+    await _safe_audit_log(
+        sdk, agent_id, "llm.result",
+        {"model": model, "streaming": True, "cost_tracked": False,
+         "reconciliation": "pending"},
+        model=str(model), session_id=session_id,
+    )
+    # Still wrap for reconciliation: projected_tokens=0 means any actual
+    # usage from the provider lands as a positive delta.
+    return _wrap_stream_for_reconciliation(
+        stream, sdk, agent_id, session_id, model, 0,
+    )
 
 
 async def _safe_audit_log(
@@ -255,6 +343,395 @@ def _is_streaming_response(response: Any) -> bool:
     return type_name in ("MessageStream", "AsyncMessageStream", "Stream", "AsyncStream")
 
 
+def _extract_final_stream_usage(stream: Any) -> dict[str, int] | None:
+    """Extract actual input/output tokens from a completed Anthropic stream.
+
+    The Anthropic SDK exposes several surfaces depending on version:
+        * ``stream.get_final_message()`` returns a Message with ``.usage``
+        * ``stream.final_message`` attribute (older versions)
+        * ``stream.usage`` attribute (newer versions with direct accessor)
+        * ``stream._final_message`` private cache
+
+    This helper probes them in order and returns the first non-None usage.
+    Returns None if none of the probes yield a valid usage block — the
+    caller must then fall back to the projected tokens.
+    """
+    # Try get_final_message() first (the documented API)
+    getter = getattr(stream, "get_final_message", None)
+    if callable(getter):
+        try:
+            final = getter()
+            if final is not None and hasattr(final, "usage"):
+                return _extract_token_usage(final)
+        except Exception:  # noqa: BLE001
+            pass
+    # Try attribute accesses
+    for attr in ("final_message", "_final_message"):
+        final = getattr(stream, attr, None)
+        if final is not None and hasattr(final, "usage"):
+            try:
+                return _extract_token_usage(final)
+            except Exception:  # noqa: BLE001
+                pass
+    # Direct usage on the stream object
+    if hasattr(stream, "usage") and getattr(stream, "usage", None) is not None:
+        try:
+            return _extract_token_usage(stream)
+        except Exception:  # noqa: BLE001
+            pass
+    return None
+
+
+async def _reconcile_stream_usage_async(
+    sdk: Any,
+    agent_id: str,
+    session_id: UUID,
+    stream: Any,
+    model: str,
+    projected_tokens: int,
+    *,
+    chunks_seen: int = 0,
+    torn_down: bool = False,
+) -> None:
+    """After a stream terminates, reconcile projected vs actual tokens.
+
+    Post-call observation surface — MUST NOT raise. On any failure the
+    projected usage remains the tracked amount and a warning is logged.
+    Emits an ``llm.result.reconciled`` audit event so operators can see
+    the true usage vs the projection.
+
+    When the stream was ``torn_down`` (cancellation or mid-stream exception)
+    and the provider couldn't surface final usage, we estimate actual usage
+    from ``chunks_seen * STREAM_CHUNK_TOKEN_ESTIMATE`` — over-counting on
+    purpose so under-counting (the bypass direction) never happens silently.
+
+    Closes Bug #8 (v0.6.2): previously a stream that returned 10k tokens
+    with ``max_tokens=10`` undercounted by 1000x, letting an agent drain
+    a daily USD cap through misdeclared stream sizes.
+    """
+    try:
+        usage = _extract_final_stream_usage(stream)
+        reconciliation_source = "provider_final"
+        if usage is None or "total_tokens" not in usage:
+            if torn_down and chunks_seen > 0:
+                # v0.6.2-followup: stream torn down (CancelledError or provider
+                # exception). Estimate actual as chunks_seen * conservative
+                # per-chunk upper bound, floored at projected_tokens so we
+                # never refund. Over-counting is a self-DoS; under-counting
+                # is a budget bypass — we choose the safe direction.
+                estimated_actual = max(
+                    projected_tokens,
+                    chunks_seen * STREAM_CHUNK_TOKEN_ESTIMATE,
+                )
+                usage = {
+                    "input_tokens": 0,
+                    "output_tokens": estimated_actual,
+                    "total_tokens": estimated_actual,
+                }
+                reconciliation_source = "chunk_estimate"
+                logger.warning(
+                    "governance.anthropic_wrap.stream_usage_estimated",
+                    agent_id=agent_id,
+                    model=model,
+                    projected_tokens=projected_tokens,
+                    chunks_seen=chunks_seen,
+                    estimated_actual=estimated_actual,
+                    detail=(
+                        "Stream torn down before final usage was available; "
+                        "estimating actual tokens from chunk count. "
+                        "Tracked amount may over-count by design."
+                    ),
+                )
+            else:
+                logger.warning(
+                    "governance.anthropic_wrap.stream_usage_unavailable",
+                    agent_id=agent_id,
+                    model=model,
+                    projected_tokens=projected_tokens,
+                    detail=(
+                        "Could not read final usage from Anthropic stream; "
+                        "tracked amount remains the projected (max_tokens) value."
+                    ),
+                )
+                return
+        actual_tokens = usage["total_tokens"]
+        actual_usd = _estimate_usd(sdk, model, usage)
+        cost = getattr(sdk, "cost", None)
+        if cost is None or not hasattr(cost, "reconcile"):
+            # Fallback for older CostModule — emit delta via track().
+            token_delta = max(0, actual_tokens - projected_tokens)
+            if token_delta > 0 or actual_usd > 0.0:
+                await _safe_cost_track(
+                    sdk, agent_id, session_id, token_delta, actual_usd,
+                )
+        else:
+            try:
+                await cost.reconcile(
+                    agent_id,
+                    session_id,
+                    projected_tokens=projected_tokens,
+                    actual_tokens=actual_tokens,
+                    projected_usd=0.0,
+                    actual_usd=actual_usd,
+                    model=model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "governance.anthropic_wrap.reconcile_failed",
+                    agent_id=agent_id,
+                    error_type=type(exc).__name__,
+                )
+        await _safe_audit_log(
+            sdk, agent_id, "llm.result.reconciled",
+            {
+                "model": model,
+                "streaming": True,
+                "projected_tokens": projected_tokens,
+                "actual_tokens": actual_tokens,
+                "actual_usd": actual_usd,
+                "token_delta": actual_tokens - projected_tokens,
+                "reconciliation_source": reconciliation_source,
+            },
+            model=str(model), session_id=session_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "governance.anthropic_wrap.stream_reconcile_error",
+            agent_id=agent_id,
+            error_type=type(exc).__name__,
+        )
+
+
+def _abandonment_finalizer(
+    state: dict[str, Any],
+    agent_id: str,
+    session_id: UUID,
+    projected_tokens: int,
+    model: str,
+) -> None:
+    """Module-level finalizer callback — fires on GC of the proxy.
+
+    MUST NOT capture ``self`` (the proxy) in its closure; weakref.finalize
+    passes the required state explicitly so the proxy can actually be GC'd.
+    If ``state["reconciled"]`` is already True, the normal iteration path
+    reconciled cleanly — no-op. Otherwise the caller dropped the stream
+    without iterating: emit a structured WARN. Best-effort reconcile is
+    skipped here (no live loop from GC thread in general).
+    """
+    if state.get("reconciled"):
+        return
+    state["reconciled"] = True  # prevent duplicate finalizer fires
+    logger.warning(
+        "governance.stream.abandoned_without_reconcile",
+        agent_id=agent_id,
+        session_id=str(session_id),
+        projected_tokens=projected_tokens,
+        model=model,
+        detail=(
+            "Stream proxy was garbage-collected without iteration or close — "
+            "provider usage was never read. Tracked amount remains the "
+            "projected (max_tokens) value. To fix: iterate the stream, use "
+            "`async with`, or call .close()/.aclose()."
+        ),
+    )
+
+
+def _wrap_stream_for_reconciliation(
+    stream: Any,
+    sdk: Any,
+    agent_id: str,
+    session_id: UUID,
+    model: str,
+    projected_tokens: int,
+    state: dict[str, Any] | None = None,
+) -> Any:
+    """Proxy an Anthropic stream so we reconcile usage when iteration ends.
+
+    v0.6.2-followup — closes four bypass vectors found in DA review:
+      * **Abandonment**: ``weakref.finalize`` fires on GC; emits WARN.
+      * **Cancellation / mid-stream exception**: iteration uses
+        ``except BaseException`` so ``CancelledError`` also reconciles
+        (and is re-raised). Partial usage is estimated from ``chunks_seen``.
+      * **Double-reconcile** on ``async with s: async for chunk in s:``:
+        inner and outer proxies share the same ``state`` dict, so the
+        ``reconciled`` flag gates both paths to run reconcile once.
+      * **isinstance transparency**: the proxy reports ``__class__`` as
+        the wrapped stream's class so ``isinstance(proxy, MessageStream)``
+        still holds.
+
+    We return the proxy in place of the stream; attribute access on the
+    proxy transparently delegates to the underlying stream. Reconcile runs
+    AT MOST ONCE per logical stream.
+    """
+    if state is None:
+        state = {"reconciled": False, "chunks_seen": 0}
+
+    # Capture the running loop at proxy-construction time for the finalizer
+    # path. weakref.finalize may fire from a GC thread with no loop context.
+    try:
+        _loop_at_birth = asyncio.get_running_loop()
+        loop_ref: weakref.ref[asyncio.AbstractEventLoop] | None = weakref.ref(_loop_at_birth)
+    except RuntimeError:
+        loop_ref = None
+
+    async def _run_reconcile(torn_down: bool = False) -> None:
+        if state["reconciled"]:
+            return
+        state["reconciled"] = True
+        await _reconcile_stream_usage_async(
+            sdk, agent_id, session_id, stream, model, projected_tokens,
+            chunks_seen=state.get("chunks_seen", 0),
+            torn_down=torn_down,
+        )
+
+    has_aenter = hasattr(stream, "__aenter__")
+    has_aiter = hasattr(stream, "__aiter__")
+    has_enter = hasattr(stream, "__enter__")
+    has_iter = hasattr(stream, "__iter__")
+
+    # v0.6.2-followup: isinstance transparency — stash the wrapped stream's
+    # class so `isinstance(proxy, type(original_stream))` still holds. Users
+    # depend on this to detect MessageStream / AsyncMessageStream.
+    _wrapped_class = type(stream)
+
+    class _ReconcilingProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(stream, name)
+
+        def __repr__(self) -> str:
+            return f"<ReconcilingProxy wrap={stream!r}>"
+
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return _wrapped_class
+
+        if has_aenter:
+            async def __aenter__(self) -> Any:
+                inner = await stream.__aenter__()
+                # Share the same `state` dict so the inner proxy's reconcile
+                # and the outer proxy's __aexit__ reconcile compete on the
+                # same `reconciled` flag — exactly one fires.
+                return _wrap_stream_for_reconciliation(
+                    inner, sdk, agent_id, session_id, model, projected_tokens,
+                    state=state,
+                )
+
+            async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+                try:
+                    return await stream.__aexit__(exc_type, exc, tb)
+                finally:
+                    try:
+                        # torn_down=True when the context is exiting because
+                        # of an exception — triggers the chunk-estimate path
+                        # if provider final usage is unavailable.
+                        await _run_reconcile(torn_down=exc_type is not None)
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.error(
+                            "governance.anthropic_wrap.reconcile_aexit_failed",
+                            error_type=type(_exc).__name__,
+                        )
+
+        if has_enter:
+            def __enter__(self) -> Any:
+                inner = stream.__enter__()
+                return _wrap_stream_for_reconciliation(
+                    inner, sdk, agent_id, session_id, model, projected_tokens,
+                    state=state,
+                )
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+                try:
+                    return stream.__exit__(exc_type, exc, tb)
+                finally:
+                    try:
+                        if _has_running_loop():
+                            loop = asyncio.get_running_loop()
+                            # v0.6.2-followup: hold a strong ref so the task
+                            # is not GC'd before it runs.
+                            _spawn_tracked_reconcile(
+                                loop,
+                                _run_reconcile(torn_down=exc_type is not None),
+                            )
+                        else:
+                            asyncio.run(
+                                _run_reconcile(torn_down=exc_type is not None),
+                            )
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.error(
+                            "governance.anthropic_wrap.reconcile_exit_failed",
+                            error_type=type(_exc).__name__,
+                        )
+
+        if has_aiter:
+            def __aiter__(self) -> Any:
+                async def _gen() -> Any:
+                    # v0.6.2-followup: split the exception-vs-clean paths so
+                    # CancelledError (BaseException) triggers the estimate
+                    # reconcile AND is re-raised. A single `finally` can't
+                    # distinguish "normal stop" from "cancelled" reliably.
+                    try:
+                        async for chunk in stream:
+                            state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                            yield chunk
+                    except BaseException:
+                        # CancelledError is a BaseException in 3.8+. Reconcile
+                        # with torn_down=True, then re-raise so cancellation
+                        # semantics are preserved.
+                        try:
+                            await _run_reconcile(torn_down=True)
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.error(
+                                "governance.anthropic_wrap.reconcile_aiter_failed",
+                                error_type=type(_exc).__name__,
+                            )
+                        raise
+                    else:
+                        try:
+                            await _run_reconcile(torn_down=False)
+                        except Exception as _exc:  # noqa: BLE001
+                            logger.error(
+                                "governance.anthropic_wrap.reconcile_aiter_failed",
+                                error_type=type(_exc).__name__,
+                            )
+                return _gen()
+
+        if has_iter:
+            def __iter__(self) -> Any:
+                torn_down = False
+                try:
+                    for chunk in stream:
+                        state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                        yield chunk
+                except BaseException:
+                    torn_down = True
+                    raise
+                finally:
+                    try:
+                        if _has_running_loop():
+                            loop = asyncio.get_running_loop()
+                            _spawn_tracked_reconcile(
+                                loop, _run_reconcile(torn_down=torn_down),
+                            )
+                        else:
+                            asyncio.run(_run_reconcile(torn_down=torn_down))
+                    except Exception as _exc:  # noqa: BLE001
+                        logger.error(
+                            "governance.anthropic_wrap.reconcile_iter_failed",
+                            error_type=type(_exc).__name__,
+                        )
+
+    proxy = _ReconcilingProxy()
+    # v0.6.2-followup: abandonment detection. weakref.finalize fires when the
+    # proxy is GC'd. Pass only primitives + the state dict — DO NOT capture
+    # `proxy` in the closure or finalize will never fire.
+    weakref.finalize(
+        proxy,
+        _abandonment_finalizer,
+        state, agent_id, session_id, projected_tokens, model,
+    )
+    return proxy
+
+
 def _wrap_sync_create(
     original: Any,
     sdk: GovernanceSDK,
@@ -291,6 +768,11 @@ def _wrap_sync_create(
                 kwargs["model"] = _suggested
                 model = _suggested
 
+        # Enforcement gate 0: halt switch (v0.6.2 P0).
+        # Runs BEFORE scope/cost so a halted agent's LLM call never fires,
+        # even when no scope or budget policy is registered.
+        asyncio.run(_halt_check_if_wired(sdk, agent_id))
+
         # Enforcement gate 1: scope
         asyncio.run(_scope_check_if_registered(sdk, agent_id, _MESSAGES_CREATE_SENTINEL))
 
@@ -313,7 +795,9 @@ def _wrap_sync_create(
             raise
 
         if is_streaming or _is_streaming_response(response):
-            # Item 4: budget gate already ran above. Track projected tokens.
+            # Item 4: budget gate already ran above. Track projected tokens
+            # and return a reconciliation-wrapped stream so the host sees
+            # the true provider usage land as a delta when the stream ends.
             tracked_tokens = _projected or 0
             if tracked_tokens > 0:
                 asyncio.run(_safe_cost_track(sdk, agent_id, session_id, tracked_tokens, 0.0))
@@ -321,7 +805,8 @@ def _wrap_sync_create(
                     _safe_audit_log(
                         sdk, agent_id, "llm.result",
                         {"model": model, "streaming": True, "cost_tracked": True,
-                         "projected_tokens_tracked": tracked_tokens},
+                         "projected_tokens_tracked": tracked_tokens,
+                         "reconciliation": "pending"},
                         model=str(model), session_id=session_id,
                     )
                 )
@@ -331,23 +816,26 @@ def _wrap_sync_create(
                     agent_id=agent_id,
                     detail=(
                         "Streaming call with no max_tokens declared and no SDK default. "
-                        "Cost not tracked for this call. Pass max_tokens= in your API "
-                        "call or set GovernanceSDK(..., default_max_tokens=N)."
+                        "Cost not tracked upfront for this call — will be "
+                        "reconciled against provider usage when the stream ends."
                     ),
                 )
                 asyncio.run(
                     _safe_audit_log(
                         sdk, agent_id, "llm.result",
-                        {"model": model, "streaming": True, "cost_tracked": False},
+                        {"model": model, "streaming": True, "cost_tracked": False,
+                         "reconciliation": "pending"},
                         model=str(model), session_id=session_id,
                     )
                 )
-            return response
+            return _wrap_stream_for_reconciliation(
+                response, sdk, agent_id, session_id, str(model), tracked_tokens,
+            )
 
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
         resp_model = getattr(response, "model", model)
-        usd = _estimate_usd(str(resp_model), usage)
+        usd = _estimate_usd(sdk, str(resp_model), usage)
 
         asyncio.run(
             _safe_audit_log(
@@ -387,6 +875,11 @@ def _wrap_async_create(
                 kwargs["model"] = _suggested
                 model = _suggested
 
+        # Enforcement gate 0: halt switch (v0.6.2 P0). Fires BEFORE scope/cost
+        # so a halted agent's LLM call never fires, even when no scope or
+        # budget policy is registered. Closes the v0.5.4 bypass.
+        await _halt_check_if_wired(sdk, agent_id)
+
         # Enforcement gate 1: scope — raises ScopeViolation if denied.
         # Fires before cost so a scope denial never touches the budget counter.
         await _scope_check_if_registered(sdk, agent_id, _MESSAGES_CREATE_SENTINEL)
@@ -424,11 +917,13 @@ def _wrap_async_create(
         await pre_audit_task
 
         if is_streaming or _is_streaming_response(response):
-            # Item 4: pre-stream gate already ran above. Now accumulate tokens post-stream.
-            await _handle_streaming_response(
+            # Item 4: pre-stream gate already ran above. Track projected
+            # tokens upfront and return a reconciliation-wrapped stream so
+            # the provider's final usage lands as a delta (Bug #8 fix).
+            wrapped = await _handle_streaming_response(
                 sdk, agent_id, session_id, response, model, _projected
             )
-            return response
+            return wrapped
 
         # Observation: audit log + cost track post-call — run concurrently.
         # cost.track must complete before the next check_or_raise to avoid
@@ -437,7 +932,7 @@ def _wrap_async_create(
         usage = _extract_token_usage(response)
         total_tokens = usage.get("total_tokens", 0)
         resp_model = getattr(response, "model", model)
-        usd = _estimate_usd(str(resp_model), usage)
+        usd = _estimate_usd(sdk, str(resp_model), usage)
 
         post_coros: list[Any] = [
             _safe_audit_log(

@@ -111,6 +111,20 @@ class GovernanceConfig:
     # F9 wrapper coverage table (requires the F9 migration to be applied).
     enable_coverage: bool = False
 
+    # v0.6.2 followup: SDK-level opt-out for strict_unknown_models.
+    # v0.6.2 closed a silent-zero budget-bypass (cost/module.py default
+    # strict_unknown_models=True), but customers with fine-tuned model
+    # names had no config-level way to opt out — they had to subclass
+    # CostModule. These two knobs fix that and can also be set via env
+    # vars GOVERNANCE_COST_STRICT_UNKNOWN_MODELS and
+    # GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION.
+    # Precedence: explicit kwarg > env var > default (True / None).
+    # Default True preserves v0.6.2 behavior — flipping to False would
+    # silently undo the P0 budget-bypass fix on upgrade. Customers with
+    # fine-tuned names should set False + fallback rate explicitly.
+    cost_strict_unknown_models: bool = True
+    cost_unknown_model_fallback_usd_per_million: float | None = None
+
     def __post_init__(self) -> None:
         """Validate field constraints that cannot be expressed as dataclass defaults."""
         if self.default_max_tokens is not None and self.default_max_tokens < 1:
@@ -160,6 +174,40 @@ class GovernanceSDK:
                 "Expected: a postgresql:// connection string OR a Code Atelier API key.\n"
                 "Fix: GovernanceSDK(database_url=os.environ['GOVERNANCE_DATABASE_URL'])"
             )
+        # v0.6.2 followup: resolve env-var fallbacks for cost strict-unknown
+        # knobs BEFORE constructing GovernanceConfig, per the "no module-level
+        # env capture" rule (feedback_no_module_level_env_capture.md). Env
+        # reads happen per-instance at __init__ time so test isolation holds.
+        # Precedence: explicit kwarg > env var > default.
+        if "cost_strict_unknown_models" not in kwargs:
+            env_strict = os.environ.get("GOVERNANCE_COST_STRICT_UNKNOWN_MODELS")
+            if env_strict is not None:
+                # Accept "true"/"false"/"1"/"0" (case-insensitive) — anything
+                # else is a misconfiguration that should be loud.
+                normalised = env_strict.strip().lower()
+                if normalised in {"true", "1", "yes", "on"}:
+                    kwargs["cost_strict_unknown_models"] = True
+                elif normalised in {"false", "0", "no", "off"}:
+                    kwargs["cost_strict_unknown_models"] = False
+                else:
+                    raise ValueError(
+                        f"GOVERNANCE_COST_STRICT_UNKNOWN_MODELS must be "
+                        f"true/false/1/0/yes/no/on/off "
+                        f"(got {env_strict!r})"
+                    )
+        if "cost_unknown_model_fallback_usd_per_million" not in kwargs:
+            env_fb = os.environ.get(
+                "GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION"
+            )
+            if env_fb is not None:
+                try:
+                    kwargs["cost_unknown_model_fallback_usd_per_million"] = float(env_fb)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION "
+                        f"must be a float (got {env_fb!r})"
+                    ) from exc
+
         self.config = GovernanceConfig(
             database_url=database_url,
             api_key=api_key,
@@ -268,7 +316,12 @@ class GovernanceSDK:
                 ),
             )
             self.audit = AuditModule(
-                InMemoryAuditStore(max_events=64),
+                # enable_audit=False is explicitly a "no persistence"
+                # path; ring-buffer semantics are the intended behavior,
+                # not a silent HMAC truncation. Opt in to on_full='evict'
+                # so the v0.6.2 default (raise) does not break this
+                # deliberate degraded path.
+                InMemoryAuditStore(max_events=64, on_full="evict"),
                 secret=resolved_secret,
                 signer=self._identity_signer,
             )
@@ -305,6 +358,13 @@ class GovernanceSDK:
                 fail_open=cost_fail_open,
                 database_url=database_url,
                 engine=self._shared_engine,
+                # v0.6.2 followup: forward strict-unknown-models knobs.
+                # Default (True) preserves the v0.6.2 P0 fix; customers
+                # with fine-tuned model names set False + fallback rate.
+                strict_unknown_models=self.config.cost_strict_unknown_models,
+                unknown_model_fallback_usd_per_million=(
+                    self.config.cost_unknown_model_fallback_usd_per_million
+                ),
             )
         else:
             logger.warning(
@@ -351,12 +411,19 @@ class GovernanceSDK:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
             )
-            # v0.5.4 halt switch wiring (renamed from "kill" in v0.6):
-            # scope.check() will fail-closed with AgentHaltedError when an
-            # operator clicks "Halt" in the console. Setter is no-op if
-            # scope is also disabled.
+            # v0.5.4 halt switch wiring (renamed from "kill" in v0.6),
+            # expanded in v0.6.2 P0 to every enforcement module. When an
+            # operator clicks "Halt" in the console, scope.check(),
+            # cost.check_or_raise(), and gates.request() all fail-closed
+            # with AgentHaltedError. wrap_anthropic / wrap_openai read
+            # sdk.presence directly and fail-close before the LLM call.
+            # Setters are no-op if the target module is also disabled.
             if hasattr(self, "scope") and hasattr(self.scope, "set_presence_module"):
                 self.scope.set_presence_module(self.presence)
+            if hasattr(self, "cost") and hasattr(self.cost, "set_presence_module"):
+                self.cost.set_presence_module(self.presence)
+            if hasattr(self, "gates") and hasattr(self.gates, "set_presence_module"):
+                self.gates.set_presence_module(self.presence)
         else:
             logger.warning(
                 "sdk.presence_disabled",

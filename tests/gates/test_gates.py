@@ -143,7 +143,20 @@ async def test_short_secret_is_rejected(audit) -> None:  # type: ignore[no-untyp
 
 @pytest.mark.asyncio
 async def test_forged_token_rejected(gates: GatesModule) -> None:
-    """A token signed by a DIFFERENT secret must fail verification."""
+    """A token signed by a DIFFERENT secret must fail verification.
+
+    v0.6.2: the v2 format embeds the signing key's fingerprint prefix
+    in the token body. A forged token signed by a random secret will
+    carry a random prefix that neither matches the current secret nor
+    any historical key mounted via ``GOVERNANCE_CHAIN_KEY_<prefix>``,
+    so verification now rejects it with
+    ``"historical key unavailable"`` rather than ``"signature
+    mismatch"``. Either message is an ``ApprovalTokenError`` and the
+    operational answer is the same (reject); the test asserts only the
+    rejection, not the specific error string. See
+    ``tests/gates/test_token_rotation.py::test_tampered_hmac_rejected``
+    for the dedicated signature-mismatch assertion.
+    """
     req = await gates.request("k", "a", payload={})
     fake_secret = _secrets.token_bytes(32)
     forged = make_token(
@@ -152,7 +165,7 @@ async def test_forged_token_rejected(gates: GatesModule) -> None:
         action_hash=req.action_hash,
         expires_at=req.expires_at,
     )
-    with pytest.raises(ApprovalTokenError, match="signature mismatch"):
+    with pytest.raises(ApprovalTokenError):
         await gates.grant(forged)
 
 
