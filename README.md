@@ -86,11 +86,40 @@ governance console add-user --username admin --role admin
 
 ## What's new in v0.6.2
 
+**v0.6.2 flips several public SDK defaults to fail-closed.** If you are
+upgrading from v0.5.x or v0.6.0/v0.6.1, read the "Upgrade from" sections
+of `CHANGELOG.md` before `pip install -U` — most breaks surface on the
+first call, not at import time.
+
+- **BREAKING**: `CostModule.strict_unknown_models=True` default —
+  unknown model names (fine-tunes, custom aliases) raise
+  `UnknownModelError` instead of pricing at `$0`. Set
+  `cost_strict_unknown_models=False` with a fallback rate to keep
+  v0.5.x behavior.
+- **BREAKING**: `InMemoryAuditStore(on_full="raise")` default — hitting
+  `max_events` now raises `StoreUnavailableError` instead of silently
+  evicting. Pass `on_full="evict"` for ring-buffer semantics.
+- **BREAKING**: `RevocationStore(strict_chain=True)` default — when the
+  audit write inside `revoke_with_chain_event` fails, the revocation
+  raises instead of writing `chain_event_id=None`. Pass
+  `strict_chain=False` to preserve v0.5.x degraded-mode.
+- **BREAKING**: Halt enforcement now fires across `cost.check_or_raise`,
+  `gates.request`, `wrap_openai`, and `wrap_anthropic`. Add
+  `except AgentHaltedError` where you catch enforcement errors for
+  graceful degradation.
+- **BREAKING**: Streaming token accounting reconciles at end-of-stream.
+  Cost numbers will be more accurate (and often higher) than projected-only.
+- **BREAKING**: `/api/gates/pending` (v1) is now admin-only and caps at
+  500 rows — response carries `Deprecation: true` + `Sunset: Thu, 01 Oct
+  2026`. Migrate HTTP consumers to `/api/v2/gates/pending` which returns
+  `{items, has_more, next_cursor}` with keyset pagination.
 - **v4 is the default console UI.** `NEXT_PUBLIC_CONSOLE_UI_VERSION`
   defaults to `v4` as of v0.6.2; set it to `v3` at build time to keep
   the legacy console. `?ui=v3` persists via a `console_ui_version`
   cookie (SameSite=Lax, 30 days). v3 is removed in v0.7. See
   `docs/configuration.md` for the full escape-hatch semantics.
+- See `CHANGELOG.md` for full BREAKING blocks + `Upgrade from v0.5.x` +
+  `Upgrade from v0.6.0` migration playbooks.
 
 ## What's new in v0.6.0
 

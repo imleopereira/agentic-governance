@@ -138,6 +138,41 @@ See the four BREAKING blocks below before upgrading.
 >
 > v3 is removed in v0.7.
 
+### Upgrade from v0.5.x
+
+1. **Run `governance migrate`.** v0.6.0 added `signature_status` + Ed25519 columns; v0.6.0/v0.6.1 wheels failed to package the alembic files. v0.6.2 fixes that, but you still need to run the migration. **Without this, the first audit write raises `StoreUnavailableError` against the missing column.**
+2. **Preserve v0.5.x cost behavior** (if you use fine-tuned or non-catalog model names — they used to silently price at `$0`, now they raise):
+   ```python
+   GovernanceSDK(
+       cost_strict_unknown_models=False,
+       cost_unknown_model_fallback_usd_per_million=10.0,
+   )
+   # or via env:
+   #   GOVERNANCE_COST_STRICT_UNKNOWN_MODELS=false
+   #   GOVERNANCE_COST_UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION=10.0
+   ```
+3. **Preserve v0.5.x in-memory ring-buffer semantics** (if anything relies on silent eviction at `max_events`):
+   ```python
+   store = InMemoryAuditStore(on_full="evict", max_events=100_000)
+   ```
+4. **Preserve v0.5.x revocation degraded-mode** (if you tolerate unlinked revocations when the audit write fails):
+   ```python
+   RevocationStore(strict_chain=False)
+   ```
+5. **Add `except AgentHaltedError` guards** around any code that catches enforcement exceptions for graceful degradation. v0.5.x only raised on `scope.check`; v0.6.2 raises on `cost.check_or_raise`, `gates.request`, `wrap_openai`, and `wrap_anthropic` too.
+6. **Streaming cost numbers will go up.** End-of-stream reconciliation corrects the previous `max_tokens`-only projection. Hard-USD-capped customers may see `BudgetExceeded` on workloads that passed before — this is the bypass vector closing, not a regression.
+
+### Upgrade from v0.6.0 / v0.6.1
+
+Steps 2–6 from the v0.5.x path apply. Skip step 1 if you already ran `governance migrate` against a live DB (alembic is idempotent).
+
+Additional v0.6.2-only migration step to avoid a flip-day scramble when v0.6.3 flips gate tokens to v2 default:
+```python
+GatesModule(enable_v2_tokens=True)
+# or:
+#   GOVERNANCE_GATES_ENABLE_V2_TOKENS=true
+```
+
 ### Added
 
 - **Wheel-packaged migrations (P0).** `alembic.ini` and the full
