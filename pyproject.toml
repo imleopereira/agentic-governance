@@ -75,6 +75,9 @@ dev = [
     "mypy",
     "coverage",
     "httpx>=0.27",
+    # v0.7.0 platform-bridge unit tests: mock httpx requests without a
+    # live platform so SDK CI can verify forward/retry/auth behavior.
+    "respx>=0.21",
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
 ]
@@ -127,6 +130,10 @@ include-package-data = true
 "codeatelier_governance.presence" = ["*.sql"]
 "codeatelier_governance.migrations" = ["*.py", "*.mako", "README"]
 "codeatelier_governance.migrations.versions" = ["*.py"]
+# v0.7 F3 Agent Recipe CLI: ship templates as package data so
+# ``governance init agent-<kind>`` can read them via importlib.resources
+# regardless of install mode (wheel vs editable).
+"codeatelier_governance.cli.recipes" = ["*.py.tmpl"]
 
 [tool.ruff]
 line-length = 100

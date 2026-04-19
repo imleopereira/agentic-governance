@@ -39,6 +39,14 @@ from ..audit.module import AuditModule
 from .errors import BudgetExceeded
 from .models import BudgetPolicy, BudgetSnapshot
 from .store import CostStore, InMemoryCostStore
+from .webhook import (
+    AlertDedup,
+    build_payload,
+    log_disabled_once,
+    period_bucket_utc_day,
+    send_budget_alert,
+    _webhooks_enabled,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -96,8 +104,13 @@ class CostModule:
         # v0.5.3 SDK construction). This is a deliberate optional dependency:
         # CostModule can still be constructed and tested in isolation.
         self._presence: Any = None
+        # v0.7 F2 — budget-alert webhook dedup. Key:
+        # (agent_id, cap_id, period_bucket). In-memory; see webhook.AlertDedup
+        # docstring for the v0.7.1 upgrade path.
+        self._alert_dedup = AlertDedup()
         for policy in policies or []:
             self._policies[policy.agent_id] = policy
+            log_disabled_once(policy.agent_id, policy.alert_webhook_url is not None)
 
     def set_presence_module(self, presence: Any) -> None:
         """Wire the PresenceModule for halt-switch enforcement (v0.6.2 P0).
@@ -133,6 +146,7 @@ class CostModule:
     def register(self, policy: BudgetPolicy) -> None:
         """Register a budget policy for an agent. Call at app startup."""
         self._policies[policy.agent_id] = policy
+        log_disabled_once(policy.agent_id, policy.alert_webhook_url is not None)
         self._persist_policy_best_effort(policy.agent_id, "budget", policy)
 
     def _persist_policy_best_effort(
@@ -336,6 +350,21 @@ class CostModule:
                 usd=usd,
             )
             return
+        # Capture pre-track daily USD so we can detect threshold crossing
+        # AFTER the store update. Failing to read is non-fatal — we simply
+        # skip the alert check for this tick.
+        pre_usd: float | None = None
+        policy = self._policies.get(agent_id)
+        if (
+            policy is not None
+            and policy.alert_webhook_url is not None
+            and policy.per_agent_usd_daily is not None
+            and usd > 0.0
+        ):
+            try:
+                pre_usd, _ = await self._store.get_agent_daily_usage(agent_id)
+            except Exception:  # noqa: BLE001
+                pre_usd = None
         try:
             await self._store.track(
                 agent_id, session_id, tokens=tokens, usd=usd, model=model,
@@ -346,6 +375,87 @@ class CostModule:
                 error_type=type(exc).__name__,
                 agent_id=agent_id,
                 session_id=str(session_id),
+            )
+            return
+        if pre_usd is not None and policy is not None:
+            await self._maybe_fire_budget_alert(policy, pre_usd)
+
+    async def _maybe_fire_budget_alert(
+        self, policy: BudgetPolicy, pre_usd: float
+    ) -> None:
+        """Fire the budget-alert webhook iff the track() just crossed the threshold.
+
+        Non-breaking: catches and logs every failure — track() must never
+        raise on behalf of host code. Dedup is in-memory (see AlertDedup).
+
+        Crossing definition: ``pre_usd < threshold <= post_usd`` where
+        threshold = ``policy.alert_threshold_pct / 100 * per_agent_usd_daily``.
+        A single call that vaults past the threshold fires exactly once.
+        """
+        # Feature-flag gate. The flag is authoritative — even with a URL
+        # configured, flag-off means no POST. We still logged the once-per
+        # startup "disabled" notice at register() time.
+        if not _webhooks_enabled():
+            return
+        if (
+            policy.alert_webhook_url is None
+            or policy.alert_webhook_secret is None
+            or policy.per_agent_usd_daily is None
+        ):
+            # Secret is required — we never send an unsigned webhook.
+            if policy.alert_webhook_url is not None and policy.alert_webhook_secret is None:
+                logger.warning(
+                    "cost.webhook_missing_secret",
+                    agent_id=policy.agent_id,
+                    detail=(
+                        "alert_webhook_url configured without "
+                        "alert_webhook_secret; refusing to send unsigned POST."
+                    ),
+                )
+            return
+        try:
+            post_usd, _ = await self._store.get_agent_daily_usage(policy.agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cost.webhook_usage_read_failed",
+                agent_id=policy.agent_id,
+                error_type=type(exc).__name__,
+            )
+            return
+        threshold = policy.per_agent_usd_daily * (policy.alert_threshold_pct / 100.0)
+        if not (pre_usd < threshold <= post_usd):
+            return
+        cap_id = "per_agent_usd_daily"
+        bucket = period_bucket_utc_day()
+        if not self._alert_dedup.mark_if_unfired(policy.agent_id, cap_id, bucket):
+            logger.debug(
+                "cost.webhook_skip_duplicate_crossing",
+                agent_id=policy.agent_id,
+                cap_id=cap_id,
+                period_bucket=bucket,
+            )
+            return
+        payload = build_payload(
+            agent_id=policy.agent_id,
+            cap_id=cap_id,
+            cap_type="per_agent_usd_daily",
+            cap_value=policy.per_agent_usd_daily,
+            used_value=post_usd,
+            threshold_pct=policy.alert_threshold_pct,
+            period_bucket=bucket,
+        )
+        try:
+            secret_value = policy.alert_webhook_secret.get_secret_value()
+            await send_budget_alert(
+                url=policy.alert_webhook_url,
+                secret=secret_value,
+                payload=payload,
+            )
+        except Exception as exc:  # noqa: BLE001 — non-breaking
+            logger.error(
+                "cost.webhook_fire_failed",
+                agent_id=policy.agent_id,
+                error_type=type(exc).__name__,
             )
 
     async def reconcile(
