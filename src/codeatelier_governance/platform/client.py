@@ -225,6 +225,16 @@ class PlatformClient:
         self._pending_5xx_since_warn: int = 0
         self._started = False
         self._closed = False
+        # Per-workflow monotonic seq counter. Bridge serializes forwards
+        # through ``_seq_lock`` + ``_next_seq`` so the platform's
+        # (workflow_id, seq) unique index is satisfied. Starts at 1
+        # because the platform rejects seq=0 at the Zod layer; if the
+        # platform already has events for this token's workflow (e.g.
+        # a prior SDK process, or a curl probe during dev), the 409
+        # seq_out_of_order response carries ``expected_seq`` which we
+        # use to self-heal the counter in-place.
+        self._next_seq: int = 1
+        self._seq_lock: asyncio.Lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -416,16 +426,21 @@ class PlatformClient:
         Cumulative wall-clock is capped at 15s. After the budget is
         exhausted or ``max_retries`` is reached, the event is dropped.
         """
-        body = _event_to_wire(queued.event)
         headers = {
             "Authorization": f"Bearer {self._config.ingest_token}",
             "Content-Type": "application/json",
             "User-Agent": f"codeatelier-governance/{SDK_VERSION}",
         }
 
+        async with self._seq_lock:
+            seq = self._next_seq
+            self._next_seq += 1
+        body = _event_to_wire(queued.event, seq=seq)
+
         attempt = 0
         backoff = 1.0  # seconds; doubles each retry
         start = time.monotonic()
+        seq_healed = False
 
         while True:
             elapsed = time.monotonic() - start
@@ -474,10 +489,31 @@ class PlatformClient:
                 self._handle_auth_failure(response)
                 return
             if status == 409:
-                # Duplicate / seq_out_of_order — normal for retries.
-                # Log at DEBUG and treat as success (event already
-                # landed on a previous attempt). Does NOT count as
-                # sent because the prior attempt already did.
+                # Two flavors:
+                #   * duplicate event_id — normal on retry; treat as success
+                #   * seq_out_of_order — platform knows the expected seq;
+                #     self-heal the counter and retry ONCE. This handles
+                #     the cold-start case where the SDK's in-memory
+                #     counter doesn't know about prior events on the
+                #     workflow's chain.
+                expected_seq = _parse_expected_seq(response)
+                if (
+                    expected_seq is not None
+                    and not seq_healed
+                    and attempt <= self._config.max_retries
+                ):
+                    async with self._seq_lock:
+                        # Jump ahead. Use max() so concurrent forwards
+                        # that already observed a higher counter don't
+                        # regress.
+                        if self._next_seq < expected_seq + 1:
+                            self._next_seq = expected_seq + 1
+                    seq = expected_seq
+                    body = _event_to_wire(queued.event, seq=seq)
+                    seq_healed = True
+                    self._stats.retries += 1
+                    attempt += 1
+                    continue
                 logger.debug(
                     "platform.duplicate_or_out_of_order",
                     status=status,
@@ -601,17 +637,20 @@ class PlatformClient:
     # Ops surface
     # ------------------------------------------------------------------
 
-    def stats(self) -> dict[str, int]:
-        """Return a snapshot of the running counters.
+    def stats(self) -> dict[str, Any]:
+        """Return a snapshot of the running counters + state flags.
 
         Safe to call at any time. Returned dict is a copy, so mutating
-        it does not affect the client.
+        it does not affect the client. ``disabled`` is a boolean flag
+        that flips True after a 401 latch (bridge disabled for the
+        process lifetime).
         """
         return {
             "sent": self._stats.sent,
             "dropped_queue_full": self._stats.dropped_queue_full,
             "dropped_4xx": self._stats.dropped_4xx,
             "dropped_5xx": self._stats.dropped_5xx,
+            "disabled": self._auth_failed,
             "retries": self._stats.retries,
         }
 
@@ -621,26 +660,23 @@ class PlatformClient:
 # ----------------------------------------------------------------------
 
 
-def _event_to_wire(event: "AuditEventRecord") -> dict[str, Any]:
+def _event_to_wire(event: "AuditEventRecord", *, seq: int) -> dict[str, Any]:
     """Project an AuditEventRecord onto the ingest wire format.
 
     Mapping (from spec):
         event_id      -> str(record.event_id)
         event_type    -> record.kind
         agent_id      -> record.agent_id
-        seq           -> absent from AuditEventRecord at v0.7.0; we
-                         fall back to 0 (server ignores for auth and
-                         re-derives on its side). See TODO below.
+        seq           -> caller-supplied monotonic counter; platform
+                         enforces ``seq == last_seq + 1`` under advisory
+                         lock per (workflow_id). Caller (PlatformClient)
+                         maintains the counter with a 409-seq-out-of-order
+                         self-heal hook.
         decision      -> inferred from record.kind (allow/deny/None)
         payload       -> full model dump with chain fields included
         prev_hash     -> record.prev_hash (or "" for the root event)
         client_hmac   -> record.hmac
-        sdk_version   -> "0.7.0"
-
-    TODO(v0.8): wire a real monotonic ``seq`` once the audit store
-    exposes it. For now the server treats seq as advisory and
-    re-derives from insertion order, so sending 0 is safe — the
-    server's own ordering is authoritative.
+        sdk_version   -> resolved from importlib.metadata
     """
     decision = _infer_decision(event.kind)
     # Payload mirrors the AuditEventRecord as JSON-safe primitives.
@@ -668,17 +704,22 @@ def _event_to_wire(event: "AuditEventRecord") -> dict[str, Any]:
     if event.signature is not None:
         payload["signature_hex"] = event.signature.hex()
 
-    return {
+    wire: dict[str, Any] = {
         "event_id": str(event.event_id),
         "event_type": event.kind,
         "agent_id": event.agent_id,
-        "seq": 0,  # see TODO above
-        "decision": decision,
+        "seq": seq,
         "payload": payload,
         "prev_hash": event.prev_hash or "",
         "client_hmac": event.hmac,
         "sdk_version": SDK_VERSION,
     }
+    # Platform's Zod schema treats ``decision`` as optional-string, not
+    # nullable-string. Send the key only when we have a value, otherwise
+    # omit entirely so the field is undefined on the wire.
+    if decision is not None:
+        wire["decision"] = decision
+    return wire
 
 
 _DENY_SEGMENTS = {"denied", "violation", "exceeded", "halted"}
@@ -702,6 +743,41 @@ def _infer_decision(kind: str) -> str | None:
     if segments & _ALLOW_SEGMENTS:
         return "allow"
     return None
+
+
+_EXPECTED_SEQ_RE = re.compile(r"expected seq=(\d+)")
+
+
+def _parse_expected_seq(response: Any) -> int | None:
+    """Extract ``expected_seq`` from a 409 seq_out_of_order response.
+
+    Platform returns shape:
+        {"ok": false, "error": "seq_out_of_order",
+         "message": "expected seq=42, got 17"}
+
+    We regex the message so a minor wording drift on the platform side
+    (e.g. adding spaces) doesn't break self-heal — but if the platform
+    stops returning the number entirely, we return None and fall back
+    to the classic "log DEBUG and drop" behavior.
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(body, dict):
+        return None
+    if body.get("error") != "seq_out_of_order":
+        return None
+    msg = body.get("message", "")
+    if not isinstance(msg, str):
+        return None
+    match = _EXPECTED_SEQ_RE.search(msg)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def _parse_retry_after(response: Any) -> float | None:
