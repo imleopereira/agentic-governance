@@ -111,6 +111,11 @@ class _Stats:
     dropped_queue_full: int = 0
     dropped_4xx: int = 0
     dropped_5xx: int = 0
+    # Incremented each time a 409 seq_out_of_order arrives AFTER the
+    # single per-event self-heal has already been applied, or when the
+    # platform's 409 body lacks ``expected_seq``. Surfaces parallel-SDK
+    # chain conflicts that would otherwise drop silently at DEBUG.
+    dropped_seq_conflict: int = 0
     retries: int = 0
 
 
@@ -138,7 +143,9 @@ def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
 
 
-def _validate_url_for_tls(url: str) -> None:
+def _validate_url_for_tls(
+    url: str, trusted_hosts: tuple[str, ...] | None = None
+) -> None:
     """Reject http:// on any host other than localhost / 127.0.0.1.
 
     Called at PlatformClient init. The intent is to fail LOUDLY at
@@ -146,28 +153,52 @@ def _validate_url_for_tls(url: str) -> None:
     configuration in production — http:// to a non-localhost host
     almost always means the operator copy-pasted a dev URL.
 
+    When ``trusted_hosts`` is provided, the URL's hostname must also
+    appear in the allowlist. This is an SSRF hardening knob for
+    deployments that pin the bridge to a specific platform host and
+    want any deviation (typo, compromised env var) to fail at startup
+    rather than silently ship audit events to the wrong destination.
+
     Raises
     ------
     PlatformConfigError
-        When the scheme is http:// and the host is not localhost.
+        When the scheme is http:// and the host is not localhost, OR
+        when ``trusted_hosts`` is set and the URL's host is not in it.
     """
     parsed = urlparse(url)
+    scheme_ok = False
     if parsed.scheme == "https":
-        return
-    if parsed.scheme != "http":
+        scheme_ok = True
+    elif parsed.scheme == "http":
+        host = (parsed.hostname or "").lower()
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            scheme_ok = True
+        else:
+            raise PlatformConfigError(
+                f"PlatformConfig.ingest_url uses http:// with non-localhost "
+                f"host {host!r}. TLS is mandatory for remote ingestion; use "
+                f"https://. (Only http://localhost:* and http://127.0.0.1:* "
+                f"are permitted for local development.)"
+            )
+    else:
         raise PlatformConfigError(
             f"PlatformConfig.ingest_url must use http:// or https:// "
             f"(got scheme {parsed.scheme!r})"
         )
-    host = (parsed.hostname or "").lower()
-    if host in {"localhost", "127.0.0.1", "::1"}:
-        return
-    raise PlatformConfigError(
-        f"PlatformConfig.ingest_url uses http:// with non-localhost host "
-        f"{host!r}. TLS is mandatory for remote ingestion; use https://. "
-        f"(Only http://localhost:* and http://127.0.0.1:* are permitted "
-        f"for local development.)"
-    )
+
+    if scheme_ok and trusted_hosts is not None:
+        host = (parsed.hostname or "").lower()
+        allowed = {h.lower() for h in trusted_hosts}
+        if host not in allowed:
+            # Security P1: SSRF allowlist. Never echo the configured
+            # tuple in the exception — a production config may consider
+            # the list of valid hosts sensitive. The attempted host is
+            # safe to include because the user supplied it.
+            raise PlatformConfigError(
+                f"PlatformConfig.ingest_url host {host!r} is not in the "
+                f"configured trusted_hosts allowlist. Refusing to POST "
+                f"audit events to an untrusted destination."
+            )
 
 
 class PlatformClient:
@@ -198,7 +229,7 @@ class PlatformClient:
                 "platform bridge"
             ) from exc
 
-        _validate_url_for_tls(config.ingest_url)
+        _validate_url_for_tls(config.ingest_url, config.trusted_hosts)
 
         self._config = config
         self._token_fp = _token_fingerprint(config.ingest_token)
@@ -223,6 +254,16 @@ class PlatformClient:
         # per minute so transient platform hiccups don't fill the log.
         self._last_5xx_warn_monotonic: float = 0.0
         self._pending_5xx_since_warn: int = 0
+        # Queue-full drop summary: same pattern as the 5xx coalescer.
+        # Without this, a 9000-event burst against a saturated queue
+        # would emit 9000 WARN lines. SWE-B P1.
+        self._last_queue_full_warn_monotonic: float = 0.0
+        self._pending_queue_full_since_warn: int = 0
+        # Seq-conflict drop summary: fires when a 409 seq_out_of_order
+        # slips past the single-shot self-heal (parallel-SDK chain
+        # contention, or platform omitting expected_seq). SWE-B P1.
+        self._last_seq_conflict_warn_monotonic: float = 0.0
+        self._pending_seq_conflict_since_warn: int = 0
         self._started = False
         self._closed = False
         # Per-workflow monotonic seq counter. Bridge serializes forwards
@@ -352,17 +393,29 @@ class PlatformClient:
         # a run of drops against a saturated queue should show the
         # platform the *current* state, not the stale backlog.
         try:
-            dropped = self._queue.get_nowait()
+            self._queue.get_nowait()
             # Mark the dropped task as done so the queue.join() in
             # close() can converge.
             self._queue.task_done()
             self._stats.dropped_queue_full += 1
-            logger.warning(
-                "platform.queue_full_dropped_oldest",
-                dropped_total=self._stats.dropped_queue_full,
-                token_fp=self._token_fp,
-                dropped_event_id=str(dropped.event.event_id),
-            )
+            self._pending_queue_full_since_warn += 1
+            # Coalesce WARNs: one per minute summarizes the full burst
+            # instead of flooding the log with one line per dropped
+            # event. SWE-B P1 rate-limit pattern (mirrors 5xx summary).
+            now = time.monotonic()
+            if (
+                now - self._last_queue_full_warn_monotonic
+                >= _FIVEXX_WARN_WINDOW_SECONDS
+            ):
+                self._last_queue_full_warn_monotonic = now
+                logger.warning(
+                    "platform.queue_full_drop_summary",
+                    dropped_queue_full_total=self._stats.dropped_queue_full,
+                    dropped_since_last_warn=self._pending_queue_full_since_warn,
+                    max_queue_size=self._config.max_queue_size,
+                    token_fp=self._token_fp,
+                )
+                self._pending_queue_full_since_warn = 0
         except asyncio.QueueEmpty:  # pragma: no cover — racy, but benign
             pass
         try:
@@ -514,10 +567,19 @@ class PlatformClient:
                     self._stats.retries += 1
                     attempt += 1
                     continue
-                logger.debug(
-                    "platform.duplicate_or_out_of_order",
+                # Fallthrough: either
+                #   * platform omitted expected_seq (we can't self-heal), or
+                #   * self-heal was already used on this event and we're
+                #     STILL getting 409 — indicates a parallel writer
+                #     against the same workflow chain.
+                # Previously this path logged DEBUG and dropped silently,
+                # hiding real data loss in multi-SDK deployments. We now
+                # bump a dedicated counter and emit a WARN summary at
+                # most once per minute. SWE-B P1.
+                self._record_seq_conflict_drop(
                     status=status,
-                    token_fp=self._token_fp,
+                    seq=seq,
+                    seq_healed=seq_healed,
                 )
                 return
             if status == 413:
@@ -613,6 +675,35 @@ class PlatformClient:
                 ),
             )
 
+    def _record_seq_conflict_drop(
+        self, *, status: int, seq: int, seq_healed: bool
+    ) -> None:
+        """Count a 409 that bypassed the per-event self-heal.
+
+        Emits a per-minute WARN summary mirroring the 5xx and queue-full
+        coalescers. ``seq_healed`` in the log distinguishes
+        "platform omitted expected_seq" (False) from "parallel writer
+        caused repeat conflict" (True) so operators can diagnose.
+        """
+        self._stats.dropped_seq_conflict += 1
+        self._pending_seq_conflict_since_warn += 1
+        now = time.monotonic()
+        if (
+            now - self._last_seq_conflict_warn_monotonic
+            >= _FIVEXX_WARN_WINDOW_SECONDS
+        ):
+            self._last_seq_conflict_warn_monotonic = now
+            logger.warning(
+                "platform.seq_conflict_drop_summary",
+                dropped_seq_conflict_total=self._stats.dropped_seq_conflict,
+                dropped_since_last_warn=self._pending_seq_conflict_since_warn,
+                status=status,
+                last_seq=seq,
+                self_heal_already_used=seq_healed,
+                token_fp=self._token_fp,
+            )
+            self._pending_seq_conflict_since_warn = 0
+
     def _record_5xx_drop(
         self, *, reason: str, attempt: int, elapsed: float
     ) -> None:
@@ -650,6 +741,7 @@ class PlatformClient:
             "dropped_queue_full": self._stats.dropped_queue_full,
             "dropped_4xx": self._stats.dropped_4xx,
             "dropped_5xx": self._stats.dropped_5xx,
+            "dropped_seq_conflict": self._stats.dropped_seq_conflict,
             "disabled": self._auth_failed,
             "retries": self._stats.retries,
         }

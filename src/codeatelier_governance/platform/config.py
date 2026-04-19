@@ -64,8 +64,21 @@ class PlatformConfig:
     max_queue_size: int = 1000
     max_retries: int = 4
     timeout_seconds: float = 10.0
+    # Optional SSRF allowlist: if set, PlatformClient refuses any
+    # ingest_url whose hostname is not in this tuple. Used by security-
+    # hardened deployments that pin the bridge to a known set of
+    # platform hostnames. None = "no allowlist, any valid TLS host
+    # accepted" (still subject to http:// rejection in client.py).
+    # Security P1.
+    trusted_hosts: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
+        # SWE-B P2: strip trailing/leading whitespace that commonly slips
+        # in via env-var copy-paste (``\n`` from a shell heredoc, the
+        # stray space at the end of a .env line). frozen=True blocks
+        # normal assignment so we route through object.__setattr__.
+        object.__setattr__(self, "ingest_url", self.ingest_url.strip())
+        object.__setattr__(self, "ingest_token", self.ingest_token.strip())
         if not self.ingest_url:
             raise ValueError("PlatformConfig.ingest_url must be non-empty")
         if not self.ingest_token:
