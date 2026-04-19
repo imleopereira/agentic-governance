@@ -143,7 +143,9 @@ def test_handler_without_cost_module_still_safe() -> None:
         fget=lambda self: (_ for _ in ()).throw(AttributeError())
     )
 
-    handler = GovernanceCallbackHandler(
+    # Construct once to confirm the property-raises case doesn't crash init;
+    # the assertion path below uses sdk2 (plain-missing attribute).
+    GovernanceCallbackHandler(
         sdk=sdk, agent_id="no-cost-agent", session_id=uuid4(),
     )
 

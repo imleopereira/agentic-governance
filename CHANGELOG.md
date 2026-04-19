@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.7.0 (unreleased) — platform bridge + distribution pivot
+## v0.7.0 — platform bridge + distribution pivot
 
 Distribution-pivot release. The SDK gains an optional **platform bridge**
 that dual-writes audit events to a hosted Code Atelier Governance
@@ -27,7 +27,7 @@ Everything in v0.7.0 is additive — no BREAKING changes from v0.6.2.
 > the active state with the configured URL — so env-driven activation
 > is never invisible to an operator watching logs.
 
-### Added (in progress)
+### Added
 
 - **Platform bridge** (`codeatelier_governance.platform`): async HTTP
   client that POSTs each local audit event to the platform's ingest
@@ -39,6 +39,22 @@ Everything in v0.7.0 is additive — no BREAKING changes from v0.6.2.
   provided). Env equivalents: `GOVERNANCE_PLATFORM_INGEST_URL`,
   `GOVERNANCE_PLATFORM_INGEST_TOKEN`,
   `GOVERNANCE_PLATFORM_BRIDGE_ENABLED`.
+- **seq self-heal**: on a `seq_out_of_order` 409 the bridge reads the
+  server's `expected_seq` and retries once — so an SDK process restart
+  that jumps the local seq counter converges without operator
+  intervention. Counter: `stats.dropped_seq_conflict` surfaces the
+  cases where even the self-heal couldn't converge (should be 0 in
+  steady state).
+- **Bridge hardening**: a `trusted_hosts` allow-list on
+  `platform_ingest_url` (SSRF defence — blocks loopback/private/link-local
+  by default), queue WARN rate-limiter (1 WARN per 30s, prevents log
+  flood on extended outages), whitespace-stripping on ingest tokens
+  (matches how Bearer tokens are commonly pasted), 401-latch
+  self-disable (stops the bridge on revoked tokens; never retries).
+- **Recipe CLI** (F3): `governance recipe agt` emits a self-contained
+  starter repo for the Microsoft AGT integration.
+- **Cost webhook** (F2): `GovernanceSDK(cost_webhook_url=...)` POSTs a
+  `cost.budget_breached` event the first time a budget cap clips.
 - **Optional dep**: `pip install "code-atelier-governance[platform]"`
   adds `httpx>=0.27` for the bridge. Without it, the bridge imports
   fail loudly at SDK init if creds are set — never silently.

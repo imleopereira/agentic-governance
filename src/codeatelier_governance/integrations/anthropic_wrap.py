@@ -566,13 +566,13 @@ def _wrap_stream_for_reconciliation(
     if state is None:
         state = {"reconciled": False, "chunks_seen": 0}
 
-    # Capture the running loop at proxy-construction time for the finalizer
-    # path. weakref.finalize may fire from a GC thread with no loop context.
+    # Touch asyncio.get_running_loop() at proxy-construction time so any
+    # "no running loop" misuse surfaces here rather than inside the
+    # finalizer (which may fire from a GC thread with no loop context).
     try:
-        _loop_at_birth = asyncio.get_running_loop()
-        loop_ref: weakref.ref[asyncio.AbstractEventLoop] | None = weakref.ref(_loop_at_birth)
+        asyncio.get_running_loop()
     except RuntimeError:
-        loop_ref = None
+        pass
 
     async def _run_reconcile(torn_down: bool = False) -> None:
         if state["reconciled"]:

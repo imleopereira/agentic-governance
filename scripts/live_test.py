@@ -385,8 +385,20 @@ async def run_all_tests() -> None:
     claude_cost = estimate_cost("claude-sonnet-4-6", 1000, 500)
     log_result("Claude Sonnet pricing", claude_cost > 0, f"${claude_cost:.6f}")
 
-    unknown = estimate_cost("totally-unknown-model", 1000, 1000)
-    log_result("Unknown model returns $0", unknown == 0.0)
+    # Strict mode (default) raises on unknown models to prevent silent-zero
+    # budget-bypass. Verify both the raise path and the lax-mode escape hatch.
+    from codeatelier_governance.cost.errors import UnknownModelError
+    try:
+        estimate_cost("totally-unknown-model", 1000, 1000)
+        log_result("Unknown model raises in strict mode", False, "no raise")
+    except UnknownModelError:
+        log_result("Unknown model raises in strict mode", True)
+
+    lax_zero = estimate_cost(
+        "totally-unknown-model", 1000, 1000,
+        strict=False, fallback_usd_per_million=0.0,
+    )
+    log_result("Unknown model lax-mode zero fallback", lax_zero == 0.0)
 
     # Prefix matching
     versioned = estimate_cost("gpt-4o-2024-05-13", 1_000_000, 0)
