@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { useTier, TIER_ORDER } from "@/lib/tierContext";
-import { TIER_LABELS, TIER_PRICES, type TierName } from "@/lib/demoUsage";
+import { TIER_LABELS, type TierName } from "@/lib/demoUsage";
 
 const TIER_COLOR: Record<TierName, string> = {
   starter: "var(--text-secondary)",
@@ -71,12 +71,6 @@ function TierRow({ onPick }: { onPick?: () => void }) {
             }}
           >
             {TIER_LABELS[t]}
-            <span aria-hidden="true" style={{
-              marginLeft: 6, fontSize: "0.625rem",
-              color: "var(--text-tertiary)", fontFamily: "var(--font-mono)",
-            }}>
-              {TIER_PRICES[t]}
-            </span>
           </button>
         );
       })}

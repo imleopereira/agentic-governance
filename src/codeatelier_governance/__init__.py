@@ -6,6 +6,7 @@ from .contracts.errors import ContractViolation
 from .errors import GovernanceError
 from .contracts.models import Contract, PostCondition, PreCondition
 from .cost.models import BudgetPolicy
+from .integrations.agt_wrap import AGTBridge, wrap_agt_agent
 from .loop.errors import LoopDetected
 from .loop.models import LoopPolicy
 from .presence.models import AgentStatus
@@ -21,6 +22,7 @@ except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.0.0+source"
 
 __all__ = [
+    "AGTBridge",
     "AgentStatus",
     "AuditEvent",
     "BudgetPolicy",
@@ -37,4 +39,5 @@ __all__ = [
     "RoutingPolicy",
     "ScopePolicy",
     "__version__",
+    "wrap_agt_agent",
 ]

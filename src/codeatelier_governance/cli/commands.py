@@ -588,6 +588,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Confirm the rotation (required — prevents accidental rotations)",
     )
 
+    # init (recipe scaffolding — F3 v0.7)
+    from .init import register_subparser as _register_init
+    _register_init(subparsers)
+
     # console (user management subcommands)
     console_parser = subparsers.add_parser(
         "console", help="Console user management commands"
@@ -928,6 +932,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 reason=args.reason,
             )
         )
+
+    elif args.command == "init":
+        from .init import run_init
+        sys.exit(run_init(args.recipe, force=bool(getattr(args, "force", False))))
 
     elif args.command == "console":
         console_cmd = getattr(args, "console_command", None)

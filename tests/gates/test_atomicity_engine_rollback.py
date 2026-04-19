@@ -31,7 +31,6 @@ should investigate the adjacent session for a failed commit event.
 from __future__ import annotations
 
 import secrets as _secrets
-from typing import Any, Awaitable, Callable
 
 import pytest
 
@@ -71,8 +70,6 @@ class _RollbackAtCommitStore(InMemoryGatesStore):
         *,
         on_commit: OnCommit | None = None,
     ) -> ApprovalRequest:
-        import asyncio
-
         from codeatelier_governance.gates.errors import ApprovalTokenError
 
         async with self._lock:

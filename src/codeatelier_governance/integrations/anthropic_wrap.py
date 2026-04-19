@@ -565,22 +565,26 @@ def _wrap_stream_for_reconciliation(
     """
     if state is None:
         state = {"reconciled": False, "chunks_seen": 0}
+    # Rebind to a non-optional alias so nested class methods that close
+    # over ``state`` see a ``dict[str, Any]`` (mypy loses Optional
+    # narrowing across nested class scopes).
+    st: dict[str, Any] = state
 
-    # Capture the running loop at proxy-construction time for the finalizer
-    # path. weakref.finalize may fire from a GC thread with no loop context.
+    # Touch asyncio.get_running_loop() at proxy-construction time so any
+    # "no running loop" misuse surfaces here rather than inside the
+    # finalizer (which may fire from a GC thread with no loop context).
     try:
-        _loop_at_birth = asyncio.get_running_loop()
-        loop_ref: weakref.ref[asyncio.AbstractEventLoop] | None = weakref.ref(_loop_at_birth)
+        asyncio.get_running_loop()
     except RuntimeError:
-        loop_ref = None
+        pass
 
     async def _run_reconcile(torn_down: bool = False) -> None:
-        if state["reconciled"]:
+        if st["reconciled"]:
             return
-        state["reconciled"] = True
+        st["reconciled"] = True
         await _reconcile_stream_usage_async(
             sdk, agent_id, session_id, stream, model, projected_tokens,
-            chunks_seen=state.get("chunks_seen", 0),
+            chunks_seen=st.get("chunks_seen", 0),
             torn_down=torn_down,
         )
 
@@ -601,8 +605,13 @@ def _wrap_stream_for_reconciliation(
         def __repr__(self) -> str:
             return f"<ReconcilingProxy wrap={stream!r}>"
 
-        @property
-        def __class__(self) -> type:  # type: ignore[override]
+        # isinstance transparency: report the wrapped stream's class so
+        # callers doing ``isinstance(proxy, MessageStream)`` succeed.
+        # Overriding ``__class__`` via a read-only @property is
+        # intentional — object.__class__ is modelled as read-write in
+        # the mypy stub, so the override is flagged ``[misc]``.
+        @property  # type: ignore[misc]
+        def __class__(self) -> type:
             return _wrapped_class
 
         if has_aenter:
@@ -613,7 +622,7 @@ def _wrap_stream_for_reconciliation(
                 # same `reconciled` flag — exactly one fires.
                 return _wrap_stream_for_reconciliation(
                     inner, sdk, agent_id, session_id, model, projected_tokens,
-                    state=state,
+                    state=st,
                 )
 
             async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
@@ -636,7 +645,7 @@ def _wrap_stream_for_reconciliation(
                 inner = stream.__enter__()
                 return _wrap_stream_for_reconciliation(
                     inner, sdk, agent_id, session_id, model, projected_tokens,
-                    state=state,
+                    state=st,
                 )
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
@@ -671,7 +680,7 @@ def _wrap_stream_for_reconciliation(
                     # distinguish "normal stop" from "cancelled" reliably.
                     try:
                         async for chunk in stream:
-                            state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                            st["chunks_seen"] = st.get("chunks_seen", 0) + 1
                             yield chunk
                     except BaseException:
                         # CancelledError is a BaseException in 3.8+. Reconcile
@@ -700,7 +709,7 @@ def _wrap_stream_for_reconciliation(
                 torn_down = False
                 try:
                     for chunk in stream:
-                        state["chunks_seen"] = state.get("chunks_seen", 0) + 1
+                        st["chunks_seen"] = st.get("chunks_seen", 0) + 1
                         yield chunk
                 except BaseException:
                     torn_down = True

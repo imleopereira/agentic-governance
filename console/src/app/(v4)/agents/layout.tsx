@@ -46,10 +46,18 @@ export default function AgentsLayout({
   };
 
   return (
-    <div className="flex h-full min-h-screen">
+    // Negative right-margin escapes AppShell's 2rem horizontal main padding
+    // so the drawer reaches the viewport edge instead of leaving a gap.
+    // Top/bottom padding on main is intentionally kept — the drawer sits
+    // within the main content rhythm, not over the chrome.
+    <div
+      className="flex h-full min-h-screen"
+      style={{ marginRight: hasDrill ? "-2rem" : undefined }}
+    >
       <div
         className="flex-1 min-w-0 overflow-auto"
         onMouseDown={onListMouseDown}
+        style={{ paddingRight: hasDrill ? "2rem" : undefined }}
       >
         <AgentsList />
         {/* `page.tsx` and `[id]/page.tsx` render null — kept for routing. */}
