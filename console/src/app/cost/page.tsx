@@ -7,7 +7,9 @@ import { LiveBadge } from "@/components/LiveBadge";
 import { CardSkeleton, TableSkeleton } from "@/components/Skeleton";
 import { formatUtcTimestamp } from "@/lib/formatDate";
 import { TierGate } from "@/components/TierGate";
-import { TrendingUp, Webhook, GitBranch } from "lucide-react";
+import { Webhook, GitBranch } from "lucide-react";
+import { CostTree, type CostAgent } from "@/components/cost/CostTree";
+import { ForecastBadge } from "@/components/cost/ForecastBadge";
 
 /**
  * Built-in model pricing reference (mirrors the SDK's pricing.py).
@@ -95,6 +97,55 @@ function PricingReference() {
   );
 }
 
+// Demo reconciliation tree data until the /cost/reconcile endpoint ships
+// (v0.7.1 hardening). PRD §F2 explicitly scopes v0.7 to "UI surface" — the
+// tree renders from a seeded constant so 2+ design partners can see the
+// shape without waiting for the Postgres view.
+const DEMO_RECONCILIATION_DATA: CostAgent[] = [
+  {
+    agent_id: "billing-agent",
+    sessions: [
+      {
+        session_id: "01JF9KQW7YZ2HMN1",
+        models: [
+          {
+            model: "openai/gpt-4o",
+            governance_usd: 4.82,
+            invoice_usd: 4.84,
+            recent_calls: [
+              { ts: "14:02:11Z", tokens: 1240, usd: 0.0210 },
+              { ts: "14:01:02Z", tokens: 980, usd: 0.0165 },
+              { ts: "13:58:44Z", tokens: 3100, usd: 0.0520 },
+              { ts: "13:57:20Z", tokens: 760, usd: 0.0128 },
+              { ts: "13:55:01Z", tokens: 1500, usd: 0.0255 },
+            ],
+          },
+          {
+            model: "anthropic/claude-sonnet-4-6",
+            governance_usd: 3.41,
+            invoice_usd: 3.40,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    agent_id: "refund-bot",
+    sessions: [
+      {
+        session_id: "01JF8TQ5X2AAPE3M",
+        models: [
+          {
+            model: "gemini/flash-2.0",
+            governance_usd: 0.18,
+            invoice_usd: 0.22,
+          },
+        ],
+      },
+    ],
+  },
+];
+
 export default function CostPage() {
   const { data: agents, isLoading: agentsLoading } = useQuery({
     queryKey: ["cost-agents"],
@@ -123,24 +174,15 @@ export default function CostPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <TierGate feature="cost_forecast" fallback="hidden">
-            <span
-              aria-label="Projected to hit cap in 3.2 days"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 10px",
-                fontSize: "0.75rem",
-                fontWeight: 500,
-                background: "rgba(234, 179, 8, 0.1)",
-                color: "var(--warn)",
-                border: "1px solid rgba(234, 179, 8, 0.35)",
-                borderRadius: 999,
-              }}
-            >
-              <TrendingUp size={12} aria-hidden="true" />
-              Cap in 3.2 days
-            </span>
+            {/* Demo values: 30-day history gate keeps this hidden for new
+                tenants; server will supply the real burn once the
+                /cost/forecast endpoint ships (v0.7.1 hardening). */}
+            <ForecastBadge
+              currentUsd={8.2}
+              capUsd={10.0}
+              dailyBurnUsd={0.56}
+              daysOfHistory={30}
+            />
           </TierGate>
           <LiveBadge />
         </div>
@@ -394,25 +436,7 @@ export default function CostPage() {
           <h2 className="text-lg font-semibold">Reconciliation Delta</h2>
         </div>
         <TierGate feature="cost_reconciliation" minHeight={140}>
-          <div
-            className="border p-4"
-            style={{
-              borderColor: "var(--border)",
-              background: "var(--card)",
-              borderRadius: "var(--radius-md)",
-              fontFamily: "var(--font-mono)",
-              fontSize: "0.8125rem",
-            }}
-          >
-            <p style={{ color: "var(--text-secondary)", marginBottom: 10, fontSize: "0.75rem" }}>
-              Governance-recorded cost vs. provider invoice (today).
-            </p>
-            <ul style={{ listStyle: "none", padding: 0, margin: 0, lineHeight: 1.7 }}>
-              <li>├─ openai/gpt-4o <span style={{ color: "var(--text-tertiary)" }}>· governance $4.82 · invoice $4.84 · </span><span style={{ color: "var(--success)" }}>Δ +$0.02</span></li>
-              <li>├─ anthropic/claude-sonnet-4-6 <span style={{ color: "var(--text-tertiary)" }}>· governance $3.41 · invoice $3.40 · </span><span style={{ color: "var(--success)" }}>Δ -$0.01</span></li>
-              <li>└─ gemini/flash-2.0 <span style={{ color: "var(--text-tertiary)" }}>· governance $0.18 · invoice $0.22 · </span><span style={{ color: "var(--warn)" }}>Δ +$0.04</span></li>
-            </ul>
-          </div>
+          <CostTree agents={DEMO_RECONCILIATION_DATA} />
         </TierGate>
       </section>
 
