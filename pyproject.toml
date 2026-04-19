@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-atelier-governance"
-version = "0.6.2"
+version = "0.7.0"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -60,6 +60,13 @@ openai = [
 ]
 anthropic = [
     "anthropic>=0.30",
+]
+# v0.7.0 platform bridge: dual-write audit events to the Code Atelier
+# platform's ingest endpoint. httpx only — no new CA bundle or TLS
+# library; httpx brings certifi transitively. Keep the version pin
+# tight so a future httpx major can't silently relax TLS defaults.
+platform = [
+    "httpx>=0.27,<1.0",
 ]
 dev = [
     "pytest>=8",

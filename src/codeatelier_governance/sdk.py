@@ -125,6 +125,23 @@ class GovernanceConfig:
     cost_strict_unknown_models: bool = True
     cost_unknown_model_fallback_usd_per_million: float | None = None
 
+    # v0.7.0 platform bridge: dual-write audit events to the Code Atelier
+    # platform's ingest endpoint. All three fields are optional; the
+    # bridge only activates when BOTH ingest_url and ingest_token are
+    # provided AND platform_bridge_enabled is not explicitly False.
+    # Env-var equivalents are resolved in GovernanceSDK.__init__
+    # (per the "no module-level env capture" rule):
+    #   GOVERNANCE_PLATFORM_INGEST_URL
+    #   GOVERNANCE_PLATFORM_INGEST_TOKEN
+    #   GOVERNANCE_PLATFORM_BRIDGE_ENABLED
+    # Precedence: explicit kwarg > env var > default.
+    # If the [platform] extra is not installed (httpx missing) but the
+    # bridge is configured, __init__ raises ImportError at construction
+    # time with the pip install hint — fail LOUDLY, never silently.
+    platform_ingest_url: str | None = None
+    platform_ingest_token: str | None = None
+    platform_bridge_enabled: bool = True
+
     def __post_init__(self) -> None:
         """Validate field constraints that cannot be expressed as dataclass defaults."""
         if self.default_max_tokens is not None and self.default_max_tokens < 1:
@@ -208,6 +225,32 @@ class GovernanceSDK:
                         f"must be a float (got {env_fb!r})"
                     ) from exc
 
+        # v0.7.0 platform bridge env-var fallbacks. Precedence:
+        # explicit kwarg > env var > default. Reads happen per-instance
+        # at __init__ time per feedback_no_module_level_env_capture.
+        if "platform_ingest_url" not in kwargs:
+            env_url = os.environ.get("GOVERNANCE_PLATFORM_INGEST_URL")
+            if env_url:
+                kwargs["platform_ingest_url"] = env_url
+        if "platform_ingest_token" not in kwargs:
+            env_tok = os.environ.get("GOVERNANCE_PLATFORM_INGEST_TOKEN")
+            if env_tok:
+                kwargs["platform_ingest_token"] = env_tok
+        if "platform_bridge_enabled" not in kwargs:
+            env_enabled = os.environ.get("GOVERNANCE_PLATFORM_BRIDGE_ENABLED")
+            if env_enabled is not None:
+                normalised = env_enabled.strip().lower()
+                if normalised in {"true", "1", "yes", "on"}:
+                    kwargs["platform_bridge_enabled"] = True
+                elif normalised in {"false", "0", "no", "off"}:
+                    kwargs["platform_bridge_enabled"] = False
+                else:
+                    raise ValueError(
+                        f"GOVERNANCE_PLATFORM_BRIDGE_ENABLED must be "
+                        f"true/false/1/0/yes/no/on/off "
+                        f"(got {env_enabled!r})"
+                    )
+
         self.config = GovernanceConfig(
             database_url=database_url,
             api_key=api_key,
@@ -289,6 +332,16 @@ class GovernanceSDK:
                 ),
             )
 
+        # v0.7.0 platform bridge: construct the PlatformClient BEFORE the
+        # AuditModule so we can inject it. Activation requires both
+        # ingest_url AND ingest_token; if only one is set we raise
+        # ValueError (loud misconfiguration). If httpx isn't installed
+        # we raise ImportError with the pip extra instruction — never
+        # silently disable. When platform_bridge_enabled=False, the
+        # client is not constructed regardless of URL/token state
+        # (operator-level off switch, used for killswitch and tests).
+        self._platform_client = self._build_platform_client()
+
         if self.config.enable_audit:
             store = self._build_audit_store(database_url, self._shared_engine)
             # Durable fallback: when the primary is down, audit events spill
@@ -303,6 +356,7 @@ class GovernanceSDK:
                 writer=writer,
                 verify_chain_on_read=self.config.verify_chain_on_read,
                 signer=self._identity_signer,
+                platform_client=self._platform_client,
             )
         else:
             logger.warning(
@@ -324,6 +378,7 @@ class GovernanceSDK:
                 InMemoryAuditStore(max_events=64, on_full="evict"),
                 secret=resolved_secret,
                 signer=self._identity_signer,
+                platform_client=self._platform_client,
             )
 
         # ------------------------------------------------------------------
@@ -493,6 +548,56 @@ class GovernanceSDK:
                     database_url=database_url,
                     engine=self._shared_engine,
                 )
+
+    # ------------------------------------------------------------------
+    # v0.7.0: platform bridge bootstrap
+    # ------------------------------------------------------------------
+
+    def _build_platform_client(self) -> Any:
+        """Construct a PlatformClient if the config activates it.
+
+        Activation rules (from the v0.7.0 spec):
+            * Bridge is OFF if ``platform_bridge_enabled=False``.
+            * Bridge requires BOTH ``platform_ingest_url`` AND
+              ``platform_ingest_token``.  Exactly-one is a ValueError
+              so operators never ship a half-configured bridge.
+            * If activation is requested but httpx is missing,
+              ImportError with the pip install instruction.  Fail
+              loudly at init — never silently disable.
+
+        Returns ``None`` when the bridge is off (the common case for
+        self-hosted deployments that do not use the platform).
+        """
+        cfg = self.config
+        if not cfg.platform_bridge_enabled:
+            return None
+        url_set = bool(cfg.platform_ingest_url)
+        token_set = bool(cfg.platform_ingest_token)
+        if not url_set and not token_set:
+            return None
+        if url_set != token_set:
+            raise ValueError(
+                "platform_ingest_url and platform_ingest_token must be "
+                "set together (both required to enable the v0.7.0 "
+                "platform bridge)."
+            )
+        try:
+            import httpx  # noqa: F401  — presence check
+        except ImportError as exc:
+            raise ImportError(
+                "pip install 'code-atelier-governance[platform]' to "
+                "enable platform bridge"
+            ) from exc
+        from .platform import PlatformClient, PlatformConfig
+
+        assert cfg.platform_ingest_url is not None  # narrowed by url_set
+        assert cfg.platform_ingest_token is not None
+        pcfg = PlatformConfig(
+            ingest_url=cfg.platform_ingest_url,
+            ingest_token=cfg.platform_ingest_token,
+            enabled=True,
+        )
+        return PlatformClient(pcfg)
 
     # ------------------------------------------------------------------
     # F6 Track A: agent identity bootstrap
@@ -800,6 +905,28 @@ class GovernanceSDK:
         ``warn_on_no_wrappers=False`` was passed at construction time.
         """
         self._started = True
+        # v0.7.0: start the platform bridge FIRST so the worker is
+        # already draining by the time the first audit.log() fires.
+        # Failures are non-breaking (invariant #1): a bridge that
+        # cannot start logs WARN and the SDK continues on local-only.
+        if self._platform_client is not None:
+            try:
+                await self._platform_client.start()
+            except Exception as exc:  # noqa: BLE001 — invariant #1
+                logger.warning(
+                    "sdk.platform_bridge_start_failed",
+                    error_type=type(exc).__name__,
+                    detail=(
+                        "Platform bridge could not start; audit events "
+                        "will be written local-only. Host app is "
+                        "unaffected."
+                    ),
+                )
+                self._platform_client = None
+                # Also drop the reference inside the audit module so
+                # forward() becomes a no-op on every subsequent log.
+                if hasattr(self, "audit"):
+                    self.audit._platform_client = None
         # self.audit always exists — either wired to a real persistent
         # substrate (enable_audit=True) or an in-memory ring buffer
         # (enable_audit=False).  Either way the writer lifecycle must run
@@ -873,6 +1000,18 @@ class GovernanceSDK:
             await self.loop.close()
         if hasattr(self, "presence"):
             await self.presence.close()
+        # v0.7.0: close the platform bridge AFTER audit so any events
+        # flushed during audit.close() still land in the forward queue.
+        # The bridge itself has a 5s flush deadline; see PlatformClient.
+        if self._platform_client is not None:
+            try:
+                await self._platform_client.close()
+            except Exception as exc:  # noqa: BLE001 — close is best-effort
+                logger.warning(
+                    "sdk.platform_bridge_close_failed",
+                    error_type=type(exc).__name__,
+                )
+            self._platform_client = None
         # Dispose the shared engine last, after all modules have released
         # their references to it.
         if self._shared_engine is not None:

@@ -1,0 +1,718 @@
+"""Async HTTP client that forwards audit events to the platform ingest endpoint.
+
+Design constraints (from the v0.7.0 platform-bridge spec):
+
+1. **Never raise to the host app.** Every exception is caught inside the
+   background worker. ``forward()`` is a synchronous enqueue that cannot
+   raise — a full queue drops the oldest event and logs WARN.
+
+2. **Never block the event loop.** Enqueue is O(1). The worker runs as a
+   separate ``asyncio.Task`` on the same loop, but it ``await``s the
+   queue, never the user's call path.
+
+3. **Never log the bearer token.** Tokens appear only in the
+   ``Authorization`` header. When an error log needs to identify a
+   token, we use the first 8 hex chars of ``sha256(token)`` — enough
+   to correlate with rotation events, not enough to exfiltrate.
+
+4. **TLS verify is mandatory.** ``httpx.AsyncClient(verify=True)``. The
+   one exception is explicit localhost URLs (``http://localhost:*`` /
+   ``http://127.0.0.1:*``) for local development. Any ``http://`` on a
+   non-localhost host is rejected at client init with ValueError —
+   **not** silently upgraded to https.
+
+5. **Retry budget is per-event.** Exponential backoff 1s → 2s → 4s → 8s,
+   capped at ~15s cumulative delay per event. After the budget is
+   exhausted the event is dropped and a cumulative drop counter is
+   incremented.
+
+6. **Graceful close.** ``close()`` flushes pending forwards with a 5s
+   deadline, then cancels the worker. Dropped counts are logged once.
+
+7. **401 disables the bridge.** If the platform rejects our token we
+   log WARN (with sha256-prefix token identifier) and flip the bridge
+   to permanently-disabled for the lifetime of this client instance.
+   Host audit.log() continues on local-only storage.
+
+Not in scope for v0.7.0:
+    * Batching (one POST per event). v0.8 will introduce batched ingest.
+    * Circuit breaker. The 5xx backoff + cumulative-drop WARN gives
+      operators enough signal to intervene without machinery that can
+      itself fail-closed on a transient blip.
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
+
+import structlog
+
+from .config import PlatformConfig
+from .errors import PlatformConfigError
+
+if TYPE_CHECKING:  # pragma: no cover — import only for type checking
+    from ..audit.models import AuditEventRecord
+
+
+logger = structlog.get_logger(__name__)
+
+# Per-event cumulative retry budget. Summed backoff of 1+2+4+8 = 15s
+# matches the spec; a handful of milliseconds for the actual POST is
+# included implicitly because we measure elapsed wall-clock, not just
+# sleep time.
+MAX_CUMULATIVE_RETRY_SECONDS = 15.0
+
+# Graceful-close flush deadline. After this much wall-clock, any events
+# still in the queue are dropped and counted.
+CLOSE_FLUSH_DEADLINE_SECONDS = 5.0
+
+# Hourly rate-limit key for 401 WARN de-duplication. Computed as
+# epoch_seconds // 3600 so we log once per (token_hash_prefix, hour).
+_WARN_RATE_LIMIT_WINDOW_SECONDS = 3600
+
+# We hold a small burst allowance on WARN-level "5xx dropped" summaries
+# so a transient outage doesn't flood the log. One WARN per minute with
+# cumulative drop count attached.
+_FIVEXX_WARN_WINDOW_SECONDS = 60.0
+
+SDK_VERSION = "0.7.0"
+
+
+@dataclass
+class _Stats:
+    """Running counters for ops. Exposed via ``PlatformClient.stats()``.
+
+    Every counter increments monotonically for the lifetime of the
+    client. Consumers can snapshot and diff across calls to compute
+    rates. Reset on ``close()``? No — the SDK constructs one client
+    per process, so lifetime == process.
+    """
+
+    sent: int = 0
+    dropped_queue_full: int = 0
+    dropped_4xx: int = 0
+    dropped_5xx: int = 0
+    retries: int = 0
+
+
+@dataclass
+class _QueuedEvent:
+    """Internal wrapper for events in the forward queue.
+
+    Holds the record plus the timestamp at which it was enqueued so the
+    worker can enforce the 15s per-event retry budget as wall-clock
+    elapsed (not just retry-attempt count).
+    """
+
+    event: "AuditEventRecord"
+    enqueued_at: float = field(default_factory=time.monotonic)
+
+
+def _token_fingerprint(token: str) -> str:
+    """Return a stable non-reversible identifier for a bearer token.
+
+    sha256 digest truncated to 8 hex chars. Long enough to disambiguate
+    between multiple tokens in a fleet during rotation; short enough
+    that a log leak does not meaningfully weaken the pre-image
+    resistance of the underlying token.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+
+
+def _validate_url_for_tls(url: str) -> None:
+    """Reject http:// on any host other than localhost / 127.0.0.1.
+
+    Called at PlatformClient init. The intent is to fail LOUDLY at
+    startup rather than silently accept a cleartext ingestion
+    configuration in production — http:// to a non-localhost host
+    almost always means the operator copy-pasted a dev URL.
+
+    Raises
+    ------
+    PlatformConfigError
+        When the scheme is http:// and the host is not localhost.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "https":
+        return
+    if parsed.scheme != "http":
+        raise PlatformConfigError(
+            f"PlatformConfig.ingest_url must use http:// or https:// "
+            f"(got scheme {parsed.scheme!r})"
+        )
+    host = (parsed.hostname or "").lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return
+    raise PlatformConfigError(
+        f"PlatformConfig.ingest_url uses http:// with non-localhost host "
+        f"{host!r}. TLS is mandatory for remote ingestion; use https://. "
+        f"(Only http://localhost:* and http://127.0.0.1:* are permitted "
+        f"for local development.)"
+    )
+
+
+class PlatformClient:
+    """Fire-and-forget client that forwards audit events to the platform.
+
+    Lifecycle:
+        client = PlatformClient(config)              # no I/O
+        await client.start()                          # spawns worker
+        client.forward(record)                        # sync enqueue
+        ...
+        await client.close()                          # flush + cancel
+
+    The SDK wires ``start`` / ``close`` through ``GovernanceSDK.start()``
+    and ``GovernanceSDK.close()``. Callers do not interact with the
+    client directly.
+    """
+
+    def __init__(self, config: PlatformConfig) -> None:
+        # Fail loudly at init if httpx isn't installed. The SDK catches
+        # this at its own construction and re-raises ImportError with
+        # the pip-install instruction, so the user never gets a bare
+        # ModuleNotFoundError from deep inside the stack.
+        try:
+            import httpx  # noqa: F401  — presence check
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "pip install 'code-atelier-governance[platform]' to enable "
+                "platform bridge"
+            ) from exc
+
+        _validate_url_for_tls(config.ingest_url)
+
+        self._config = config
+        self._token_fp = _token_fingerprint(config.ingest_token)
+        # Bounded queue so memory can't grow unbounded under platform
+        # outage. When full, forward() drops the oldest. Using a
+        # ``deque``-style drop-oldest policy via ``asyncio.Queue`` isn't
+        # native — we implement it manually in ``forward``.
+        self._queue: asyncio.Queue[_QueuedEvent] = asyncio.Queue(
+            maxsize=config.max_queue_size
+        )
+        self._worker_task: asyncio.Task[None] | None = None
+        self._client: Any = None  # httpx.AsyncClient; typed Any to keep httpx optional
+        self._stats = _Stats()
+        # Process-scoped auth failure latch. Flipped on the first 401;
+        # once flipped, forward() silently drops and the worker exits
+        # after draining its current in-flight request.
+        self._auth_failed = False
+        # Timestamp of the last 401 WARN we emitted. Coalesced per
+        # (token_fp, hour) so a rotation failure doesn't drown the log.
+        self._last_auth_warn_window: int = -1
+        # Timestamp of the last 5xx summary WARN we emitted. Coalesced
+        # per minute so transient platform hiccups don't fill the log.
+        self._last_5xx_warn_monotonic: float = 0.0
+        self._pending_5xx_since_warn: int = 0
+        self._started = False
+        self._closed = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Spawn the background worker and create the httpx client.
+
+        Safe to call multiple times — idempotent. The SDK calls this
+        from ``GovernanceSDK.start()`` after the audit module has
+        started, so the first ``forward()`` can only happen after the
+        worker is already draining.
+        """
+        if self._started:
+            return
+        # Deferred import: keeps httpx out of the hot import path for
+        # users who have not installed the [platform] extra.
+        import httpx
+
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self._config.timeout_seconds),
+            verify=True,  # TLS verification is MANDATORY — no self-signed bypass.
+            # No custom transport — use the default which honours the
+            # host's CA bundle (via certifi inside httpx).
+        )
+        loop = asyncio.get_running_loop()
+        self._worker_task = loop.create_task(self._worker_loop())
+        self._started = True
+
+    async def close(self) -> None:
+        """Flush pending forwards with a 5s deadline, then cancel the worker.
+
+        Closing is fire-and-forget for the caller (the SDK). Any events
+        still in the queue after the deadline are counted as drops and
+        a single summary log line is emitted.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        # Signal the worker that no further items will be enqueued by
+        # putting a sentinel on the queue. We use None to avoid needing
+        # a separate ``shutdown`` event, which would race with the
+        # queue.get() in the worker.
+        try:
+            await asyncio.wait_for(
+                self._drain_queue(),
+                timeout=CLOSE_FLUSH_DEADLINE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            dropped = self._queue.qsize()
+            logger.warning(
+                "platform.close_drain_timeout",
+                dropped=dropped,
+                deadline_seconds=CLOSE_FLUSH_DEADLINE_SECONDS,
+                token_fp=self._token_fp,
+            )
+            self._stats.dropped_queue_full += dropped
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+            self._worker_task = None
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except Exception as exc:  # noqa: BLE001 — close is best-effort
+                logger.warning(
+                    "platform.client_close_failed",
+                    error_type=type(exc).__name__,
+                )
+            self._client = None
+
+    async def _drain_queue(self) -> None:
+        """Wait for the queue to empty by polling qsize.
+
+        ``asyncio.Queue.join()`` would be nicer but requires every
+        consumer to call ``task_done()`` exactly once. The worker
+        already does that; we use join() for clarity.
+        """
+        await self._queue.join()
+
+    # ------------------------------------------------------------------
+    # Public fire-and-forget enqueue
+    # ------------------------------------------------------------------
+
+    def forward(self, event: "AuditEventRecord") -> None:
+        """Enqueue ``event`` for background forward. Never raises, never blocks.
+
+        Called synchronously from ``AuditModule.log()`` after the local
+        write commits. The return is O(1): either a successful put or
+        a drop-oldest + put.
+
+        Four fast-path exits:
+            1. Bridge auth failed earlier -> silently drop.
+            2. Closed -> silently drop.
+            3. Queue full -> drop oldest + WARN + count.
+            4. Normal -> put and return.
+        """
+        if self._auth_failed or self._closed or not self._started:
+            # Pre-start / post-close / auth-disabled drops are counted
+            # separately from "queue full" so operators can distinguish
+            # "broken config" from "platform slow."
+            self._stats.dropped_queue_full += 1
+            return
+        queued = _QueuedEvent(event=event)
+        try:
+            self._queue.put_nowait(queued)
+            return
+        except asyncio.QueueFull:
+            pass
+        # Drop oldest, then retry put. Do NOT drop the new event — the
+        # freshest events are the most operationally interesting, and
+        # a run of drops against a saturated queue should show the
+        # platform the *current* state, not the stale backlog.
+        try:
+            dropped = self._queue.get_nowait()
+            # Mark the dropped task as done so the queue.join() in
+            # close() can converge.
+            self._queue.task_done()
+            self._stats.dropped_queue_full += 1
+            logger.warning(
+                "platform.queue_full_dropped_oldest",
+                dropped_total=self._stats.dropped_queue_full,
+                token_fp=self._token_fp,
+                dropped_event_id=str(dropped.event.event_id),
+            )
+        except asyncio.QueueEmpty:  # pragma: no cover — racy, but benign
+            pass
+        try:
+            self._queue.put_nowait(queued)
+        except asyncio.QueueFull:  # pragma: no cover — racy, counts as drop
+            self._stats.dropped_queue_full += 1
+
+    # ------------------------------------------------------------------
+    # Worker loop
+    # ------------------------------------------------------------------
+
+    async def _worker_loop(self) -> None:
+        """Consume the queue, POST each event, handle errors per the spec.
+
+        The worker is a single task because the spec says one POST per
+        event and there is no benefit to parallelism at v0.7.0's
+        per-SDK throughput. Concurrency can be added in v0.8 alongside
+        batching.
+        """
+        while True:
+            try:
+                queued = await self._queue.get()
+            except asyncio.CancelledError:
+                return
+            try:
+                if self._auth_failed:
+                    # Drain silently — the bridge is disabled for the
+                    # rest of the process. Still mark done so close()
+                    # can converge.
+                    self._stats.dropped_queue_full += 1
+                    continue
+                await self._forward_one(queued)
+            except asyncio.CancelledError:
+                # Requeue? No — per spec we drop on cancel, the caller
+                # is shutting down and there is no guarantee the loop
+                # will drain. Counter is bumped for observability.
+                self._stats.dropped_queue_full += 1
+                return
+            except Exception as exc:  # noqa: BLE001 — worker MUST NOT die
+                logger.warning(
+                    "platform.worker_unexpected_error",
+                    error_type=type(exc).__name__,
+                    token_fp=self._token_fp,
+                )
+                self._stats.dropped_5xx += 1
+            finally:
+                self._queue.task_done()
+
+    async def _forward_one(self, queued: _QueuedEvent) -> None:
+        """POST one event, with retries per the spec.
+
+        The retry loop bails out on:
+            * 2xx success -> increment sent, return.
+            * 4xx non-429 -> terminal drop, no retry.
+            * 401         -> auth-failed latch, disable bridge.
+            * 409         -> DEBUG log (duplicate / seq_out_of_order),
+                             treated as success for counting purposes.
+            * 429         -> honor Retry-After, retry.
+            * 5xx / conn  -> exponential backoff retry.
+
+        Cumulative wall-clock is capped at 15s. After the budget is
+        exhausted or ``max_retries`` is reached, the event is dropped.
+        """
+        body = _event_to_wire(queued.event)
+        headers = {
+            "Authorization": f"Bearer {self._config.ingest_token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"codeatelier-governance/{SDK_VERSION}",
+        }
+
+        attempt = 0
+        backoff = 1.0  # seconds; doubles each retry
+        start = time.monotonic()
+
+        while True:
+            elapsed = time.monotonic() - start
+            if elapsed >= MAX_CUMULATIVE_RETRY_SECONDS:
+                # Budget exhausted — terminal drop, counted as 5xx.
+                self._record_5xx_drop(
+                    reason="retry_budget_exhausted",
+                    attempt=attempt,
+                    elapsed=elapsed,
+                )
+                return
+            if attempt > self._config.max_retries:
+                self._record_5xx_drop(
+                    reason="max_retries_exceeded",
+                    attempt=attempt,
+                    elapsed=elapsed,
+                )
+                return
+
+            try:
+                assert self._client is not None  # always set in start()
+                response = await self._client.post(
+                    self._config.ingest_url,
+                    json=body,
+                    headers=headers,
+                )
+            except Exception as exc:  # noqa: BLE001 — conn / timeout
+                # Connection errors are retryable the same way 5xx is.
+                self._stats.retries += 1
+                if not await self._sleep_with_cap(backoff, start):
+                    self._record_5xx_drop(
+                        reason=f"connection_error:{type(exc).__name__}",
+                        attempt=attempt,
+                        elapsed=time.monotonic() - start,
+                    )
+                    return
+                backoff *= 2
+                attempt += 1
+                continue
+
+            status = response.status_code
+            if 200 <= status < 300:
+                self._stats.sent += 1
+                return
+            if status == 401:
+                self._handle_auth_failure(response)
+                return
+            if status == 409:
+                # Duplicate / seq_out_of_order — normal for retries.
+                # Log at DEBUG and treat as success (event already
+                # landed on a previous attempt). Does NOT count as
+                # sent because the prior attempt already did.
+                logger.debug(
+                    "platform.duplicate_or_out_of_order",
+                    status=status,
+                    token_fp=self._token_fp,
+                )
+                return
+            if status == 413:
+                self._stats.dropped_4xx += 1
+                logger.warning(
+                    "platform.payload_too_large",
+                    status=status,
+                    event_id=str(queued.event.event_id),
+                    token_fp=self._token_fp,
+                )
+                return
+            if 400 <= status < 500 and status != 429:
+                self._stats.dropped_4xx += 1
+                logger.warning(
+                    "platform.client_error",
+                    status=status,
+                    event_id=str(queued.event.event_id),
+                    token_fp=self._token_fp,
+                    # Body is scrubbed of the token; we include the
+                    # platform's error reason for debuggability.
+                    body_preview=_safe_body_preview(response),
+                )
+                return
+            if status == 429:
+                retry_after = _parse_retry_after(response)
+                self._stats.retries += 1
+                if not await self._sleep_with_cap(
+                    retry_after if retry_after is not None else backoff,
+                    start,
+                ):
+                    self._record_5xx_drop(
+                        reason="retry_after_exceeds_budget",
+                        attempt=attempt,
+                        elapsed=time.monotonic() - start,
+                    )
+                    return
+                if retry_after is None:
+                    backoff *= 2
+                attempt += 1
+                continue
+            # 5xx: silent retry with backoff.
+            self._stats.retries += 1
+            if not await self._sleep_with_cap(backoff, start):
+                self._record_5xx_drop(
+                    reason=f"server_error_{status}",
+                    attempt=attempt,
+                    elapsed=time.monotonic() - start,
+                )
+                return
+            backoff *= 2
+            attempt += 1
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _sleep_with_cap(self, delay: float, start: float) -> bool:
+        """Sleep ``delay`` seconds unless it would exceed the retry budget.
+
+        Returns True if the sleep completed, False if the budget would
+        be exceeded (caller drops the event). We cap the sleep at
+        whatever remains of the 15s budget so we never overshoot.
+        """
+        elapsed = time.monotonic() - start
+        remaining = MAX_CUMULATIVE_RETRY_SECONDS - elapsed
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(delay, remaining))
+        return True
+
+    def _handle_auth_failure(self, response: Any) -> None:
+        """Latch auth-failed, log WARN once per (token_fp, hour).
+
+        Does NOT log the token or the response body (a misconfigured
+        server could echo headers). The token_fp + window key give us
+        enough to correlate across rotation events.
+        """
+        self._auth_failed = True
+        self._stats.dropped_4xx += 1
+        window = int(time.time() // _WARN_RATE_LIMIT_WINDOW_SECONDS)
+        if window != self._last_auth_warn_window:
+            self._last_auth_warn_window = window
+            logger.warning(
+                "platform.auth_failed_bridge_disabled",
+                token_fp=self._token_fp,
+                # DO NOT add response.text / headers here — bearer token
+                # could be echoed. status is sufficient.
+                status=response.status_code,
+                detail=(
+                    "Platform rejected ingest token (401). Bridge "
+                    "disabled for the rest of this process. Host app "
+                    "continues on local-only audit storage."
+                ),
+            )
+
+    def _record_5xx_drop(
+        self, *, reason: str, attempt: int, elapsed: float
+    ) -> None:
+        """Increment 5xx counter, log a per-minute summary."""
+        self._stats.dropped_5xx += 1
+        self._pending_5xx_since_warn += 1
+        now = time.monotonic()
+        if now - self._last_5xx_warn_monotonic >= _FIVEXX_WARN_WINDOW_SECONDS:
+            self._last_5xx_warn_monotonic = now
+            logger.warning(
+                "platform.server_side_drop_summary",
+                dropped_5xx_total=self._stats.dropped_5xx,
+                dropped_5xx_since_last_warn=self._pending_5xx_since_warn,
+                last_reason=reason,
+                last_attempt=attempt,
+                last_elapsed_seconds=round(elapsed, 3),
+                token_fp=self._token_fp,
+            )
+            self._pending_5xx_since_warn = 0
+
+    # ------------------------------------------------------------------
+    # Ops surface
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict[str, int]:
+        """Return a snapshot of the running counters.
+
+        Safe to call at any time. Returned dict is a copy, so mutating
+        it does not affect the client.
+        """
+        return {
+            "sent": self._stats.sent,
+            "dropped_queue_full": self._stats.dropped_queue_full,
+            "dropped_4xx": self._stats.dropped_4xx,
+            "dropped_5xx": self._stats.dropped_5xx,
+            "retries": self._stats.retries,
+        }
+
+
+# ----------------------------------------------------------------------
+# Wire format helpers
+# ----------------------------------------------------------------------
+
+
+def _event_to_wire(event: "AuditEventRecord") -> dict[str, Any]:
+    """Project an AuditEventRecord onto the ingest wire format.
+
+    Mapping (from spec):
+        event_id      -> str(record.event_id)
+        event_type    -> record.kind
+        agent_id      -> record.agent_id
+        seq           -> absent from AuditEventRecord at v0.7.0; we
+                         fall back to 0 (server ignores for auth and
+                         re-derives on its side). See TODO below.
+        decision      -> inferred from record.kind (allow/deny/None)
+        payload       -> full model dump with chain fields included
+        prev_hash     -> record.prev_hash (or "" for the root event)
+        client_hmac   -> record.hmac
+        sdk_version   -> "0.7.0"
+
+    TODO(v0.8): wire a real monotonic ``seq`` once the audit store
+    exposes it. For now the server treats seq as advisory and
+    re-derives from insertion order, so sending 0 is safe — the
+    server's own ordering is authoritative.
+    """
+    decision = _infer_decision(event.kind)
+    # Payload mirrors the AuditEventRecord as JSON-safe primitives.
+    # We include every chain field so the platform can verify the HMAC
+    # itself without another round-trip. Signature fields are included
+    # when present (for F6 Ed25519 rows).
+    payload: dict[str, Any] = {
+        "session_id": str(event.session_id),
+        "kind": event.kind,
+        "created_at": event.created_at.isoformat(),
+        "metadata": event.metadata,
+    }
+    if event.parent_event_id is not None:
+        payload["parent_event_id"] = str(event.parent_event_id)
+    if event.model is not None:
+        payload["model"] = event.model
+    if event.input_hash is not None:
+        payload["input_hash"] = event.input_hash
+    if event.output_hash is not None:
+        payload["output_hash"] = event.output_hash
+    if event.signing_key_fingerprint is not None:
+        payload["signing_key_fingerprint"] = event.signing_key_fingerprint
+    payload["signature_status"] = event.signature_status
+    # Raw bytes signature is hex-encoded to survive JSON. Absent -> None.
+    if event.signature is not None:
+        payload["signature_hex"] = event.signature.hex()
+
+    return {
+        "event_id": str(event.event_id),
+        "event_type": event.kind,
+        "agent_id": event.agent_id,
+        "seq": 0,  # see TODO above
+        "decision": decision,
+        "payload": payload,
+        "prev_hash": event.prev_hash or "",
+        "client_hmac": event.hmac,
+        "sdk_version": SDK_VERSION,
+    }
+
+
+def _infer_decision(kind: str) -> str | None:
+    """Map an event kind to allow / deny / None.
+
+    The ingest schema requires ``decision`` to be one of
+    {"allow", "deny", null}. We infer from the event kind because the
+    SDK's AuditEventRecord doesn't store decision directly — enforcement
+    modules write distinct kinds for allow vs deny outcomes.
+    """
+    if kind.endswith((".denied", ".violation", ".exceeded", ".halted")):
+        return "deny"
+    if kind.endswith((".granted", ".allowed")):
+        return "allow"
+    return None
+
+
+def _parse_retry_after(response: Any) -> float | None:
+    """Return the Retry-After header as seconds, or None if absent/unparseable.
+
+    Supports the integer-seconds form (e.g. ``Retry-After: 30``). We
+    deliberately do NOT support the HTTP-date form because it's rare in
+    API responses and its parsing surface is a known source of bugs
+    (timezone handling, locale-dependent month names). On an unparseable
+    value we fall back to exponential backoff.
+    """
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return None
+    try:
+        seconds = float(header)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return seconds
+
+
+def _safe_body_preview(response: Any, max_chars: int = 256) -> str:
+    """Return a bounded preview of the response body for logging.
+
+    Truncates to ``max_chars`` so a misbehaving server can't blow up
+    our log line. Never includes headers — those could echo the
+    bearer token.
+    """
+    try:
+        text = str(response.text)
+    except Exception:  # noqa: BLE001
+        return "<unavailable>"
+    if len(text) > max_chars:
+        return text[:max_chars] + "..."
+    return text

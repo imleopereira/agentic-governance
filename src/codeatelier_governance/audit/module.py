@@ -106,6 +106,7 @@ class AuditModule:
         writer: BatchingWriter | None = None,
         verify_chain_on_read: bool = False,
         signer: Any = None,
+        platform_client: Any = None,
     ) -> None:
         _check_secret_strength(secret, "audit secret")
         self._store = store
@@ -117,6 +118,15 @@ class AuditModule:
         # call path — the row is still written with
         # signature_status='unsigned_local_failure'.
         self._signer = signer
+        # v0.7.0 platform bridge. When set, ``_log_unsafe`` calls
+        # ``forward(record)`` after the local write commits. forward()
+        # is a synchronous O(1) enqueue — NEVER awaited from the audit
+        # path — so the host's audit.log() latency is unaffected by
+        # platform reachability. Exceptions from forward() are caught
+        # here as defense-in-depth; the client guarantees it does not
+        # raise, but a future refactor must not be able to silently
+        # break the host call path.
+        self._platform_client = platform_client
         self._started = False
         self._start_warned = False
         self._verify_chain_on_read = verify_chain_on_read
@@ -520,6 +530,21 @@ class AuditModule:
             record = await fallback_store.insert_with_chain_lock(
                 session_id, build_record
             )
+
+        # v0.7.0 platform bridge: fire-and-forget dual-write. The
+        # forward is a sync O(1) enqueue into an in-process queue; the
+        # background worker handles retries + backoff. MUST NOT raise
+        # to the caller (invariant #1) — we defence-in-depth wrap it
+        # even though PlatformClient.forward guarantees no-raise.
+        if self._platform_client is not None:
+            try:
+                self._platform_client.forward(record)
+            except Exception as exc:  # noqa: BLE001 — invariant #1
+                logger.warning(
+                    "audit.platform_forward_failed",
+                    error_type=type(exc).__name__,
+                    event_id=str(record.event_id),
+                )
 
         # Subscribers run AFTER the record lands in storage. A failing
         # subscriber must never break the audit log itself.

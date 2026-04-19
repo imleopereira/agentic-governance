@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.7.0 (unreleased) — platform bridge + distribution pivot
+
+Distribution-pivot release. The SDK gains an optional **platform bridge**
+that dual-writes audit events to a hosted Code Atelier Governance
+platform (at `codeatelier.tech/api/v1/ingest/events`) while keeping the
+customer's local Postgres as the authoritative source of record.
+
+The bridge is **opt-in and non-blocking**: setting
+`platform_ingest_url` + `platform_ingest_token` enables it; the host
+application continues to work unchanged if the platform is unreachable,
+rate-limited, or the token is revoked. This preserves CLAUDE.md
+architectural invariant #1 (host app MUST continue working if the
+governance DB is unreachable) extended to the platform.
+
+Everything in v0.7.0 is additive — no BREAKING changes from v0.6.2.
+
+### Added (in progress)
+
+- **Platform bridge** (`codeatelier_governance.platform`): async HTTP
+  client that POSTs each local audit event to the platform's ingest
+  endpoint. Fire-and-forget from the audit hot path; retries with
+  exponential backoff on 429; silent on 5xx; logs (but does not raise)
+  on 4xx.
+- **New SDK kwargs**: `platform_ingest_url`, `platform_ingest_token`,
+  `platform_bridge_enabled` (default: auto-enabled when both creds
+  provided). Env equivalents: `GOVERNANCE_PLATFORM_INGEST_URL`,
+  `GOVERNANCE_PLATFORM_INGEST_TOKEN`,
+  `GOVERNANCE_PLATFORM_BRIDGE_ENABLED`.
+- **Optional dep**: `pip install "code-atelier-governance[platform]"`
+  adds `httpx>=0.27` for the bridge. Without it, the bridge imports
+  fail loudly at SDK init if creds are set — never silently.
+
 ## v0.6.2 (unreleased) — v4 console default flip + 5 P0 enforcement fixes
 
 Patch release. Lands the four parked Wave 1.5 worktrees from the v0.6.1
