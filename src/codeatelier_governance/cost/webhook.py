@@ -323,7 +323,17 @@ async def send_budget_alert(
     while attempt < 2:
         attempt += 1
         try:
-            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            # Security P0: trust_env=False disables httpx's default read of
+            # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / SSL_CERT_FILE — closes
+            # the env-controlled exfil path for the signed webhook body
+            # (which carries the budget context + cap_id + agent_id).
+            # follow_redirects=False pins the current default so a future
+            # version bump cannot silently open a 302-exfil path.
+            async with httpx.AsyncClient(
+                timeout=timeout_seconds,
+                trust_env=False,
+                follow_redirects=False,
+            ) as client:
                 resp = await client.post(url, content=body_bytes, headers=headers)
             last_status = resp.status_code
             if 200 <= resp.status_code < 300:

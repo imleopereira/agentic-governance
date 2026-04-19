@@ -7,57 +7,103 @@ that dual-writes audit events to a hosted Code Atelier Governance
 platform (at `codeatelier.tech/api/v1/ingest/events`) while keeping the
 customer's local Postgres as the authoritative source of record.
 
-The bridge is **opt-in and non-blocking**: setting
-`platform_ingest_url` + `platform_ingest_token` enables it; the host
-application continues to work unchanged if the platform is unreachable,
+The bridge is **opt-in and non-blocking**: the host application
+continues to work unchanged if the platform is unreachable,
 rate-limited, or the token is revoked. This preserves CLAUDE.md
 architectural invariant #1 (host app MUST continue working if the
 governance DB is unreachable) extended to the platform.
 
-Everything in v0.7.0 is additive — no BREAKING changes from v0.6.2.
+Also shipping in v0.7.0: an agent-recipe scaffolder CLI
+(`governance init agent-<kind>`), a Microsoft AGT integration wrapper
+(`wrap_agt_agent` + migration guide), and budget-alert webhooks
+(`BudgetPolicy.alert_webhook_url`, HMAC-signed, threshold-crossing —
+not first-breach).
 
-> **BREAKING BEHAVIOUR (env-driven bridge activation)** — the SDK
-> auto-activates the platform bridge when both `platform_ingest_url`
-> + `platform_ingest_token` are set (via kwargs OR via the
-> `GOVERNANCE_PLATFORM_INGEST_URL` / `_TOKEN` env vars). No code change
-> is needed to turn the bridge on beyond setting the creds. Set
-> `platform_bridge_enabled=False` (or
-> `GOVERNANCE_PLATFORM_BRIDGE_ENABLED=false`) to opt out explicitly.
-> At init, a `platform.bridge_enabled` structlog INFO line surfaces
-> the active state with the configured URL — so env-driven activation
-> is never invisible to an operator watching logs.
+Everything in v0.7.0 is additive — no BREAKING API changes from v0.6.2.
+
+> **Explicit opt-in required for the platform bridge.** The bridge
+> default is `platform_bridge_enabled=False`, matching sibling modules
+> (`enable_routing`, `enable_coverage`). Setting
+> `GOVERNANCE_PLATFORM_INGEST_URL` + `_TOKEN` env vars is **not**
+> enough on its own — you must also pass
+> `platform_bridge_enabled=True` (or set
+> `GOVERNANCE_PLATFORM_BRIDGE_ENABLED=true`). When activated, a single
+> `platform.bridge_enabled` WARN line surfaces the configured URL + a
+> link to the data-residency page, so bridge activation is never
+> invisible to an operator reading logs.
+
+> **Data residency** — activating the platform bridge routes a copy of
+> every audit event (event_type, agent_id, session_id, metadata up to
+> 64 KiB) to `codeatelier.tech`. See
+> <https://codeatelier.tech/governance/data-residency> for region,
+> retention window, and DPA template. The bridge is designed to be
+> turned OFF by default; customers who cannot move audit metadata
+> off-premise should leave it off — the local Postgres is the
+> authoritative source of record.
 
 ### Added
 
-- **Platform bridge** (`codeatelier_governance.platform`): async HTTP
+- **Platform bridge** (`codeatelier_governance.platform`) — async HTTP
   client that POSTs each local audit event to the platform's ingest
   endpoint. Fire-and-forget from the audit hot path; retries with
   exponential backoff on 429; silent on 5xx; logs (but does not raise)
-  on 4xx.
+  on 4xx. Bounded in-process queue (default 1000; drops oldest on
+  saturation). **Observability-grade, not durable-queue**: on crash /
+  kill-9, up to `max_queue_size` in-flight rows on the bridge path
+  may be lost. Local Postgres writes are unaffected.
 - **New SDK kwargs**: `platform_ingest_url`, `platform_ingest_token`,
-  `platform_bridge_enabled` (default: auto-enabled when both creds
-  provided). Env equivalents: `GOVERNANCE_PLATFORM_INGEST_URL`,
+  `platform_bridge_enabled` (default **False**), `platform_trusted_hosts`.
+  Env equivalents: `GOVERNANCE_PLATFORM_INGEST_URL`,
   `GOVERNANCE_PLATFORM_INGEST_TOKEN`,
-  `GOVERNANCE_PLATFORM_BRIDGE_ENABLED`.
-- **seq self-heal**: on a `seq_out_of_order` 409 the bridge reads the
-  server's `expected_seq` and retries once — so an SDK process restart
+  `GOVERNANCE_PLATFORM_BRIDGE_ENABLED`,
+  `GOVERNANCE_PLATFORM_TRUSTED_HOSTS` (comma-separated).
+- **seq self-heal** — on a `seq_out_of_order` 409 the bridge reads the
+  server's `expected_seq` and retries once, so an SDK process restart
   that jumps the local seq counter converges without operator
-  intervention. Counter: `stats.dropped_seq_conflict` surfaces the
-  cases where even the self-heal couldn't converge (should be 0 in
-  steady state).
-- **Bridge hardening**: a `trusted_hosts` allow-list on
-  `platform_ingest_url` (SSRF defence — blocks loopback/private/link-local
-  by default), queue WARN rate-limiter (1 WARN per 30s, prevents log
-  flood on extended outages), whitespace-stripping on ingest tokens
-  (matches how Bearer tokens are commonly pasted), 401-latch
-  self-disable (stops the bridge on revoked tokens; never retries).
-- **Recipe CLI** (F3): `governance recipe agt` emits a self-contained
-  starter repo for the Microsoft AGT integration.
-- **Cost webhook** (F2): `GovernanceSDK(cost_webhook_url=...)` POSTs a
-  `cost.budget_breached` event the first time a budget cap clips.
+  intervention. `stats.dropped_seq_conflict` surfaces the cases where
+  even the self-heal couldn't converge (should be 0 in steady state).
+- **Bridge hardening** — default-ON SSRF guard (rejects RFC1918 /
+  loopback / link-local / AWS-GCP-Azure metadata hosts even without
+  an explicit `trusted_hosts` allowlist), `trusted_hosts` pinning
+  allowlist, `trust_env=False` on the httpx client (blocks
+  `HTTPS_PROXY` exfil), `follow_redirects=False` (blocks 302 exfil),
+  queue-WARN rate-limiter (1 WARN per 30s), whitespace-stripping on
+  ingest tokens, 401-latch self-disable (revoked tokens never retry).
+- **Agent recipe CLI** (F3) — `governance init agent-<kind>` where
+  `<kind>` ∈ {`customer-support`, `data-enrichment`, `internal-research`}.
+  Generates a ruff-clean + mypy-strict `.py` file that passes
+  `--smoke` on first run. (This is an agent scaffolder, not an AGT
+  recipe — for AGT use `wrap_agt_agent` below.)
+- **Microsoft AGT integration** (F4) — `AGTBridge` (telemetry
+  ingestion, maps AGT event dicts → `AuditEvent`) plus
+  `wrap_agt_agent(agent, sdk, agent_id=...)` for pre-execution
+  enforcement on async AGT `ChatAgent` instances. Sync-agent wrapping
+  raises at wrap-time (AGT's documented default is async). See
+  `docs/agt-migration.md`. Top-level re-exports: `AGTBridge`,
+  `wrap_agt_agent`.
+- **Budget-alert webhooks** (F2) — `BudgetPolicy.alert_webhook_url` +
+  `alert_webhook_secret` + `alert_threshold_pct`. Fires a
+  canonical-JSON HMAC-SHA256 signed POST (schema
+  `governance.cost.budget_alert/v1`) on threshold CROSSING (default
+  80%), deduped per (agent_id, cap_id, UTC-day-bucket). Gated by
+  `GOVERNANCE_COST_WEBHOOKS_ENABLED=true` (default **false**).
+  Blocks RFC1918 / cloud-metadata hosts, `trust_env=False`,
+  `follow_redirects=False`, 1-retry-then-drop.
+- **Cost CSV export** — `cost.csv_export._csv_safe` prefix-quotes
+  CSV-injection characters (`= + - @ \t \r`); idempotent.
 - **Optional dep**: `pip install "code-atelier-governance[platform]"`
   adds `httpx>=0.27` for the bridge. Without it, the bridge imports
   fail loudly at SDK init if creds are set — never silently.
+
+### Known limitations shipped in v0.7.0
+- Bridge seq counter is process-scoped. An SDK restart re-starts the
+  counter at 1; seq self-heal converges after the first retry.
+  Postgres-persisted seq is a v0.8 item.
+- Budget-alert dedup is in-memory — duplicate POSTs on process bounce
+  within the same UTC day. Postgres-backed dedup in v0.7.1.
+- LOC budget: v0.7 target was ≤2k LOC net; actual is larger. Platform
+  bridge + AGT integration + cost webhook + recipe CLI compressed a
+  v0.7 + v0.7.5 cadence into one tag. v0.7.1 will split narrower.
 
 ## v0.6.2 (unreleased) — v4 console default flip + 5 P0 enforcement fixes
 

@@ -143,37 +143,70 @@ def _token_fingerprint(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
 
 
+_BLOCKED_METADATA_HOSTS: frozenset[str] = frozenset(
+    {
+        "169.254.169.254",  # AWS / GCP / OpenStack / DigitalOcean
+        "metadata.google.internal",
+        "metadata",
+        "metadata.azure.com",
+    }
+)
+
+
+def _host_is_private_ip(host: str) -> bool:
+    """True iff ``host`` is a literal private/loopback/link-local IP."""
+    from ipaddress import ip_address
+
+    try:
+        ip = ip_address(host)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
+
+
 def _validate_url_for_tls(
     url: str, trusted_hosts: tuple[str, ...] | None = None
 ) -> None:
-    """Reject http:// on any host other than localhost / 127.0.0.1.
+    """Validate an ingest URL at PlatformClient init.
 
-    Called at PlatformClient init. The intent is to fail LOUDLY at
-    startup rather than silently accept a cleartext ingestion
-    configuration in production — http:// to a non-localhost host
-    almost always means the operator copy-pasted a dev URL.
+    Three layers, applied in order:
 
-    When ``trusted_hosts`` is provided, the URL's hostname must also
-    appear in the allowlist. This is an SSRF hardening knob for
-    deployments that pin the bridge to a specific platform host and
-    want any deviation (typo, compromised env var) to fail at startup
-    rather than silently ship audit events to the wrong destination.
+    1. **Scheme** — ``http://`` is accepted only for localhost; anything
+       else must be ``https://``.
+    2. **Default SSRF guard** — the URL's host is rejected if it is a
+       literal private/loopback/link-local/reserved IP, or a known
+       cloud-metadata host (AWS 169.254.169.254, GCP
+       metadata.google.internal, Azure metadata.azure.com, etc.). This
+       runs even when ``trusted_hosts`` is ``None`` so a compromised env
+       var (``GOVERNANCE_PLATFORM_INGEST_URL=https://169.254.169.254/…``)
+       cannot silently exfiltrate audit events to an IMDS endpoint.
+       ``localhost`` / ``127.0.0.1`` / ``::1`` are exempt so local-dev
+       setups still work.
+    3. **Optional allowlist** — when ``trusted_hosts`` is set, the host
+       must also be in the allowlist. Pins the bridge to a specific
+       platform host for compliance-hardened deployments.
 
     Raises
     ------
     PlatformConfigError
-        When the scheme is http:// and the host is not localhost, OR
-        when ``trusted_hosts`` is set and the URL's host is not in it.
+        On any of the three failure modes. The error message names the
+        failure but never echoes the allowlist (treat as sensitive).
     """
     parsed = urlparse(url)
-    scheme_ok = False
+    host = (parsed.hostname or "").lower()
+    localhost_hosts = {"localhost", "127.0.0.1", "::1"}
+
     if parsed.scheme == "https":
-        scheme_ok = True
+        pass  # scheme OK, fall through
     elif parsed.scheme == "http":
-        host = (parsed.hostname or "").lower()
-        if host in {"localhost", "127.0.0.1", "::1"}:
-            scheme_ok = True
-        else:
+        if host not in localhost_hosts:
             raise PlatformConfigError(
                 f"PlatformConfig.ingest_url uses http:// with non-localhost "
                 f"host {host!r}. TLS is mandatory for remote ingestion; use "
@@ -186,8 +219,22 @@ def _validate_url_for_tls(
             f"(got scheme {parsed.scheme!r})"
         )
 
-    if scheme_ok and trusted_hosts is not None:
-        host = (parsed.hostname or "").lower()
+    # Default SSRF guard — always runs. Only localhost is exempt.
+    if host not in localhost_hosts:
+        if host in _BLOCKED_METADATA_HOSTS:
+            raise PlatformConfigError(
+                f"PlatformConfig.ingest_url host {host!r} is a known "
+                f"cloud-metadata endpoint. Refusing to POST audit events "
+                f"(SSRF defence)."
+            )
+        if _host_is_private_ip(host):
+            raise PlatformConfigError(
+                f"PlatformConfig.ingest_url host {host!r} is a literal "
+                f"private/loopback/link-local IP. Refusing to POST audit "
+                f"events (SSRF defence). Use the public platform hostname."
+            )
+
+    if trusted_hosts is not None:
         allowed = {h.lower() for h in trusted_hosts}
         if host not in allowed:
             # Security P1: SSRF allowlist. Never echo the configured
@@ -298,6 +345,19 @@ class PlatformClient:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self._config.timeout_seconds),
             verify=True,  # TLS verification is MANDATORY — no self-signed bypass.
+            # Security P0: trust_env=False disables httpx's default read of
+            # HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / SSL_CERT_FILE from the
+            # process environment. An attacker with env-var control (CI,
+            # container escape, adjacent compromised dep) could otherwise
+            # route every audit POST — bearer token, chain hashes, and
+            # payloads — through a proxy they control. The SDK already
+            # validates the configured URL; disabling env-proxies closes
+            # the remaining exfil path.
+            trust_env=False,
+            # Defence-in-depth: pin the current httpx default so a future
+            # version bump that flips it cannot silently open a redirect
+            # exfil path (302 → attacker-controlled host).
+            follow_redirects=False,
             # No custom transport — use the default which honours the
             # host's CA bundle (via certifi inside httpx).
         )

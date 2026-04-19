@@ -418,47 +418,26 @@ def wrap_agt_agent(
 
         agent.run = _run_async
     else:
-
-        @functools.wraps(original_run)
-        def _run_sync(*args: Any, **kwargs: Any) -> Any:
-            tool_name = _resolve_tool_name(args, kwargs)
-            try:
-                asyncio.get_running_loop()
-                raise RuntimeError(
-                    "wrap_agt_agent: sync agent.run() called inside a "
-                    "running event loop. Use AGT's async API (e.g. "
-                    "AsyncChatAgent) instead, or call from outside the "
-                    "event loop."
-                )
-            except RuntimeError as exc:
-                if "running event loop" in str(exc) and "no running" not in str(exc):
-                    raise
-
-            asyncio.run(_halt_check_if_wired(sdk, agent_id))
-            asyncio.run(_scope_check_if_registered(sdk, agent_id, tool_name))
-            cost = getattr(sdk, "cost", None)
-            if cost is not None and hasattr(cost, "check_or_raise"):
-                asyncio.run(cost.check_or_raise(agent_id, sid))
-            asyncio.run(_safe_audit_log(
-                sdk, agent_id, "agt.run",
-                {"source": "microsoft_agent_framework", "tool": tool_name},
-                session_id=sid,
-            ))
-            try:
-                return original_run(*args, **kwargs)
-            except Exception as exc:
-                asyncio.run(_safe_audit_log(
-                    sdk, agent_id, "agt.error",
-                    {
-                        "source": "microsoft_agent_framework",
-                        "tool": tool_name,
-                        "error_type": type(exc).__name__,
-                    },
-                    session_id=sid,
-                ))
-                raise
-
-        agent.run = _run_sync
+        # CTO P0: the previous sync wrapper ran four nested ``asyncio.run``
+        # calls per invocation — each one spinning up + tearing down a
+        # fresh event loop, shredding any SDK state that depends on a
+        # persistent loop (engine pool, audit writer task). AGT's public
+        # API is async-first (``AsyncChatAgent`` / ``async def run``);
+        # users hitting the sync branch almost certainly picked up a
+        # legacy sample. Fail LOUDLY at wrap time so the foot-gun is
+        # surfaced at import rather than at the first tool call in prod.
+        # Users who genuinely need a sync shim can run the async agent
+        # via ``asyncio.run(agent.run(...))`` at their call site — one
+        # loop lifecycle, not four.
+        raise TypeError(
+            f"wrap_agt_agent: agent {agent_id!r} exposes a synchronous "
+            f"run() method. The governance wrapper only supports async "
+            f"AGT agents (AGT's documented default). Use the async "
+            f"ChatAgent API, or call the sync agent yourself inside a "
+            f"single ``asyncio.run()`` and wrap the surrounding coroutine "
+            f"with wrap_agt_agent instead. This restriction will be "
+            f"revisited in v0.8 once a persistent-loop shim is proven."
+        )
 
     agent._governance_wrapped = True
     agent._governance_session_id = sid

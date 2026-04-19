@@ -126,21 +126,35 @@ class GovernanceConfig:
     cost_unknown_model_fallback_usd_per_million: float | None = None
 
     # v0.7.0 platform bridge: dual-write audit events to the Code Atelier
-    # platform's ingest endpoint. All three fields are optional; the
-    # bridge only activates when BOTH ingest_url and ingest_token are
-    # provided AND platform_bridge_enabled is not explicitly False.
+    # platform's ingest endpoint. All four fields are opt-in (off by
+    # default, matching the sibling ``enable_routing`` / ``enable_coverage``
+    # pattern and CLAUDE.md "every module is opt-in via config, not code
+    # changes"). Activating the bridge requires the operator to
+    # explicitly flip ``platform_bridge_enabled=True`` AND set BOTH
+    # ``platform_ingest_url`` + ``platform_ingest_token`` — setting only
+    # the env vars is NOT enough. This prevents a bridge from silently
+    # activating because an unrelated workflow happened to export those
+    # vars.
     # Env-var equivalents are resolved in GovernanceSDK.__init__
     # (per the "no module-level env capture" rule):
     #   GOVERNANCE_PLATFORM_INGEST_URL
     #   GOVERNANCE_PLATFORM_INGEST_TOKEN
     #   GOVERNANCE_PLATFORM_BRIDGE_ENABLED
+    #   GOVERNANCE_PLATFORM_TRUSTED_HOSTS  (comma-separated; SSRF allowlist)
     # Precedence: explicit kwarg > env var > default.
     # If the [platform] extra is not installed (httpx missing) but the
-    # bridge is configured, __init__ raises ImportError at construction
-    # time with the pip install hint — fail LOUDLY, never silently.
+    # bridge is enabled + configured, __init__ raises ImportError at
+    # construction time with the pip install hint — fail LOUDLY, never
+    # silently.
     platform_ingest_url: str | None = None
     platform_ingest_token: str | None = None
-    platform_bridge_enabled: bool = True
+    platform_bridge_enabled: bool = False
+    # SSRF allowlist for the bridge. None → bridge's built-in default
+    # (loopback + private + link-local blocked). Set to a list of
+    # hostnames to pin the bridge to specific endpoints (e.g.
+    # ["governance.codeatelier.tech"]) for compliance-hardened
+    # deployments. Env var accepts comma-separated hostnames.
+    platform_trusted_hosts: list[str] | None = None
 
     def __post_init__(self) -> None:
         """Validate field constraints that cannot be expressed as dataclass defaults."""
@@ -250,6 +264,12 @@ class GovernanceSDK:
                         f"true/false/1/0/yes/no/on/off "
                         f"(got {env_enabled!r})"
                     )
+        if "platform_trusted_hosts" not in kwargs:
+            env_hosts = os.environ.get("GOVERNANCE_PLATFORM_TRUSTED_HOSTS")
+            if env_hosts:
+                parsed = [h.strip() for h in env_hosts.split(",") if h.strip()]
+                if parsed:
+                    kwargs["platform_trusted_hosts"] = parsed
 
         self.config = GovernanceConfig(
             database_url=database_url,
@@ -592,20 +612,32 @@ class GovernanceSDK:
 
         assert cfg.platform_ingest_url is not None  # narrowed by url_set
         assert cfg.platform_ingest_token is not None
+        trusted = (
+            tuple(cfg.platform_trusted_hosts)
+            if cfg.platform_trusted_hosts
+            else None
+        )
         pcfg = PlatformConfig(
             ingest_url=cfg.platform_ingest_url,
             ingest_token=cfg.platform_ingest_token,
             enabled=True,
+            trusted_hosts=trusted,
         )
         client = PlatformClient(pcfg)
-        # DA P0-3: make bridge activation visible at init so a silent
-        # env-driven activation (env vars present, no code opt-in) is
-        # never invisible to an operator reading structlog output.
-        logger.info(
+        # CEO P0: bridge activation is a compliance-visible event (audit
+        # events start flowing to a hosted URL). WARN, not INFO — INFO is
+        # routinely filtered in prod logging configs; WARN is the level
+        # operators actually watch. A single-line WARN at start() is
+        # cheap, non-repeating, and proves the bridge state to anyone
+        # auditing the deployment afterwards.
+        logger.warning(
             "platform.bridge_enabled",
             ingest_url=cfg.platform_ingest_url,
+            trusted_hosts_set=trusted is not None,
             detail=(
                 "Audit events will dual-write to the Code Atelier platform. "
+                "Data residency + retention: see "
+                "https://codeatelier.tech/governance/data-residency. "
                 "Set platform_bridge_enabled=False (or env "
                 "GOVERNANCE_PLATFORM_BRIDGE_ENABLED=false) to disable."
             ),
