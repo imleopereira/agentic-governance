@@ -16,6 +16,17 @@ governance DB is unreachable) extended to the platform.
 
 Everything in v0.7.0 is additive — no BREAKING changes from v0.6.2.
 
+> **BREAKING BEHAVIOUR (env-driven bridge activation)** — the SDK
+> auto-activates the platform bridge when both `platform_ingest_url`
+> + `platform_ingest_token` are set (via kwargs OR via the
+> `GOVERNANCE_PLATFORM_INGEST_URL` / `_TOKEN` env vars). No code change
+> is needed to turn the bridge on beyond setting the creds. Set
+> `platform_bridge_enabled=False` (or
+> `GOVERNANCE_PLATFORM_BRIDGE_ENABLED=false`) to opt out explicitly.
+> At init, a `platform.bridge_enabled` structlog INFO line surfaces
+> the active state with the configured URL — so env-driven activation
+> is never invisible to an operator watching logs.
+
 ### Added (in progress)
 
 - **Platform bridge** (`codeatelier_governance.platform`): async HTTP

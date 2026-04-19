@@ -597,7 +597,20 @@ class GovernanceSDK:
             ingest_token=cfg.platform_ingest_token,
             enabled=True,
         )
-        return PlatformClient(pcfg)
+        client = PlatformClient(pcfg)
+        # DA P0-3: make bridge activation visible at init so a silent
+        # env-driven activation (env vars present, no code opt-in) is
+        # never invisible to an operator reading structlog output.
+        logger.info(
+            "platform.bridge_enabled",
+            ingest_url=cfg.platform_ingest_url,
+            detail=(
+                "Audit events will dual-write to the Code Atelier platform. "
+                "Set platform_bridge_enabled=False (or env "
+                "GOVERNANCE_PLATFORM_BRIDGE_ENABLED=false) to disable."
+            ),
+        )
+        return client
 
     # ------------------------------------------------------------------
     # F6 Track A: agent identity bootstrap

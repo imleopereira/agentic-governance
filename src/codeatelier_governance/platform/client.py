@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -79,7 +80,21 @@ _WARN_RATE_LIMIT_WINDOW_SECONDS = 3600
 # cumulative drop count attached.
 _FIVEXX_WARN_WINDOW_SECONDS = 60.0
 
-SDK_VERSION = "0.7.0"
+def _resolve_sdk_version() -> str:
+    """Resolve the SDK version from installed package metadata.
+
+    Lazily evaluated so the bridge's User-Agent tracks the actual
+    shipped version across future releases without a hardcode. DA P1-4.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        return version("code-atelier-governance")
+    except (ImportError, PackageNotFoundError):  # pragma: no cover
+        return "0.0.0+unknown"
+
+
+SDK_VERSION = _resolve_sdk_version()
 
 
 @dataclass
@@ -666,6 +681,10 @@ def _event_to_wire(event: "AuditEventRecord") -> dict[str, Any]:
     }
 
 
+_DENY_SEGMENTS = {"denied", "violation", "exceeded", "halted"}
+_ALLOW_SEGMENTS = {"granted", "allowed"}
+
+
 def _infer_decision(kind: str) -> str | None:
     """Map an event kind to allow / deny / None.
 
@@ -673,10 +692,14 @@ def _infer_decision(kind: str) -> str | None:
     {"allow", "deny", null}. We infer from the event kind because the
     SDK's AuditEventRecord doesn't store decision directly — enforcement
     modules write distinct kinds for allow vs deny outcomes.
+
+    Matches on dot-segments (not just suffix) so compound kinds like
+    ``approval.granted.batch`` still resolve to ``"allow"``. DA P0-1.
     """
-    if kind.endswith((".denied", ".violation", ".exceeded", ".halted")):
+    segments = set(kind.split("."))
+    if segments & _DENY_SEGMENTS:
         return "deny"
-    if kind.endswith((".granted", ".allowed")):
+    if segments & _ALLOW_SEGMENTS:
         return "allow"
     return None
 
@@ -702,17 +725,26 @@ def _parse_retry_after(response: Any) -> float | None:
     return seconds
 
 
+# Matches any ``Bearer <token>`` substring a misconfigured reverse-proxy
+# might echo into a 4xx HTML body. Replaced before we log anything at
+# WARN. DA P0-2.
+_BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+\-/=]+", re.IGNORECASE)
+
+
 def _safe_body_preview(response: Any, max_chars: int = 256) -> str:
-    """Return a bounded preview of the response body for logging.
+    """Return a bounded, bearer-scrubbed preview of the response body.
 
     Truncates to ``max_chars`` so a misbehaving server can't blow up
-    our log line. Never includes headers — those could echo the
-    bearer token.
+    our log line. Scrubs any ``Bearer <token>`` substring in case the
+    platform (or an intermediary) echoes the Authorization header into
+    an error page. Never includes response headers (they're even more
+    likely to carry the token verbatim).
     """
     try:
         text = str(response.text)
     except Exception:  # noqa: BLE001
         return "<unavailable>"
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
     if len(text) > max_chars:
         return text[:max_chars] + "..."
     return text
