@@ -1,0 +1,48 @@
+# AGT agent with Code Atelier Governance
+
+This project was scaffolded by `codeatelier-governance recipe agt`. It
+wires a Microsoft AGT agent through four Code Atelier governance gates
+for every action:
+
+1. **Scope check** — is the tool allowed for this agent?
+2. **Cost preflight** — would the action exceed the configured budget?
+3. **HITL gate** — for high-risk actions, block on a human decision.
+4. **Audit log** — append-only, HMAC-chained, every gate outcome.
+
+## Quickstart
+
+```bash
+# 1. Install the SDK (and, when you're ready, microsoft-agentic).
+pip install -r requirements.txt
+
+# 2. Point DATABASE_URL at your governance Postgres.
+cp .env.example .env
+# edit .env
+
+# 3. Apply the SDK schema (one-time, idempotent).
+governance migrate --database-url "$DATABASE_URL"
+
+# 4. Run the agent. Refunds over $1,000 block until a human approves.
+python agent.py
+```
+
+## Files
+
+- `agent.py` — the AGT tool loop. Each tool starts with a three-line
+  governance sandwich (scope + cost + gate) before the side effect.
+- `governance.py` — constructs the SDK instance. Flip
+  `platform_bridge_enabled=True` here once you sign up at
+  governance.codeatelier.tech.
+- `requirements.txt` — pins the SDK ≥ 0.7.2.
+- `.env.example` — the environment variables to copy into `.env`.
+
+## Try it
+
+Run `python agent.py` and watch a $42 refund sail through while any
+refund at $1,000 or higher blocks on a pending approval. The audit
+trail lives in your Postgres in `governance_audit_events` — verify
+its integrity at any time with:
+
+```bash
+governance verify --session-id <uuid>
+```

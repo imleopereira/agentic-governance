@@ -1,0 +1,32 @@
+"""Governance SDK wiring for this agent.
+
+Reads ``DATABASE_URL`` from the environment. Kept in its own module so
+customers can unit-test the governance wiring without spinning up the
+full AGT agent loop.
+
+Flip ``platform_bridge_enabled=True`` once the account is provisioned at
+``governance.codeatelier.tech/app/agents`` — the bridge dual-writes
+audit events and HITL approvals to the hosted platform without changing
+any local enforcement semantics (local Postgres remains the source of
+truth per the SDK's "host app must keep working if the platform is
+unreachable" invariant).
+"""
+from __future__ import annotations
+
+import os
+
+from codeatelier_governance import GovernanceSDK
+
+
+def make_sdk(agent_id: str) -> GovernanceSDK:
+    """Construct a GovernanceSDK with environment-driven configuration."""
+    return GovernanceSDK(
+        database_url=os.environ.get(
+            "DATABASE_URL", "postgresql://localhost/governance"
+        ),
+        agent_id=agent_id,
+        # Uncomment to ship audit + gates to the hosted platform:
+        # platform_bridge_enabled=True,
+        # platform_ingest_url=os.environ["GOVERNANCE_PLATFORM_URL"],
+        # platform_ingest_token=os.environ["GOVERNANCE_PLATFORM_TOKEN"],
+    )

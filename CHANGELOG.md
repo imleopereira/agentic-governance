@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.7.2 — AGT recipe scaffolder (DRAFT)
+
+> **This section is a draft.** Ships a distribution-first CLI command
+> that scaffolds a ready-to-run Microsoft AGT agent already wired
+> through the governance SDK's scope / cost / gates checks. Zero
+> external deps beyond the SDK itself; the Microsoft AGT import stays
+> commented in the scaffold so ``pip install`` stays slim.
+
+### Added
+
+- **CLI command ``codeatelier-governance recipe agt <path>``** — writes
+  a five-file project scaffold (``agent.py``, ``governance.py``,
+  ``requirements.txt``, ``.env.example``, ``README.md``) into the
+  target directory. The scaffolded ``agent.py`` demonstrates the
+  three-line governance sandwich (``sdk.scope.check`` +
+  ``sdk.cost.preflight`` + ``sdk.gates.request``) around a refund tool,
+  with refunds ≥ $1,000 blocking on a human decision. ``--force``
+  overwrites an existing directory; a populated target without
+  ``--force`` refuses to clobber user files.
+- **Alternate entry point ``codeatelier-governance``** — second
+  ``[project.scripts]`` alias pointing at the same argparse dispatcher
+  as ``governance``. The ``recipe`` subcommand is also reachable via
+  ``governance recipe ...`` and ``python -m codeatelier_governance.cli
+  recipe ...``.
+- **Recipe package** — ``codeatelier_governance.recipes`` houses
+  multi-file project scaffolds (as opposed to
+  ``codeatelier_governance.cli.recipes``, which ships single-file
+  starter templates for the older ``governance init`` command).
+  Future templates (``langgraph``, ``crewai``) plug in by dropping a
+  new directory under ``recipes/<name>/`` plus a
+  ``RECIPE_NAMES`` entry — no CLI changes required.
+
+### Not changed
+
+- No schema changes, no migrations, no runtime behaviour changes. The
+  scaffolder is a build-time convenience and never touches Postgres.
+
 ## v0.7.1 — platform-bridge-aware approvals (DRAFT)
 
 > **This section is a draft.** Final release notes will land once the
