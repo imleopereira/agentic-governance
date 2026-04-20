@@ -1,5 +1,157 @@
 # Changelog
 
+## v0.7.1 — platform-bridge-aware approvals (DRAFT)
+
+> **This section is a draft.** Final release notes will land once the
+> `/app/approvals` platform surface ships alongside. The shape of what
+> the SDK contributes in v0.7.1 is stable; the prose will be re-polished
+> for the release announcement.
+
+Extends the v0.7.0 platform bridge with a **write-and-poll contract
+for HITL approvals**. When the bridge is on (opt-in, unchanged from
+v0.7.0 — default OFF), `sdk.gates.request()` dual-writes the pending
+gate to the platform's `/app/approvals` inbox, and `sdk.gates.wait_for()`
+polls the platform's resolution endpoint alongside the local gate
+store. The customer's own Postgres remains the source of truth per
+CLAUDE.md invariant #1: local always wins.
+
+No breaking API changes. Callers with the bridge off see exactly the
+v0.7.0 behaviour. Callers with the bridge on gain a second channel for
+approving pending gates (`/app/approvals`) without losing the CLI
+fallback (`governance grant <token>` / `governance deny <token>`).
+
+### Added
+
+- **Gate-bridge write path** — `PlatformClient.forward_gate_request`
+  fire-and-forget POSTs each new gate to
+  `/api/v1/bridge/gates/:request_id` using the existing ingest bearer
+  token. Same retry/backoff budget as the audit-event forward (1s → 2s
+  → 4s → 8s, 15s cap). Platform 5xx never blocks local gate creation.
+  The POST body carries `request_id`, `agent_id`, `kind`, `action_hash`,
+  `expires_at`, and `sdk_version`; the single-use HMAC `token` and the
+  agent-side `payload` are **not** transmitted (the payload can contain
+  PII; the token is strictly customer-side for the CLI fallback path).
+- **Gate-bridge read path** — `PlatformClient.poll_gate_resolution`
+  GETs `/api/v1/bridge/gates/:request_id/resolution`. Returns a
+  `PlatformGateResolution` with `status` (`pending`/`granted`/`denied`)
+  and optional `decided_at`. The `reason` string is deliberately
+  omitted from the response to prevent PII from leaking into the
+  agent's LLM context (Leo's v0.7.1 security decision, spec §3).
+- **`sdk.gates.wait_for` platform-poll merge** — each poll tick now
+  reads local first (authoritative), then platform if local is still
+  pending. If platform returns `granted`/`denied` while local is
+  `pending`, the resolution is synced back to the local store via
+  `GatesStore.resolve(..., on_commit=<audit-emit>)` with
+  `by=platform` metadata, so a subsequent `wait_for` in a sibling
+  process sees the decision locally without another platform round-trip.
+  Platform poll cadence: 2s base ±500ms jitter, exponential backoff on
+  errors capped at 10s. The local poll cadence (`poll_interval_s`,
+  default 0.5s) is unchanged.
+- **Four new stats counters** on `PlatformClient.stats()`:
+  `gate_requests_sent`, `gate_requests_dropped`, `gate_polls_sent`,
+  `gate_polls_failed`. The original seven keys are unchanged, so any
+  telemetry scraping v0.7.0 stats continues to work.
+- **`PlatformGatePollError`** — new internal exception (subclass of
+  `PlatformRetryableError`) raised by `poll_gate_resolution` on
+  platform 4xx/5xx/connection errors. Never propagates to the host
+  app: the gates module catches, logs at DEBUG, applies backoff, and
+  keeps polling local.
+
+### Fail-open semantics (unchanged, restated for the record)
+
+- Platform unreachable at gate creation → local gate is created anyway;
+  CLI grant/deny path still resolves it. Matches v0.7.0 audit-bridge
+  posture.
+- Platform unreachable during polling → wait_for keeps polling local,
+  gate expires at `timeout` as usual.
+- Local `granted` + platform `pending` → agent proceeds (local wins).
+- Local `pending` + platform `granted` → SDK syncs resolution into
+  local store, then returns True.
+
+### v0.7.1 remediation additions (scope C)
+
+- **402 tier-not-entitled handling** — when the platform returns HTTP 402
+  on any bridge route (ingest events, bridge gate POST, bridge resolution
+  GET, reverse-sync POST), the SDK auto-disables the bridge for the rest
+  of the process via a single-flight latch, logs ONE structured
+  `platform.bridge_disabled reason=tier_not_entitled` WARN with the
+  platform-supplied `upgrade_url`, and silently drops subsequent bridge
+  calls. All local writes continue on the customer's own Postgres, so
+  `audit.log()`, `gates.request()`, and `gates.grant/deny` remain fully
+  operational. Matches CLAUDE.md invariant #1 (host app MUST continue
+  working if the governance DB is unreachable — extended here to "if the
+  platform rejects the tier").
+- **`stats()['disabled_reason']`** — new string field on
+  `PlatformClient.stats()`. Emits `"auth_failed"` when the 401 latch is
+  set, `"tier_not_entitled"` when the 402 latch is set, `None` otherwise.
+  `disabled` (the pre-existing boolean) covers both latches so existing
+  dashboards don't break.
+- **`PlatformTierNotEntitledError`** — new internal exception
+  (subclass of `PlatformTerminalError`). Strictly internal; the host
+  application cannot catch it (it does not inherit from
+  `GovernanceError`).
+
+### Pass-2 additions (real-usage + edge cases)
+
+- **Reverse-sync on local resolve** — when `sdk.gates.grant()` or
+  `sdk.gates.deny()` resolves a gate that was forwarded to the
+  platform, the SDK fires a best-effort
+  `POST /api/v1/bridge/gates/:id/resolution` with
+  `{decision, decided_at, by: "sdk_local"}`. The platform writes a
+  `gate_decisions` row via `resolve_gate` with `p_by_source='sdk_local'`
+  so the `/app/approvals` UI renders "Resolved in SDK · 14:02 UTC"
+  instead of leaving a stale pending card. Two new stats:
+  `local_resolutions_sent`, `local_resolutions_dropped`. Only fires
+  for gates the platform has actually acknowledged (via the bridge's
+  internal `_forwarded_request_ids` set), so a stale CLI grant against
+  a platform-down-at-creation-time gate skips silently.
+- **Forward-burst semaphore** — concurrent gate-request forwards are
+  now capped at 100 via `asyncio.Semaphore(100)`. Above the cap, the
+  task awaits briefly before dispatching its httpx POST. New stat:
+  `gate_forwards_queued` increments whenever a task hits back-pressure.
+  Prevents unbounded coroutine creation when the platform is hanging.
+- **Auth-failed latch now covers forward + reverse-sync** — previously
+  only `poll_gate_resolution`'s 401 flipped the bridge-disabled latch.
+  A 401 on `forward_gate_request` or `notify_local_resolution` now also
+  latches, matching the audit-event-forward contract. After the latch,
+  every subsequent bridge call (forward, poll, reverse-sync) short-
+  circuits to a drop without I/O.
+- **Consecutive-5xx backoff cap latch** — after 5 consecutive platform
+  poll errors, the next-poll hold jumps from the normal jittered
+  interval to 60s for one tick, before resuming the exponential-with-
+  cap ladder. Prevents hammering a stuck upstream. The latch resets
+  on any successful poll.
+- **Wire-format regression guard** — a dedicated test now asserts the
+  forward body contains EXACTLY
+  `{request_id, agent_id, kind, action_hash, expires_at, sdk_version}`
+  and NONE of `{token, secret, payload, chain_key, reason, decision,
+  hmac, client_hmac}`. Future refactors leaking a secret to the
+  platform fail CI.
+
+### Internal
+
+- `gates.module` and `platform.client` share a module-level
+  `jittered_gate_poll_delay` / `_jittered_interval` helper so the
+  poll-cadence policy lives in one place.
+- `GatesModule.__init__` accepts a new `platform_client=None` kwarg.
+  Default None preserves v0.7.0 behaviour exactly.
+- Migration `0008_approvals_inbox.sql` amended in-place (not a new
+  migration) to add `gate_decisions.by_source text` (DEFAULT
+  'platform'; check constraint {'platform','sdk_local'}) and relax
+  `decided_by` / `token_hmac` to nullable behind a semantic-
+  consistency check (platform rows MUST have both; sdk_local rows
+  MUST have neither). `resolve_gate` RPC gains a 7th parameter
+  `p_by_source text default 'platform'` so all 6-arg callers remain
+  wire-compatible.
+
+### Changelog-only follow-ups (not code)
+
+- Platform-side `/api/v1/bridge/gates/*` routes + `/app/approvals`
+  inbox land in a separate platform repo release. The SDK's
+  write-and-poll contract is forward-compatible with any platform that
+  implements §3 of the spec; the platform merge is gated on the
+  platform team's own CPO/Design/Security sign-off.
+
 ## v0.7.0 — platform bridge + distribution pivot
 
 Distribution-pivot release. The SDK gains an optional **platform bridge**

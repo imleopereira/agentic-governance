@@ -29,7 +29,7 @@ import json
 import os
 import random
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, ParamSpec, TypeVar
 from uuid import UUID, uuid4
 
 import structlog
@@ -45,6 +45,9 @@ from .errors import (
 from .models import ApprovalRequest
 from .store import GatesStore, InMemoryGatesStore
 from .tokens import make_token, parse_token
+
+if TYPE_CHECKING:  # pragma: no cover — import only for type checking
+    from ..platform.client import PlatformClient
 
 logger = structlog.get_logger(__name__)
 
@@ -91,6 +94,43 @@ def _hash_action_payload(value: Any) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# v0.7.1 platform-bridge poll cadence. Derived from the SDK <-> platform
+# contract (spec §3):
+#     "Poll interval: 2s jittered (randomised +/-500ms per tick),
+#      capped at 10s via exponential backoff on errors."
+#
+# These constants are module-level (not class-level) so tests can
+# monkey-patch them without subclassing GatesModule. Kept here rather
+# than in platform/client.py because they describe CALLER policy (how
+# often the gates module asks the platform) rather than TRANSPORT
+# policy (how the platform client retries a single request).
+_PLATFORM_POLL_BASE_SECONDS: float = 2.0
+_PLATFORM_POLL_JITTER_SECONDS: float = 0.5
+_PLATFORM_POLL_MAX_SECONDS: float = 10.0
+
+# v0.7.1 pass-2 edge case E: after this many consecutive 5xx / network
+# errors from the platform poll, the backoff "latches" at the 10s cap
+# for ``_PLATFORM_POLL_LATCH_SECONDS`` before allowing a retry. Prevents
+# the SDK from hammering a stuck upstream once the exponential ladder
+# has already reached the cap. The latch window resets on any
+# successful poll.
+_PLATFORM_POLL_LATCH_THRESHOLD: int = 5
+_PLATFORM_POLL_LATCH_SECONDS: float = 60.0
+
+
+def _jittered_interval(base: float) -> float:
+    """Return ``base`` + uniform jitter in [-0.5s, +0.5s], clamped to [0, 10s].
+
+    Uses a simple uniform jitter — the spec is explicit that +-500ms is
+    sufficient; we do NOT layer a second randomisation on top because
+    each poll already has its own schedule and a deterministic cap.
+    """
+    delta = random.uniform(
+        -_PLATFORM_POLL_JITTER_SECONDS, _PLATFORM_POLL_JITTER_SECONDS
+    )
+    return max(0.0, min(_PLATFORM_POLL_MAX_SECONDS, base + delta))
+
+
 class GatesModule:
     """Human-in-the-loop approval gates."""
 
@@ -104,6 +144,7 @@ class GatesModule:
         poll_interval_s: float = 0.5,
         enable_v2_tokens: bool | None = None,
         accept_v1_until: datetime | None = None,
+        platform_client: "PlatformClient | None" = None,
     ) -> None:
         from ..audit.module import _check_secret_strength
 
@@ -113,6 +154,15 @@ class GatesModule:
         self._default_expires_in = default_expires_in
         self._store: GatesStore = store or InMemoryGatesStore()
         self._poll_interval_s = poll_interval_s
+        # v0.7.1 platform-bridge hook. When wired, ``request()`` dual-
+        # writes the gate creation to the platform and ``wait_for()``
+        # polls the platform's resolution endpoint alongside the local
+        # store. Default None preserves v0.7.0 semantics exactly.
+        # CLAUDE.md invariant #1: every platform interaction is
+        # best-effort — the local store remains authoritative for
+        # wait_for's return value and a platform outage never blocks
+        # gate creation or resolution polling.
+        self._platform_client: "PlatformClient | None" = platform_client
         # v0.6.2-followup: downgrade-safe token format.
         # Env var is read here (not at module import time) per the
         # project memory rule against module-level os.environ capture
@@ -271,6 +321,20 @@ class GatesModule:
                 },
             )
         )
+        # v0.7.1 platform-bridge write path. Fire-and-forget — mirrors
+        # the audit-event bridge contract (invariant #1). The local
+        # store is already the source of truth; a platform outage here
+        # cannot fail gate creation. The PlatformClient's own
+        # forward_gate_request never raises.
+        if self._platform_client is not None:
+            try:
+                self._platform_client.forward_gate_request(req)
+            except Exception as exc:  # noqa: BLE001 — non-breaking
+                logger.warning(
+                    "gates.platform_forward_failed",
+                    error_type=type(exc).__name__,
+                    request_id=str(request_id),
+                )
         return req
 
     async def grant(self, token: str) -> None:
@@ -362,6 +426,28 @@ class GatesModule:
             on_commit=_emit_audit,
         )
 
+        # v0.7.1 pass-2 edge case B: reverse-sync the resolution to the
+        # platform so the /app/approvals inbox doesn't leave a stale
+        # pending card. Best-effort: the platform client filters on its
+        # internal ``_forwarded_request_ids`` set so we only notify for
+        # gates the platform has actually seen — a stale CLI grant
+        # against a platform-down-at-creation-time gate skips silently.
+        # Never raises, never blocks: the caller's grant/deny has
+        # already committed locally.
+        if self._platform_client is not None:
+            try:
+                self._platform_client.notify_local_resolution(
+                    request_id,
+                    "granted" if granted else "denied",
+                    datetime.now(timezone.utc),
+                )
+            except Exception as exc:  # noqa: BLE001 — non-breaking
+                logger.warning(
+                    "gates.platform_reverse_sync_failed",
+                    error_type=type(exc).__name__,
+                    request_id=str(request_id),
+                )
+
     async def wait_for(self, request_id: UUID, timeout: float) -> bool:
         """Block until the request is resolved. Returns True if granted.
 
@@ -370,10 +456,41 @@ class GatesModule:
 
         Raises :class:`ApprovalTimeout` if the timeout elapses without
         resolution. Raises :class:`ApprovalDenied` if the request was denied.
+
+        When a platform bridge is wired (v0.7.1), this method ALSO
+        polls the platform's ``GET /api/v1/bridge/gates/:id/resolution``
+        endpoint each tick. The LOCAL store remains authoritative per
+        CLAUDE.md invariant #1:
+
+        * local ``granted`` + platform ``pending``  -> return True
+        * local ``pending`` + platform ``granted``  -> sync platform
+          verdict back into the local store via
+          ``self._store.resolve(..., on_commit=<audit emit>)`` so any
+          subsequent ``wait_for`` call sees the resolution locally too,
+          then return True
+        * local ``denied`` (regardless of platform) -> raise
+          :class:`ApprovalDenied`
+        * platform unreachable / 5xx -> exponential backoff (2s -> 4s
+          -> 8s -> 10s cap), keep polling local. Gate still expires at
+          ``timeout`` just like the v0.7.0 contract.
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
+        # Platform-poll backoff state. Reset to the default base on any
+        # successful poll; exponentiated on any raised error up to the
+        # 10s cap. Kept out of self because wait_for may be called
+        # concurrently for different request_ids.
+        platform_backoff = _PLATFORM_POLL_BASE_SECONDS
+        next_platform_poll_at: float = loop.time()
+        # Edge case E: consecutive-5xx latch. After
+        # ``_PLATFORM_POLL_LATCH_THRESHOLD`` failures in a row, we hold
+        # the next poll off by ``_PLATFORM_POLL_LATCH_SECONDS`` instead
+        # of the normal jittered interval. Resets to 0 on any successful
+        # poll. ``next_platform_poll_at`` already enforces the hold via
+        # wall-clock, so this is purely state-tracking.
+        platform_consecutive_failures = 0
         while True:
+            # -- Local read first (authoritative per invariant #1) ---
             try:
                 resolution = await self._store.get_resolution(request_id)
             except Exception as exc:
@@ -389,15 +506,165 @@ class GatesModule:
                 raise ApprovalDenied(
                     f"approval denied for request {request_id}"
                 )
+            # -- Platform read (advisory; only consulted when local is
+            # still pending). Local-always-wins is enforced by the
+            # ordering above: we NEVER reach this branch with a
+            # non-None local resolution. -----------------------------
+            if (
+                self._platform_client is not None
+                and loop.time() >= next_platform_poll_at
+            ):
+                try:
+                    platform_res = (
+                        await self._platform_client.poll_gate_resolution(
+                            request_id
+                        )
+                    )
+                    # Successful poll resets both the backoff ladder
+                    # AND the consecutive-failure latch counter.
+                    platform_backoff = _PLATFORM_POLL_BASE_SECONDS
+                    platform_consecutive_failures = 0
+                except Exception as exc:  # noqa: BLE001 — non-breaking
+                    # DEBUG, not WARN: a platform outage shouldn't spam
+                    # the log once per poll tick across every
+                    # outstanding gate. The PlatformClient already
+                    # bumps ``gate_polls_failed`` for observability.
+                    logger.debug(
+                        "gates.wait_for_platform_poll_failed",
+                        error_type=type(exc).__name__,
+                        request_id=str(request_id),
+                    )
+                    platform_res = None
+                    platform_consecutive_failures += 1
+                    # Exponential backoff up to 10s cap.
+                    platform_backoff = min(
+                        platform_backoff * 2,
+                        _PLATFORM_POLL_MAX_SECONDS,
+                    )
+                # Edge case E: consecutive-5xx latch. Once we've been
+                # at the cap long enough (5 failures in a row), hold
+                # the next poll off by 60s instead of jittering at 10s.
+                # This prevents hammering a stuck upstream — the local
+                # store still wins, and a long-timeout wait_for will
+                # eventually succeed or ApprovalTimeout at the
+                # user-supplied deadline. The jittered interval
+                # continues to govern the sub-latch window so a healthy
+                # platform recovers immediately.
+                if (
+                    platform_consecutive_failures
+                    >= _PLATFORM_POLL_LATCH_THRESHOLD
+                ):
+                    hold = _PLATFORM_POLL_LATCH_SECONDS
+                else:
+                    hold = _jittered_interval(platform_backoff)
+                # Schedule the next platform poll by wall-clock, so a
+                # faster local poll_interval_s doesn't spam the platform.
+                next_platform_poll_at = loop.time() + hold
+                if platform_res is not None and platform_res.status in (
+                    "granted",
+                    "denied",
+                ):
+                    await self._sync_platform_resolution(
+                        request_id, platform_res.status
+                    )
+                    if platform_res.status == "granted":
+                        return True
+                    raise ApprovalDenied(
+                        f"approval denied for request {request_id}"
+                    )
             now = loop.time()
             if now >= deadline:
                 raise ApprovalTimeout(
                     f"approval timeout after {timeout}s for request {request_id}"
                 )
-            # ±20% jitter to avoid thundering-herd polling under load
+            # ±20% jitter on the local poll interval to avoid thundering
+            # herd. The platform poll cadence is managed separately via
+            # next_platform_poll_at above (2s base +- 500ms, 10s cap).
             jittered = self._poll_interval_s * random.uniform(0.8, 1.2)
             sleep_for = min(jittered, deadline - now)
             await asyncio.sleep(sleep_for)
+
+    async def _sync_platform_resolution(
+        self,
+        request_id: UUID,
+        status: str,
+    ) -> None:
+        """Commit a platform-decided verdict to the local store.
+
+        Called from :meth:`wait_for` when the platform returns a terminal
+        verdict while the local store is still pending. Uses the
+        on_commit hook so the audit row lands atomically with the state
+        flip (v0.6.2 P0 atomicity contract — same as ``grant``/``deny``
+        but with ``by=platform`` metadata).
+
+        Best-effort: any failure is logged and swallowed. The caller
+        may still return the platform verdict to the agent because the
+        agent cares about the decision, not which store won the race.
+        A subsequent ``wait_for`` from a sibling process will either
+        see a local resolution (this call succeeded) or repeat the
+        platform poll (still pending locally) — both are correct.
+        """
+        try:
+            pending = await self._store.get_pending(request_id)
+        except Exception as exc:  # noqa: BLE001 — invariant #1
+            logger.warning(
+                "gates.platform_sync_get_pending_failed",
+                error_type=type(exc).__name__,
+                request_id=str(request_id),
+            )
+            return
+        if pending is None:
+            # Local row is gone (expired, purged, or a sibling resolved
+            # it racily). Nothing to sync. Return — the caller will
+            # honor the platform verdict on this call and the next
+            # wait_for will re-evaluate from scratch.
+            return
+
+        async def _emit_audit(req: ApprovalRequest) -> None:
+            await self._audit.log(
+                AuditEvent(
+                    agent_id=req.agent_id,
+                    kind=(
+                        "approval.granted"
+                        if status == "granted"
+                        else "approval.denied"
+                    ),
+                    metadata={
+                        "request_id": str(request_id),
+                        "approval_kind": req.kind,
+                        # ``by=platform`` marks this resolution as
+                        # originating from the platform bridge (rather
+                        # than from the CLI / webhook / grant-token
+                        # path). Compliance exports and retrospectives
+                        # can filter on it.
+                        "by": "platform",
+                    },
+                )
+            )
+
+        try:
+            await self._store.resolve(
+                request_id,
+                "granted" if status == "granted" else "denied",
+                on_commit=_emit_audit,
+            )
+        except ApprovalTokenError:
+            # Race: a concurrent grant/deny (CLI or another process)
+            # resolved the gate between our get_resolution() call and
+            # here. That other resolution is the authoritative one; we
+            # drop the platform sync on the floor. The caller still
+            # honors the platform verdict this call, and the next
+            # wait_for will see the local resolution directly.
+            logger.info(
+                "gates.platform_sync_lost_race",
+                request_id=str(request_id),
+            )
+        except Exception as exc:  # noqa: BLE001 — invariant #1
+            logger.warning(
+                "gates.platform_sync_resolve_failed",
+                error_type=type(exc).__name__,
+                request_id=str(request_id),
+            )
 
     def require_approval(
         self,

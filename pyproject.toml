@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-atelier-governance"
-version = "0.7.0"
+version = "0.7.1"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
