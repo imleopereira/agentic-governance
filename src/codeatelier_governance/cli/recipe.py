@@ -80,7 +80,18 @@ def run_recipe_command(template: str, path: str, *, force: bool = False) -> int:
         )
         return 2
 
-    target = Path(path).expanduser().resolve()
+    raw_target = Path(path).expanduser()
+    # Symlink refusal BEFORE .resolve(): resolve() dereferences, so running
+    # --force against a symlinked directory would call shutil.rmtree() on
+    # the resolved destination (e.g. `ln -s /etc/important my-agent` then
+    # `recipe agt my-agent --force` would wipe /etc/important).
+    if raw_target.is_symlink():
+        sys.stderr.write(
+            f"Error: {raw_target} is a symlink; refusing to --force "
+            "(would clobber the link target).\n"
+        )
+        return 1
+    target = raw_target.resolve()
 
     if _target_has_content(target):
         if not force:
@@ -89,9 +100,6 @@ def run_recipe_command(template: str, path: str, *, force: bool = False) -> int:
                 "Re-run with --force to overwrite.\n"
             )
             return 1
-        # --force semantics: nuke and re-create so stale files from a
-        # previous scaffold don't linger (e.g. old governance.py the
-        # user deleted from the template but kept on disk).
         if target.is_file():
             target.unlink()
         else:

@@ -574,6 +574,19 @@ class GatesModule:
                     )
             now = loop.time()
             if now >= deadline:
+                # TODO(future): notify the platform bridge with a "timed_out"
+                # resolution here so the UI card transitions to "Expired"
+                # immediately instead of waiting for the gate's own expires_at
+                # (up to 1 hour away). Needs further research before
+                # implementing — three blockers identified in the v0.7.2
+                # team review: (1) platform Zod + Postgres schema rejects
+                # "timed_out" today; (2) principal-model violation — the
+                # agent process writing a terminal gate state can race and
+                # silently drop a legitimate operator approval; (3) no
+                # opt-out mechanism (violates CLAUDE.md opt-in invariant).
+                # Also missing: local approval.timed_out audit event for
+                # EU AI Act Article 12 compliance. Do not implement without
+                # resolving all three and a full DA + Security sign-off.
                 raise ApprovalTimeout(
                     f"approval timeout after {timeout}s for request {request_id}"
                 )

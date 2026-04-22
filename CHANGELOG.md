@@ -1,12 +1,12 @@
 # Changelog
 
-## v0.7.2 — AGT recipe scaffolder (DRAFT)
+## v0.7.2 (unreleased) — AGT recipe scaffolder
 
-> **This section is a draft.** Ships a distribution-first CLI command
-> that scaffolds a ready-to-run Microsoft AGT agent already wired
-> through the governance SDK's scope / cost / gates checks. Zero
-> external deps beyond the SDK itself; the Microsoft AGT import stays
-> commented in the scaffold so ``pip install`` stays slim.
+Distribution-first CLI command that scaffolds a ready-to-run Microsoft
+AGT agent already wired through the governance SDK's scope / cost /
+gates checks. Zero external deps beyond the SDK itself; the Microsoft
+AGT import stays commented in the scaffold so ``pip install`` stays
+slim.
 
 ### Added
 
@@ -18,7 +18,11 @@
   ``sdk.cost.preflight`` + ``sdk.gates.request``) around a refund tool,
   with refunds ≥ $1,000 blocking on a human decision. ``--force``
   overwrites an existing directory; a populated target without
-  ``--force`` refuses to clobber user files.
+  ``--force`` refuses to clobber user files. Symlinked targets are
+  refused outright under ``--force`` to avoid dereferencing through to
+  the link's destination (e.g. ``ln -s /etc/important my-agent`` +
+  ``recipe agt my-agent --force`` would otherwise wipe
+  ``/etc/important``).
 - **Alternate entry point ``codeatelier-governance``** — second
   ``[project.scripts]`` alias pointing at the same argparse dispatcher
   as ``governance``. The ``recipe`` subcommand is also reachable via
@@ -37,12 +41,7 @@
 - No schema changes, no migrations, no runtime behaviour changes. The
   scaffolder is a build-time convenience and never touches Postgres.
 
-## v0.7.1 — platform-bridge-aware approvals (DRAFT)
-
-> **This section is a draft.** Final release notes will land once the
-> `/app/approvals` platform surface ships alongside. The shape of what
-> the SDK contributes in v0.7.1 is stable; the prose will be re-polished
-> for the release announcement.
+## v0.7.1 (unreleased) — platform-bridge-aware approvals
 
 Extends the v0.7.0 platform bridge with a **write-and-poll contract
 for HITL approvals**. When the bridge is on (opt-in, unchanged from
@@ -123,6 +122,19 @@ fallback (`governance grant <token>` / `governance deny <token>`).
   set, `"tier_not_entitled"` when the 402 latch is set, `None` otherwise.
   `disabled` (the pre-existing boolean) covers both latches so existing
   dashboards don't break.
+- **Latch reset requires process restart.** Both the 401
+  (`auth_failed`) and 402 (`tier_not_entitled`) latches are permanent
+  for the lifetime of the SDK process. A transient 401 (briefly
+  revoked-then-restored token) or 402 (platform glitch, misrouted
+  request) will disable the bridge until the next deploy or process
+  restart. Operators can detect the state via
+  `sdk.platform.stats()['disabled']` (bool) and
+  `stats()['disabled_reason']` (string). If the underlying platform
+  condition is cleared, restart the process to re-enable the bridge.
+  Local `audit.log()`, `gates.request()`, and `gates.grant/deny`
+  remain fully operational while a latch is set — the bridge is
+  advisory dual-write, not the enforcement path, so silent latching
+  never causes an enforcement bypass.
 - **`PlatformTierNotEntitledError`** — new internal exception
   (subclass of `PlatformTerminalError`). Strictly internal; the host
   application cannot catch it (it does not inherit from
