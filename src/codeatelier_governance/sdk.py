@@ -455,7 +455,16 @@ class GovernanceSDK:
                 database_url, self._shared_engine
             )
             self.gates = GatesModule(
-                self.audit, secret=resolved_secret, store=gates_store,
+                self.audit,
+                secret=resolved_secret,
+                store=gates_store,
+                # v0.7.1: opt-in platform bridge for HITL approvals.
+                # When the bridge is off (default), this is None and
+                # wait_for() falls back to pure local polling — exact
+                # v0.7.0 behaviour. When on, request() dual-writes gate
+                # creations and wait_for() also polls the platform's
+                # resolution endpoint. Local store always wins.
+                platform_client=self._platform_client,
             )
         else:
             logger.warning(
@@ -972,6 +981,11 @@ class GovernanceSDK:
                 # forward() becomes a no-op on every subsequent log.
                 if hasattr(self, "audit"):
                     self.audit._platform_client = None
+                # v0.7.1: same for the gates module — without this,
+                # request() would keep spawning forward_gate_request
+                # tasks against a client whose worker never started.
+                if hasattr(self, "gates"):
+                    self.gates._platform_client = None
         # self.audit always exists — either wired to a real persistent
         # substrate (enable_audit=True) or an in-memory ring buffer
         # (enable_audit=False).  Either way the writer lifecycle must run

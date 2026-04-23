@@ -17,10 +17,16 @@ extra is missing but the caller configured a platform_ingest_url +
 token, GovernanceSDK.__init__ raises ImportError with the pip
 install instruction.
 """
-from .client import PlatformClient
+from .client import (
+    PlatformClient,
+    PlatformGateResolution,
+    jittered_gate_poll_delay,
+)
 from .config import PlatformConfig
 
 __all__ = [
     "PlatformClient",
     "PlatformConfig",
+    "PlatformGateResolution",
+    "jittered_gate_poll_delay",
 ]

@@ -73,3 +73,35 @@ class PlatformQueueFullError(PlatformBridgeError):
     logs WARN with the cumulative drop count. Never raised to the host
     — forward() swallows it.
     """
+
+
+class PlatformGatePollError(PlatformRetryableError):
+    """Raised by :meth:`PlatformClient.poll_gate_resolution` on 4xx/5xx/conn.
+
+    Retryable — the gates module catches this and applies exponential
+    backoff (2s → 4s → 8s → 10s cap) before the next poll tick. Never
+    propagates to the host application: the wait_for() loop logs at
+    DEBUG (to avoid flooding on a platform outage) and falls back to
+    the local customer-Postgres gate store, which remains authoritative
+    per invariant #1.
+
+    Distinct from :class:`PlatformAuthError` because 401 flips the
+    auth-failed latch and returns ``"pending"`` (caller unaware of the
+    latch by design — it just keeps polling local).
+    """
+
+
+class PlatformTierNotEntitledError(PlatformTerminalError):
+    """402 Payment Required — tenant tier does not include this feature.
+
+    Flipped on the first 402 from any platform bridge route; the bridge
+    disables for the process lifetime (single-flight latch), mirroring
+    the 401 auth-failed latch. The host app never breaks: local audit
+    writes, local gate creation, and local grant/deny all continue to
+    work because the customer's own Postgres is authoritative per
+    invariant #1.
+
+    The response body carries ``required_tier`` and ``upgrade_url`` so
+    the warn log surfaces both without the SDK having to hardcode the
+    platform's billing URL.
+    """

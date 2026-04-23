@@ -44,19 +44,23 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
+from uuid import UUID
 
 import structlog
 
 from .config import PlatformConfig
-from .errors import PlatformConfigError
+from .errors import PlatformConfigError, PlatformGatePollError
 
 if TYPE_CHECKING:  # pragma: no cover — import only for type checking
     from ..audit.models import AuditEventRecord
+    from ..gates.models import ApprovalRequest
 
 
 logger = structlog.get_logger(__name__)
@@ -79,6 +83,12 @@ _WARN_RATE_LIMIT_WINDOW_SECONDS = 3600
 # so a transient outage doesn't flood the log. One WARN per minute with
 # cumulative drop count attached.
 _FIVEXX_WARN_WINDOW_SECONDS = 60.0
+
+# v0.7.1 pass-2 edge case A: hard ceiling on in-flight gate-forward
+# tasks. Above this, forward_gate_request awaits on a semaphore before
+# spawning the task, back-pressuring the caller by a few ms rather than
+# unbounded coroutine creation.
+MAX_CONCURRENT_GATE_FORWARDS = 100
 
 def _resolve_sdk_version() -> str:
     """Resolve the SDK version from installed package metadata.
@@ -117,6 +127,55 @@ class _Stats:
     # chain conflicts that would otherwise drop silently at DEBUG.
     dropped_seq_conflict: int = 0
     retries: int = 0
+    # v0.7.1 gate-bridge counters. ``gate_requests_*`` track the write
+    # path (POST /api/v1/bridge/gates/:request_id), ``gate_polls_*``
+    # track the read path (GET /api/v1/bridge/gates/:request_id/resolution).
+    # Both are best-effort — the local customer-Postgres gate store is
+    # the source of truth (invariant #1), so platform failure never
+    # blocks the host app.
+    gate_requests_sent: int = 0
+    gate_requests_dropped: int = 0
+    gate_polls_sent: int = 0
+    gate_polls_failed: int = 0
+    # v0.7.1 pass-2 edge case A: forward-burst semaphore queue depth.
+    # Incremented each time ``forward_gate_request`` has to await the
+    # ``_gate_forward_sem`` before spawning its background task because
+    # the 100-in-flight cap is saturated. Not a drop — the forward still
+    # runs, just after a brief wait — but operators need to see when the
+    # bridge is back-pressured so they can provision more platform
+    # capacity before drops start.
+    gate_forwards_queued: int = 0
+    # v0.7.1 pass-2 edge case B: reverse-sync writes (POST /resolution
+    # from SDK to platform when the SDK resolves a forwarded gate
+    # locally). Parallels the gate_requests_* counters: _sent on 2xx,
+    # _dropped on 4xx/5xx/timeout after the retry budget.
+    local_resolutions_sent: int = 0
+    local_resolutions_dropped: int = 0
+
+
+# ----------------------------------------------------------------------
+# Gate-bridge wire types (v0.7.1)
+# ----------------------------------------------------------------------
+
+
+GateResolutionStatus = Literal["pending", "granted", "denied"]
+
+
+@dataclass(frozen=True)
+class PlatformGateResolution:
+    """Response from ``GET /api/v1/bridge/gates/:request_id/resolution``.
+
+    Platform deliberately omits the ``reason`` string (Leo's security
+    decision — reason stays platform-side to avoid PII leaking into the
+    agent's LLM context). Only the verdict + timestamp travel back.
+
+    ``status == "pending"`` is the "not yet decided OR unknown
+    request_id" response from the platform. The SDK treats both the
+    same way: keep polling its own local store, platform is advisory.
+    """
+
+    status: GateResolutionStatus
+    decided_at: datetime | None = None
 
 
 @dataclass
@@ -294,6 +353,14 @@ class PlatformClient:
         # once flipped, forward() silently drops and the worker exits
         # after draining its current in-flight request.
         self._auth_failed = False
+        # v0.7.1 A-8: tier-not-entitled single-flight latch. Flipped on
+        # the first 402 response from ANY platform bridge route (ingest
+        # events, bridge gates, reverse-sync, poll). Once flipped, every
+        # subsequent forward / forward_gate_request / notify_local_resolution
+        # / poll_gate_resolution short-circuits to a drop (audit) or a
+        # pending response (poll), exactly like the 401 auth-failed
+        # latch. Host app continues on local-only storage — invariant #1.
+        self._tier_not_entitled_latch = False
         # Timestamp of the last 401 WARN we emitted. Coalesced per
         # (token_fp, hour) so a rotation failure doesn't drown the log.
         self._last_auth_warn_window: int = -1
@@ -323,6 +390,43 @@ class PlatformClient:
         # use to self-heal the counter in-place.
         self._next_seq: int = 1
         self._seq_lock: asyncio.Lock = asyncio.Lock()
+        # v0.7.1 gate-bridge: derive the base URL (scheme://host[:port])
+        # from the configured ingest_url. Both the audit-ingest and the
+        # new gate bridge endpoints are served by the same platform host
+        # under ``/api/v1``; re-using the same host keeps the
+        # SSRF-guarded validation done at init applicable to gate posts
+        # too, with zero new configuration surface.
+        parsed_ingest = urlparse(config.ingest_url)
+        self._bridge_base_url = (
+            f"{parsed_ingest.scheme}://{parsed_ingest.netloc}"
+        )
+        # Track in-flight gate-request forwards so close() can cancel
+        # them cleanly. Gate requests are sparse enough (one per HITL
+        # decision, typically minutes apart) that a per-request task is
+        # cheaper than another full worker loop and queue.
+        self._gate_forward_tasks: set[asyncio.Task[None]] = set()
+        # v0.7.1 pass-2 edge case A: cap concurrent gate-forward tasks at
+        # 100. Above this, ``forward_gate_request`` awaits briefly on the
+        # semaphore before the task is dispatched so we don't spawn an
+        # unbounded number of httpx.post coroutines when the platform is
+        # hanging. The cap is a best-guess: 100 × one in-flight request
+        # × a few KB wire body is well under any sensible memory budget,
+        # and any single tenant triggering >100 concurrent HITL gates is
+        # a misconfiguration we want to see in stats as
+        # ``gate_forwards_queued > 0`` rather than paper over.
+        self._gate_forward_sem: asyncio.Semaphore = asyncio.Semaphore(
+            MAX_CONCURRENT_GATE_FORWARDS
+        )
+        # v0.7.1 pass-2 edge case B: track which request_ids have been
+        # successfully forwarded to the platform. Used by the reverse-
+        # sync path on local grant/deny: we only notify the platform for
+        # gates the platform actually knows about, so a stale CLI grant
+        # against a platform-down-at-creation-time gate doesn't generate
+        # a meaningless 404. Bounded-size LRU via a simple cap — if the
+        # process runs long enough to overflow, oldest entries age out;
+        # a missed reverse-sync is best-effort anyway.
+        self._forwarded_request_ids: set[UUID] = set()
+        self._forwarded_request_ids_cap: int = 10_000
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -393,6 +497,27 @@ class PlatformClient:
                 token_fp=self._token_fp,
             )
             self._stats.dropped_queue_full += dropped
+        # v0.7.1: drain in-flight gate-request forwards. They never
+        # share the audit queue, so they need their own flush. Cap at
+        # the same 5s deadline used for the audit queue — a stuck
+        # gate-forward task must not delay process shutdown.
+        if self._gate_forward_tasks:
+            pending = {t for t in self._gate_forward_tasks if not t.done()}
+            if pending:
+                done, still_pending = await asyncio.wait(
+                    pending, timeout=CLOSE_FLUSH_DEADLINE_SECONDS
+                )
+                for t in still_pending:
+                    t.cancel()
+                if still_pending:
+                    logger.warning(
+                        "platform.gate_forward_close_timeout",
+                        dropped=len(still_pending),
+                        deadline_seconds=CLOSE_FLUSH_DEADLINE_SECONDS,
+                        token_fp=self._token_fp,
+                    )
+                    self._stats.gate_requests_dropped += len(still_pending)
+            self._gate_forward_tasks.clear()
         if self._worker_task is not None:
             self._worker_task.cancel()
             try:
@@ -436,7 +561,12 @@ class PlatformClient:
             3. Queue full -> drop oldest + WARN + count.
             4. Normal -> put and return.
         """
-        if self._auth_failed or self._closed or not self._started:
+        if (
+            self._auth_failed
+            or self._tier_not_entitled_latch
+            or self._closed
+            or not self._started
+        ):
             # Pre-start / post-close / auth-disabled drops are counted
             # separately from "queue full" so operators can distinguish
             # "broken config" from "platform slow."
@@ -501,10 +631,11 @@ class PlatformClient:
             except asyncio.CancelledError:
                 return
             try:
-                if self._auth_failed:
+                if self._auth_failed or self._tier_not_entitled_latch:
                     # Drain silently — the bridge is disabled for the
                     # rest of the process. Still mark done so close()
-                    # can converge.
+                    # can converge. Covers both the 401 (auth) and the
+                    # 402 (tier) terminal-latch states.
                     self._stats.dropped_queue_full += 1
                     continue
                 await self._forward_one(queued)
@@ -600,6 +731,12 @@ class PlatformClient:
                 return
             if status == 401:
                 self._handle_auth_failure(response)
+                return
+            if status == 402:
+                # v0.7.1 A-8: tier-not-entitled. Latch + drop; future
+                # forwards short-circuit without I/O. Mirrors the 401
+                # handler's terminal-drop semantics.
+                self._handle_tier_not_entitled(response)
                 return
             if status == 409:
                 # Two flavors:
@@ -735,6 +872,49 @@ class PlatformClient:
                 ),
             )
 
+    def _handle_tier_not_entitled(self, response: Any) -> None:
+        """Latch tier-not-entitled, log WARN once per process.
+
+        Parses the platform's documented 402 body shape
+        ``{ok: false, error: "tier_not_entitled", required_tier, upgrade_url}``
+        and surfaces ``upgrade_url`` in the warn log so the operator
+        sees exactly where to upgrade.
+
+        After the latch, every bridge call short-circuits like the 401
+        path. Host app audit.log() + local gate create/resolve continue
+        to work — invariant #1.
+        """
+        already_latched = self._tier_not_entitled_latch
+        self._tier_not_entitled_latch = True
+        self._stats.dropped_4xx += 1
+        if already_latched:
+            return
+        required_tier: str | None = None
+        upgrade_url: str | None = None
+        try:
+            body = response.json()
+            if isinstance(body, dict):
+                rt = body.get("required_tier")
+                uu = body.get("upgrade_url")
+                if isinstance(rt, str):
+                    required_tier = rt
+                if isinstance(uu, str):
+                    upgrade_url = uu
+        except Exception:  # noqa: BLE001 — defensive parse
+            pass
+        logger.warning(
+            "platform.bridge_disabled",
+            reason="tier_not_entitled",
+            required_tier=required_tier,
+            upgrade_url=upgrade_url,
+            token_fp=self._token_fp,
+            detail=(
+                "Platform rejected bridge call (402 tier_not_entitled). "
+                "Bridge disabled for the rest of this process. Host app "
+                "continues on local-only storage."
+            ),
+        )
+
     def _record_seq_conflict_drop(
         self, *, status: int, seq: int, seq_healed: bool
     ) -> None:
@@ -785,6 +965,441 @@ class PlatformClient:
             self._pending_5xx_since_warn = 0
 
     # ------------------------------------------------------------------
+    # Gate bridge (v0.7.1) — write path + poll path
+    # ------------------------------------------------------------------
+
+    def forward_gate_request(self, request: "ApprovalRequest") -> None:
+        """Fire-and-forget POST of a gate creation to the platform bridge.
+
+        Mirrors the contract of :meth:`forward` for audit events: never
+        raises, never blocks. The host application's ``sdk.gates.request``
+        call continues whether or not this POST succeeds — the local
+        customer-Postgres gate store is the source of truth (invariant #1).
+
+        Fast-path exits (same as :meth:`forward`):
+            1. Bridge auth failed earlier -> silently drop.
+            2. Closed or not started -> silently drop.
+            3. Normal -> spawn background task, return.
+
+        The POST target is
+        ``{base}/api/v1/bridge/gates/{request_id}`` where ``{base}`` is
+        derived from the configured ``ingest_url`` at init time (same
+        scheme + host, SSRF-validated once).
+        """
+        if (
+            self._auth_failed
+            or self._tier_not_entitled_latch
+            or self._closed
+            or not self._started
+        ):
+            self._stats.gate_requests_dropped += 1
+            return
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(self._forward_gate_request_one(request))
+        # Track so close() can drain/cancel. ``discard`` on done is safe
+        # because ``add_done_callback`` runs on this same loop.
+        self._gate_forward_tasks.add(task)
+        task.add_done_callback(self._gate_forward_tasks.discard)
+
+    async def _forward_gate_request_one(
+        self, request: "ApprovalRequest"
+    ) -> None:
+        """POST one gate creation, with retries per the audit-ingest spec.
+
+        Same retry budget + backoff as :meth:`_forward_one`:
+            * 2xx -> gate_requests_sent++
+            * 401 -> auth-failed latch
+            * 4xx non-429 -> terminal drop
+            * 409 -> treat as success (duplicate — platform has seen it)
+            * 429 -> honor Retry-After
+            * 5xx / conn error -> exponential backoff retry
+
+        Per-event cumulative wall-clock is capped at
+        :data:`MAX_CUMULATIVE_RETRY_SECONDS`. Worker NEVER raises — any
+        uncaught exception is logged WARN and counted as a drop.
+        """
+        url = f"{self._bridge_base_url}/api/v1/bridge/gates/{request.request_id}"
+        headers = {
+            "Authorization": f"Bearer {self._config.ingest_token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"codeatelier-governance/{SDK_VERSION}",
+        }
+        body = _gate_request_to_wire(request)
+        start = time.monotonic()
+        attempt = 0
+        backoff = 1.0
+        try:
+            # Edge case A: bound concurrent forwards at
+            # ``MAX_CONCURRENT_GATE_FORWARDS``. The acquire is the ONLY
+            # point of back-pressure — once we hold the slot, the body
+            # runs as before. Release happens on exit of the ``async
+            # with`` block, including on cancellation.
+            # Bump the back-pressure counter when the semaphore is
+            # saturated at the moment we attempt to enter. ``locked()``
+            # returns True when value == 0 (all 100 slots held). This
+            # check runs INSIDE the task, after the event loop has had
+            # a chance to schedule the first batch, so the racy-by-one
+            # approximation is fine for an ops counter.
+            if self._gate_forward_sem.locked():
+                self._stats.gate_forwards_queued += 1
+            async with self._gate_forward_sem:
+                while True:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= MAX_CUMULATIVE_RETRY_SECONDS:
+                        self._stats.gate_requests_dropped += 1
+                        return
+                    if attempt > self._config.max_retries:
+                        self._stats.gate_requests_dropped += 1
+                        return
+                    try:
+                        assert self._client is not None
+                        response = await self._client.post(
+                            url, json=body, headers=headers
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 — conn / timeout
+                        self._stats.retries += 1
+                        if not await self._sleep_with_cap(backoff, start):
+                            self._stats.gate_requests_dropped += 1
+                            return
+                        backoff *= 2
+                        attempt += 1
+                        continue
+
+                    status = response.status_code
+                    if 200 <= status < 300:
+                        self._stats.gate_requests_sent += 1
+                        # Edge case B: remember that the platform has
+                        # this gate. Bounded set — once the process has
+                        # forwarded more than 10k gates, the oldest
+                        # entries silently age out (a missed reverse-
+                        # sync is best-effort). For a well-behaved
+                        # deployment, gate throughput is minutes apart
+                        # per workflow so this cap is effectively never
+                        # hit; for a misconfigured deployment flooding
+                        # gates, losing some reverse-syncs is
+                        # acceptable.
+                        if (
+                            len(self._forwarded_request_ids)
+                            >= self._forwarded_request_ids_cap
+                        ):
+                            # pop an arbitrary element; set iteration
+                            # order is deterministic within a run but
+                            # not stable across Python versions, which
+                            # is fine for LRU approximation.
+                            try:
+                                self._forwarded_request_ids.pop()
+                            except KeyError:  # pragma: no cover
+                                pass
+                        self._forwarded_request_ids.add(request.request_id)
+                        return
+                    if status == 401:
+                        self._handle_auth_failure(response)
+                        self._stats.gate_requests_dropped += 1
+                        return
+                    if status == 402:
+                        self._handle_tier_not_entitled(response)
+                        self._stats.gate_requests_dropped += 1
+                        return
+                    if status == 409:
+                        # Duplicate — platform already has this gate.
+                        # Count as success for the write-path contract
+                        # AND remember the gate so reverse-sync still
+                        # fires if the local grant lands later.
+                        self._stats.gate_requests_sent += 1
+                        self._forwarded_request_ids.add(request.request_id)
+                        return
+                    if 400 <= status < 500 and status != 429:
+                        self._stats.gate_requests_dropped += 1
+                        logger.warning(
+                            "platform.gate_forward_client_error",
+                            status=status,
+                            request_id=str(request.request_id),
+                            token_fp=self._token_fp,
+                            body_preview=_safe_body_preview(response),
+                        )
+                        return
+                    if status == 429:
+                        retry_after = _parse_retry_after(response)
+                        self._stats.retries += 1
+                        if not await self._sleep_with_cap(
+                            retry_after if retry_after is not None else backoff,
+                            start,
+                        ):
+                            self._stats.gate_requests_dropped += 1
+                            return
+                        if retry_after is None:
+                            backoff *= 2
+                        attempt += 1
+                        continue
+                    # 5xx: retry with backoff.
+                    self._stats.retries += 1
+                    if not await self._sleep_with_cap(backoff, start):
+                        self._stats.gate_requests_dropped += 1
+                        return
+                    backoff *= 2
+                    attempt += 1
+        except asyncio.CancelledError:
+            # Happens when close() cancels a task that didn't finish in
+            # the 5s drain window. Count as dropped so operators can see
+            # it; re-raise so asyncio can mark the task cancelled.
+            self._stats.gate_requests_dropped += 1
+            raise
+        except Exception as exc:  # noqa: BLE001 — task MUST NOT die loudly
+            self._stats.gate_requests_dropped += 1
+            logger.warning(
+                "platform.gate_forward_unexpected_error",
+                error_type=type(exc).__name__,
+                request_id=str(request.request_id),
+                token_fp=self._token_fp,
+            )
+
+    async def poll_gate_resolution(
+        self, request_id: UUID
+    ) -> PlatformGateResolution:
+        """GET the platform's current verdict for ``request_id``.
+
+        Returns a :class:`PlatformGateResolution`. Called by
+        :meth:`GatesModule.wait_for` once per poll tick. Semantics:
+
+        * HTTP 200 with ``{"status": "pending" | "granted" | "denied",
+          "decided_at": <ISO8601> | null}`` → return the parsed resolution.
+          The platform deliberately does NOT return the reason string
+          (Leo's security decision, v0.7.1 spec §3): reason stays
+          platform-side so it never leaks into the agent's LLM context.
+        * HTTP 404 → ``status="pending"`` (platform hasn't seen this
+          request yet — common right after a gate creation if the
+          write-path POST is still in flight).
+        * HTTP 401 → auth-failed latch; return ``"pending"`` so the
+          caller keeps polling its local store (which is authoritative).
+        * HTTP 4xx/5xx/connection error → raise. Caller applies its own
+          exponential backoff (2s → 4s → 8s → 10s cap).
+
+        Closed/not-started/auth-failed short-circuit: return
+        ``"pending"`` without I/O. Allows the caller to unconditionally
+        merge platform state with local state in a single loop.
+        """
+        if (
+            self._auth_failed
+            or self._tier_not_entitled_latch
+            or self._closed
+            or not self._started
+        ):
+            return PlatformGateResolution(status="pending")
+        url = (
+            f"{self._bridge_base_url}/api/v1/bridge/gates/{request_id}"
+            f"/resolution"
+        )
+        headers = {
+            "Authorization": f"Bearer {self._config.ingest_token}",
+            "User-Agent": f"codeatelier-governance/{SDK_VERSION}",
+        }
+        assert self._client is not None  # invariant: started => client set
+        try:
+            response = await self._client.get(url, headers=headers)
+        except Exception:
+            self._stats.gate_polls_failed += 1
+            raise
+        status = response.status_code
+        if status == 200:
+            self._stats.gate_polls_sent += 1
+            return _parse_gate_resolution(response)
+        if status == 404:
+            # Platform doesn't know about this gate yet. Caller keeps
+            # polling its local store. This is a normal race, not an
+            # error — DO NOT bump gate_polls_failed.
+            self._stats.gate_polls_sent += 1
+            return PlatformGateResolution(status="pending")
+        if status == 401:
+            self._handle_auth_failure(response)
+            return PlatformGateResolution(status="pending")
+        if status == 402:
+            # v0.7.1 A-8: tier-not-entitled. Same semantics as 401 —
+            # latch, return pending so the local-poll loop keeps going.
+            # The local gate store is authoritative per invariant #1.
+            self._handle_tier_not_entitled(response)
+            return PlatformGateResolution(status="pending")
+        # Any other status is a caller-visible error so it can apply
+        # exponential backoff. No WARN coalesce here — the caller (the
+        # gates module) decides its own log level.
+        self._stats.gate_polls_failed += 1
+        raise PlatformGatePollError(
+            f"poll_gate_resolution: platform returned HTTP {status}"
+        )
+
+    # ------------------------------------------------------------------
+    # v0.7.1 pass-2 edge case B: reverse-sync (local resolve -> platform)
+    # ------------------------------------------------------------------
+
+    def notify_local_resolution(
+        self,
+        request_id: UUID,
+        decision: str,
+        decided_at: datetime,
+    ) -> None:
+        """Fire-and-forget POST to the platform saying "SDK resolved this gate".
+
+        Called by :meth:`GatesModule._resolve` after the local grant /
+        deny commits. Without this, the platform's approvals inbox
+        leaves a stale pending card for a gate an SDK already resolved
+        via the CLI fallback (``governance grant <token>`` / the
+        library's ``sdk.gates.grant()``).
+
+        Only fires when:
+            * the platform bridge is healthy (not auth-latched, not closed)
+            * the gate's request_id is in ``_forwarded_request_ids``,
+              i.e. the platform has at some point acknowledged this
+              gate. Prevents a stale CLI grant against a gate created
+              while the bridge was down from generating a 404 on the
+              platform.
+
+        Never raises, never blocks the caller. Mirrors the fire-and-
+        forget contract of :meth:`forward_gate_request`.
+        """
+        if (
+            self._auth_failed
+            or self._tier_not_entitled_latch
+            or self._closed
+            or not self._started
+        ):
+            self._stats.local_resolutions_dropped += 1
+            return
+        if request_id not in self._forwarded_request_ids:
+            # Gate was never seen by the platform — no UI card to
+            # resolve. Silent no-op; NOT a drop.
+            return
+        loop = asyncio.get_event_loop()
+        task = loop.create_task(
+            self._notify_local_resolution_one(request_id, decision, decided_at)
+        )
+        # Reuse the gate-forward task set so close() drains these too.
+        self._gate_forward_tasks.add(task)
+        task.add_done_callback(self._gate_forward_tasks.discard)
+
+    async def _notify_local_resolution_one(
+        self,
+        request_id: UUID,
+        decision: str,
+        decided_at: datetime,
+    ) -> None:
+        """POST one reverse-sync, with the same retry budget as forward.
+
+        Body shape (matches the platform-side POST handler added in
+        v0.7.1 pass 2):
+            {"decision": "granted"|"denied",
+             "decided_at": "<ISO-8601 UTC>",
+             "by": "sdk_local"}
+
+        Idempotent platform-side: a second POST against an already-
+        resolved gate returns 200 no-op (platform checks gate_decisions
+        unique index).
+        """
+        url = (
+            f"{self._bridge_base_url}/api/v1/bridge/gates/{request_id}"
+            f"/resolution"
+        )
+        headers = {
+            "Authorization": f"Bearer {self._config.ingest_token}",
+            "Content-Type": "application/json",
+            "User-Agent": f"codeatelier-governance/{SDK_VERSION}",
+        }
+        body: dict[str, Any] = {
+            "decision": decision,
+            "decided_at": _utc_isoformat_z(decided_at),
+            "by": "sdk_local",
+        }
+        start = time.monotonic()
+        attempt = 0
+        backoff = 1.0
+        try:
+            async with self._gate_forward_sem:
+                while True:
+                    elapsed = time.monotonic() - start
+                    if elapsed >= MAX_CUMULATIVE_RETRY_SECONDS:
+                        self._stats.local_resolutions_dropped += 1
+                        return
+                    if attempt > self._config.max_retries:
+                        self._stats.local_resolutions_dropped += 1
+                        return
+                    try:
+                        assert self._client is not None
+                        response = await self._client.post(
+                            url, json=body, headers=headers
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        self._stats.retries += 1
+                        if not await self._sleep_with_cap(backoff, start):
+                            self._stats.local_resolutions_dropped += 1
+                            return
+                        backoff *= 2
+                        attempt += 1
+                        continue
+
+                    status = response.status_code
+                    if 200 <= status < 300:
+                        self._stats.local_resolutions_sent += 1
+                        return
+                    if status == 401:
+                        self._handle_auth_failure(response)
+                        self._stats.local_resolutions_dropped += 1
+                        return
+                    if status == 402:
+                        self._handle_tier_not_entitled(response)
+                        self._stats.local_resolutions_dropped += 1
+                        return
+                    if status == 409:
+                        # Gate already has a decision on the platform —
+                        # e.g. a race where platform UI decided first.
+                        # Idempotent no-op; count as success so stats
+                        # reflect reality.
+                        self._stats.local_resolutions_sent += 1
+                        return
+                    if 400 <= status < 500 and status != 429:
+                        self._stats.local_resolutions_dropped += 1
+                        logger.warning(
+                            "platform.local_resolution_client_error",
+                            status=status,
+                            request_id=str(request_id),
+                            token_fp=self._token_fp,
+                            body_preview=_safe_body_preview(response),
+                        )
+                        return
+                    if status == 429:
+                        retry_after = _parse_retry_after(response)
+                        self._stats.retries += 1
+                        if not await self._sleep_with_cap(
+                            retry_after if retry_after is not None else backoff,
+                            start,
+                        ):
+                            self._stats.local_resolutions_dropped += 1
+                            return
+                        if retry_after is None:
+                            backoff *= 2
+                        attempt += 1
+                        continue
+                    # 5xx: retry.
+                    self._stats.retries += 1
+                    if not await self._sleep_with_cap(backoff, start):
+                        self._stats.local_resolutions_dropped += 1
+                        return
+                    backoff *= 2
+                    attempt += 1
+        except asyncio.CancelledError:
+            self._stats.local_resolutions_dropped += 1
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._stats.local_resolutions_dropped += 1
+            logger.warning(
+                "platform.local_resolution_unexpected_error",
+                error_type=type(exc).__name__,
+                request_id=str(request_id),
+                token_fp=self._token_fp,
+            )
+
+    # ------------------------------------------------------------------
     # Ops surface
     # ------------------------------------------------------------------
 
@@ -802,8 +1417,26 @@ class PlatformClient:
             "dropped_4xx": self._stats.dropped_4xx,
             "dropped_5xx": self._stats.dropped_5xx,
             "dropped_seq_conflict": self._stats.dropped_seq_conflict,
-            "disabled": self._auth_failed,
+            "disabled": self._auth_failed or self._tier_not_entitled_latch,
+            "disabled_reason": (
+                "auth_failed"
+                if self._auth_failed
+                else ("tier_not_entitled" if self._tier_not_entitled_latch else None)
+            ),
             "retries": self._stats.retries,
+            # v0.7.1 gate-bridge counters (additive; pre-0.7.1 callers
+            # that key off the four original ``dropped_*`` entries are
+            # unaffected).
+            "gate_requests_sent": self._stats.gate_requests_sent,
+            "gate_requests_dropped": self._stats.gate_requests_dropped,
+            "gate_polls_sent": self._stats.gate_polls_sent,
+            "gate_polls_failed": self._stats.gate_polls_failed,
+            # v0.7.1 pass-2 additions (edge cases A + B).
+            "gate_forwards_queued": self._stats.gate_forwards_queued,
+            "local_resolutions_sent": self._stats.local_resolutions_sent,
+            "local_resolutions_dropped": (
+                self._stats.local_resolutions_dropped
+            ),
         }
 
 
@@ -976,3 +1609,112 @@ def _safe_body_preview(response: Any, max_chars: int = 256) -> str:
     if len(text) > max_chars:
         return text[:max_chars] + "..."
     return text
+
+
+# ----------------------------------------------------------------------
+# v0.7.1 gate-bridge wire helpers
+# ----------------------------------------------------------------------
+
+
+def _gate_request_to_wire(request: "ApprovalRequest") -> dict[str, Any]:
+    """Project an :class:`ApprovalRequest` onto the gate-bridge wire format.
+
+    Body of ``POST /api/v1/bridge/gates/{request_id}``.
+
+    Deliberate omissions (spec §3):
+        * ``token`` is NEVER sent to the platform. The single-use HMAC
+          token is minted for the CLI fallback path; the platform's
+          approve/deny UI uses session auth, not the token. Sending it
+          would leak a single-use credential for no reason.
+        * ``payload`` is NOT sent. The agent-side payload can contain
+          PII / prompt text that must not leave the customer's own
+          Postgres. We send ``action_hash`` instead — enough for the UI
+          to show "agent X is asking to run action with hash abc123…"
+          side-by-side with whatever redacted preview the customer
+          optionally supplies out-of-band.
+
+    Fields sent (minimum viable for the platform approvals inbox):
+        request_id, agent_id, kind, action_hash, expires_at,
+        sdk_version.
+    """
+    return {
+        "request_id": str(request.request_id),
+        "agent_id": request.agent_id,
+        "kind": request.kind,
+        "action_hash": request.action_hash,
+        # Platform Zod validator uses ``z.string().datetime()`` which
+        # requires the ``Z`` suffix form, NOT the ``+00:00`` form that
+        # Python's ``datetime.isoformat()`` emits by default for UTC.
+        # Normalize here — the wire must always look like
+        # ``2026-04-19T12:34:56.789012Z``.
+        "expires_at": _utc_isoformat_z(request.expires_at),
+        "sdk_version": SDK_VERSION,
+    }
+
+
+def _utc_isoformat_z(dt: datetime) -> str:
+    """Emit ``<iso>Z`` — Zod datetime()-compatible. UTC assumed.
+
+    If ``dt`` is naive, assumes UTC. If tz-aware and NOT UTC, converts.
+    """
+    if dt.tzinfo is None:
+        aware = dt.replace(tzinfo=timezone.utc)
+    else:
+        aware = dt.astimezone(timezone.utc)
+    # isoformat() on a UTC-aware datetime emits ``+00:00``; swap to ``Z``.
+    s = aware.isoformat()
+    return s[:-6] + "Z" if s.endswith("+00:00") else s
+
+
+def _parse_gate_resolution(response: Any) -> "PlatformGateResolution":
+    """Parse a 200 response from ``GET .../resolution``.
+
+    Platform shape:
+        {"status": "pending" | "granted" | "denied",
+         "decided_at": "<ISO-8601 UTC>" | null}
+
+    Defensive parsing:
+        * unknown ``status`` -> ``"pending"`` (safe default; SDK keeps
+          polling local).
+        * unparseable ``decided_at`` -> ``None`` (non-critical).
+        * malformed body (non-dict, non-JSON) -> ``"pending"``.
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 — defensive
+        return PlatformGateResolution(status="pending")
+    if not isinstance(body, dict):
+        return PlatformGateResolution(status="pending")
+    raw_status = body.get("status")
+    status: GateResolutionStatus
+    if raw_status in ("pending", "granted", "denied"):
+        status = raw_status
+    else:
+        status = "pending"
+    decided_at_raw = body.get("decided_at")
+    decided_at: datetime | None = None
+    if isinstance(decided_at_raw, str):
+        try:
+            decided_at = datetime.fromisoformat(decided_at_raw)
+        except ValueError:
+            decided_at = None
+    return PlatformGateResolution(status=status, decided_at=decided_at)
+
+
+def jittered_gate_poll_delay(
+    base: float,
+    *,
+    jitter_ms: float = 500.0,
+    cap: float = 10.0,
+) -> float:
+    """Return ``base`` with ±``jitter_ms`` uniform jitter, clamped to [0, cap].
+
+    Exposed at module scope so the gates module uses the same jitter
+    policy the platform team documented in the spec (2s base ± 500ms,
+    10s cap on exponential backoff). Split into a module function so
+    tests can monkey-patch ``random.uniform`` against a known-good
+    target without reaching into a method.
+    """
+    jitter_seconds = jitter_ms / 1000.0
+    delta = random.uniform(-jitter_seconds, jitter_seconds)
+    return max(0.0, min(cap, base + delta))

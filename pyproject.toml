@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "code-atelier-governance"
-version = "0.7.0"
+version = "0.7.2"
 description = "Enforcement gates for AI agents — five lines, in-process, just Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -100,6 +100,9 @@ migrations = [
 
 [project.scripts]
 governance = "codeatelier_governance.cli:main"
+# v0.7.2: alternate entry point for distribution-first messaging. Same
+# argparse dispatcher as ``governance`` — both names are stable.
+codeatelier-governance = "codeatelier_governance.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -134,6 +137,10 @@ include-package-data = true
 # ``governance init agent-<kind>`` can read them via importlib.resources
 # regardless of install mode (wheel vs editable).
 "codeatelier_governance.cli.recipes" = ["*.py.tmpl"]
+# v0.7.2 multi-file recipe scaffolder (``codeatelier-governance recipe
+# agt <path>``). Templates cover every scaffold file type, so the glob
+# is broad (``*.tmpl``) rather than ``.py.tmpl``-only.
+"codeatelier_governance.recipes.agt" = ["*.tmpl"]
 
 [tool.ruff]
 line-length = 100

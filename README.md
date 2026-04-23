@@ -71,6 +71,24 @@ governance migrate --database-url postgresql://user:pass@host/db
 governance console add-user --username admin --role admin
 ```
 
+## Scaffold a ready-to-run agent (v0.7.2+)
+
+Prefer starting from a working project? The SDK ships a scaffolder that
+writes a full Microsoft AGT agent wired through `scope.check`,
+`cost.preflight`, and `gates.request` — all four enforcement gates on
+from the first line:
+
+```bash
+pip install code-atelier-governance
+codeatelier-governance recipe agt ./my-agent
+cd my-agent && python agent.py
+```
+
+The generated project has a refund tool where anything over $1,000
+blocks on a human decision — a concrete demo of HITL gates on real
+Postgres. Other recipes (`langgraph`, `crewai`) are on the v0.8
+roadmap.
+
 ## Eight enforcement modules
 
 | Module | What it does |

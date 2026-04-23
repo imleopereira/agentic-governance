@@ -588,9 +588,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Confirm the rotation (required — prevents accidental rotations)",
     )
 
-    # init (recipe scaffolding — F3 v0.7)
+    # init (single-file recipe scaffolding — F3 v0.7)
     from .init import register_subparser as _register_init
     _register_init(subparsers)
+
+    # recipe (multi-file project scaffolding — v0.7.2)
+    from ..recipes import RECIPE_NAMES as _RECIPE_NAMES
+    recipe_parser = subparsers.add_parser(
+        "recipe",
+        help="Scaffold a ready-to-run agent project (e.g. Microsoft AGT).",
+    )
+    recipe_parser.add_argument(
+        "template",
+        choices=list(_RECIPE_NAMES),
+        help="Which recipe to scaffold.",
+    )
+    recipe_parser.add_argument(
+        "path",
+        help="Target directory for the scaffolded project.",
+    )
+    recipe_parser.add_argument(
+        "--force", action="store_true", default=False,
+        help="Overwrite the target directory if it already exists.",
+    )
 
     # console (user management subcommands)
     console_parser = subparsers.add_parser(
@@ -936,6 +956,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.command == "init":
         from .init import run_init
         sys.exit(run_init(args.recipe, force=bool(getattr(args, "force", False))))
+
+    elif args.command == "recipe":
+        from .recipe import run_recipe_command
+        sys.exit(
+            run_recipe_command(
+                args.template,
+                args.path,
+                force=bool(getattr(args, "force", False)),
+            )
+        )
 
     elif args.command == "console":
         console_cmd = getattr(args, "console_command", None)

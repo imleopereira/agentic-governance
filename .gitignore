@@ -64,3 +64,7 @@ governance-internal/
 # Playwright test output
 console/test-results/
 console/playwright-report/
+
+# Mem Palace local tool config — file-routing rules for a local memory-
+# organisation tool, not a shipped artifact. Never commit.
+mempalace.yaml

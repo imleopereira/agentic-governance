@@ -11,7 +11,7 @@ from importlib.metadata import version
 import codeatelier_governance
 
 
-EXPECTED_VERSION = "0.7.0"
+EXPECTED_VERSION = "0.7.1"
 
 
 def test_pyproject_version_matches_expected() -> None:
