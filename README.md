@@ -1,4 +1,4 @@
-# Code Atelier Governance SDK
+# Agentic Governance SDK
 
 **Enforcement gates for every action routed through the SDK — in-process, just Postgres.**
 
