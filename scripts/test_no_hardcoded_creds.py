@@ -121,7 +121,6 @@ ALLOW_SUFFIXES: tuple[str, ...] = (
     # root:rootpw, xkcd-meme placeholders) are not real credentials.
     "tests/audit/test_otel_exporter_redaction.py",
     "tests/audit/test_metadata_sanitization.py",
-    "tests/console/test_response_models_typed.py",
 )
 
 

@@ -29,7 +29,6 @@ _DDL_FILES = [
     _PKG_ROOT / "audit" / "ddl.sql",
     _PKG_ROOT / "cost" / "ddl.sql",
     _PKG_ROOT / "gates" / "ddl.sql",
-    _PKG_ROOT / "console" / "ddl.sql",
     _PKG_ROOT / "loop" / "ddl.sql",
     _PKG_ROOT / "presence" / "ddl.sql",
 ]
@@ -612,71 +611,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Overwrite the target directory if it already exists.",
     )
 
-    # console (user management subcommands)
-    console_parser = subparsers.add_parser(
-        "console", help="Console user management commands"
-    )
-    console_sub = console_parser.add_subparsers(
-        dest="console_command", help="Console subcommands"
-    )
-
-    # console add-user
-    add_user_parser = console_sub.add_parser(
-        "add-user", help="Create a console user"
-    )
-    add_user_parser.add_argument(
-        "--database-url", type=str, default=None,
-        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
-    )
-    add_user_parser.add_argument(
-        "--username", type=str, required=True, help="Username"
-    )
-    add_user_parser.add_argument(
-        "--role", type=str, default="viewer", choices=["viewer", "admin"],
-        help="User role (default: viewer)",
-    )
-    add_user_parser.add_argument(
-        "--password", type=str, default=None,
-        help="Password (prompted interactively if not provided)",
-    )
-
-    # console list-users
-    list_users_parser = console_sub.add_parser(
-        "list-users", help="List all console users"
-    )
-    list_users_parser.add_argument(
-        "--database-url", type=str, default=None,
-        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
-    )
-
-    # console disable-user
-    disable_user_parser = console_sub.add_parser(
-        "disable-user", help="Disable a console user"
-    )
-    disable_user_parser.add_argument(
-        "--database-url", type=str, default=None,
-        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
-    )
-    disable_user_parser.add_argument(
-        "--username", type=str, required=True, help="Username to disable"
-    )
-
-    # console reset-password
-    reset_pw_parser = console_sub.add_parser(
-        "reset-password", help="Reset a user's password"
-    )
-    reset_pw_parser.add_argument(
-        "--database-url", type=str, default=None,
-        help="PostgreSQL connection string (or set GOVERNANCE_DATABASE_URL)",
-    )
-    reset_pw_parser.add_argument(
-        "--username", type=str, required=True, help="Username"
-    )
-    reset_pw_parser.add_argument(
-        "--password", type=str, default=None,
-        help="New password (prompted interactively if not provided)",
-    )
-
     return parser
 
 
@@ -744,145 +678,6 @@ async def _run_report(
         sys.stdout.write(f"Report written to {output_path}\n")
     else:
         sys.stdout.write(report_json + "\n")
-
-
-async def _run_console_add_user(
-    database_url: str, username: str, role: str, password: str
-) -> None:
-    """Create a console user in Postgres."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    from codeatelier_governance.console.auth import hash_password
-
-    engine = create_async_engine(_normalize_url_sync(database_url))
-    try:
-        uid = str(__import__("uuid").uuid4())
-        pw_hash = hash_password(password)
-        async with engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "INSERT INTO governance_console_users "
-                    "(user_id, username, password_hash, role, created_at, updated_at) "
-                    "VALUES (:uid, :username, :pw_hash, :role, NOW(), NOW())"
-                ),
-                {
-                    "uid": uid,
-                    "username": username.lower(),
-                    "pw_hash": pw_hash,
-                    "role": role,
-                },
-            )
-        sys.stdout.write(f"Created user '{username}' with role '{role}'.\n")
-    except Exception as exc:
-        from sqlalchemy.exc import IntegrityError
-        if isinstance(exc, IntegrityError):
-            sys.stderr.write(f"Error: username '{username}' already exists.\n")
-            sys.exit(1)
-        logger.error(
-            "cli.add_user_failed",
-            error_type=type(exc).__name__,
-        )
-        sys.stderr.write(f"Error: failed to create user ({type(exc).__name__}). Check database connectivity.\n")
-        sys.exit(1)
-    finally:
-        await engine.dispose()
-
-
-async def _run_console_list_users(database_url: str) -> None:
-    """List all console users."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    engine = create_async_engine(_normalize_url_sync(database_url))
-    try:
-        async with engine.connect() as conn:
-            res = await conn.execute(
-                text(
-                    "SELECT username, role, disabled, created_at "
-                    "FROM governance_console_users ORDER BY created_at"
-                )
-            )
-            rows = list(res.mappings())
-        if not rows:
-            sys.stdout.write("No users found.\n")
-            return
-        for row in rows:
-            status = "disabled" if row["disabled"] else "active"
-            sys.stdout.write(
-                f"  {row['username']:20s}  {row['role']:8s}  {status:10s}  "
-                f"{row['created_at'].isoformat()}\n"
-            )
-    finally:
-        await engine.dispose()
-
-
-async def _run_console_disable_user(database_url: str, username: str) -> None:
-    """Disable a console user."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    engine = create_async_engine(_normalize_url_sync(database_url))
-    try:
-        async with engine.begin() as conn:
-            res = await conn.execute(
-                text(
-                    "UPDATE governance_console_users "
-                    "SET disabled = TRUE, updated_at = NOW() "
-                    "WHERE username = :username"
-                ),
-                {"username": username.lower()},
-            )
-            if res.rowcount == 0:
-                sys.stderr.write(f"Error: user '{username}' not found.\n")
-                sys.exit(1)
-        sys.stdout.write(f"Disabled user '{username}'.\n")
-    finally:
-        await engine.dispose()
-
-
-async def _run_console_reset_password(
-    database_url: str, username: str, password: str
-) -> None:
-    """Reset a user's password."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-
-    from codeatelier_governance.console.auth import hash_password
-
-    engine = create_async_engine(_normalize_url_sync(database_url))
-    try:
-        pw_hash = hash_password(password)
-        async with engine.begin() as conn:
-            res = await conn.execute(
-                text(
-                    "UPDATE governance_console_users "
-                    "SET password_hash = :pw_hash, updated_at = NOW() "
-                    "WHERE username = :username"
-                ),
-                {"pw_hash": pw_hash, "username": username.lower()},
-            )
-            if res.rowcount == 0:
-                sys.stderr.write(f"Error: user '{username}' not found.\n")
-                sys.exit(1)
-        sys.stdout.write(f"Password reset for '{username}'.\n")
-    finally:
-        await engine.dispose()
-
-
-def _get_password_from_args_or_prompt(args: argparse.Namespace) -> str:
-    """Get password from --password arg or prompt interactively."""
-    pw: str | None = getattr(args, "password", None)
-    if pw:
-        return pw
-    import getpass
-    pw = getpass.getpass("Password: ")
-    if not pw:
-        sys.stderr.write("Error: password cannot be empty.\n")
-        sys.exit(1)
-    if len(pw) < 8:
-        sys.stderr.write("Warning: password is shorter than 8 characters.\n")
-    return pw
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -966,30 +761,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                 force=bool(getattr(args, "force", False)),
             )
         )
-
-    elif args.command == "console":
-        console_cmd = getattr(args, "console_command", None)
-        if console_cmd is None:
-            parser.parse_args(["console", "--help"])
-            sys.exit(0)
-        database_url = _resolve_database_url(args)
-        if console_cmd == "add-user":
-            password = _get_password_from_args_or_prompt(args)
-            asyncio.run(
-                _run_console_add_user(database_url, args.username, args.role, password)
-            )
-        elif console_cmd == "list-users":
-            asyncio.run(_run_console_list_users(database_url))
-        elif console_cmd == "disable-user":
-            asyncio.run(_run_console_disable_user(database_url, args.username))
-        elif console_cmd == "reset-password":
-            password = _get_password_from_args_or_prompt(args)
-            asyncio.run(
-                _run_console_reset_password(database_url, args.username, password)
-            )
-        else:
-            parser.parse_args(["console", "--help"])
-            sys.exit(1)
 
     else:
         parser.print_help()

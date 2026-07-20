@@ -31,7 +31,7 @@ jobs:
       - name: install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,otel,console]"
+          python -m pip install -e ".[dev,otel]"
       - name: ruff
         run: python -m ruff check src/ tests/
       - name: mypy
@@ -69,7 +69,7 @@ jobs:
           # [migrations] extra brings in psycopg (v3) — required by the
           # seeded-DB integration test which spins a Docker Postgres and
           # imports psycopg directly to wait for readiness.
-          python -m pip install -e ".[dev,otel,console,migrations]"
+          python -m pip install -e ".[dev,otel,migrations]"
       - name: apply DDL
         run: |
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
@@ -79,8 +79,6 @@ jobs:
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
             -f src/codeatelier_governance/gates/ddl.sql
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
-            -f src/codeatelier_governance/console/ddl.sql
-          PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
             -f src/codeatelier_governance/loop/ddl.sql
           PGPASSWORD=governance psql -h localhost -p 5435 -U governance -d governance_qa \
             -f src/codeatelier_governance/presence/ddl.sql
@@ -88,135 +86,6 @@ jobs:
             -f src/codeatelier_governance/scope/ddl.sql
       - name: integration tests
         run: python -m pytest tests/ -q -m integration
-
-  console-typecheck:
-    name: console tsc --noEmit
-    runs-on: ubuntu-latest
-    # Path filter: only run when console/** changes on PRs. Push events
-    # (branches: production) always run as a safety net so main never
-    # drifts. F8 item 8 of the v0.6 PRD — gate added in standalone PR
-    # before any other v0.6 feature branch opens to avoid cascading CI
-    # breakage on pre-existing TS errors.
-    steps:
-      - uses: actions/checkout@v4
-      - name: detect console changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            console:
-              - 'console/**'
-              - '.github/workflows/test.yml'
-      - uses: actions/setup-node@v4
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: console/package-lock.json
-      - name: install console deps
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        working-directory: console
-        run: npm ci
-      - name: tsc --noEmit
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        working-directory: console
-        run: npm run typecheck
-
-  console-e2e-smoke:
-    name: console E2E smoke (Playwright)
-    runs-on: ubuntu-latest
-    # v0.6.2 (Wave 1.5 from v0.6.1) — hero smoke for the v4-default flip.
-    # Covers: `/` -> v4, Compliance nav -> export button, ?ui=v3 escape hatch.
-    #
-    # continue-on-error: true is deliberate for this first version.
-    # Rationale: (1) Playwright on a fresh CI runner has known flake
-    # surfaces (browser download, Next dev-server cold start,
-    # network-timing races on redirects); (2) v0.6.2 is a polish
-    # release, and a single flaky E2E must not block a
-    # security/docs/copy fix PR; (3) we want the SIGNAL (red check on
-    # the PR) without the hard gate. Promote to a blocking check in
-    # v0.7 once we have flake stats from 10+ green runs.
-    #
-    # Path filter mirrors console-typecheck so non-console PRs don't
-    # pay the Playwright install cost.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: detect console changes
-        id: changes
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            console:
-              - 'console/**'
-              - '.github/workflows/test.yml'
-      - uses: actions/setup-node@v4
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        with:
-          node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: console/package-lock.json
-      - name: install console deps
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        working-directory: console
-        run: npm ci
-      - name: install Playwright browser (chromium only)
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        working-directory: console
-        run: npx playwright install --with-deps chromium
-      - name: playwright test
-        if: github.event_name == 'push' || steps.changes.outputs.console == 'true'
-        working-directory: console
-        run: npm run e2e
-
-  console-llm-theater-tripwire:
-    name: console LLM-theater tripwire (source-grep tests)
-    runs-on: ubuntu-latest
-    # v0.6 PRD F7 set a tripwire at 5 instances of the "source-grep
-    # test" pattern — a test that `readFileSync`-s a component file
-    # and regex-matches it for structural tokens, instead of rendering
-    # the component and asserting on runtime behaviour. The team shipped
-    # 8 such files in v0.6 (process breach disclosed in CHANGELOG).
-    #
-    # v0.6.1 polish sprint closes that breach: all 8 files were
-    # rewritten to render + assert, and this job makes a regression
-    # impossible. The count of `readFileSync` occurrences in console
-    # *.test.ts / *.test.tsx files MUST remain at 0 on every push. One
-    # new source-grep test in a PR is enough to fail this job.
-    steps:
-      - uses: actions/checkout@v4
-      - name: count source-grep tests
-        run: |
-          # DA v0.6.1: broaden the tripwire from ``readFileSync`` only to
-          # ANY fs-read helper that a test might use to pull a component
-          # file off disk. Covers:
-          #   * readFileSync (sync fs)
-          #   * readFile     (both node:fs/promises and callback-form)
-          #   * import("fs") / require("fs")
-          # Security v0.6.1: widened quote handling and subpath variants.
-          # Single-quoted imports (`from 'fs'`) and `fs/promises` subpaths
-          # previously bypassed the tripwire. The new regex treats the
-          # quote as any of "'` and matches `fs`, `fs/…`, `node:fs`, or
-          # `node:fs/…` so every realistic fs-read path trips the gate.
-          # A matching line in ANY *.test.ts / *.test.tsx file under
-          # console/src fails the job. `grep -l` exits 1 when nothing
-          # matches; `|| true` keeps the pipeline's exit status pinned to
-          # the `wc -l` step.
-          # Pattern built piece-by-piece to avoid single-quote escaping
-          # hell. `q` is the character class of quote styles JS/TS allows
-          # (double, single, backtick). Subpath variants (`fs/promises`,
-          # `node:fs/promises`) and the dynamic `import("fs")` form are
-          # all covered.
-          q='["'"'"'`]'
-          pattern="readFileSync|readFile\(|from[[:space:]]+${q}(node:)?fs(/[a-z]+)?${q}|require\([[:space:]]*${q}(node:)?fs(/[a-z]+)?${q}[[:space:]]*\)|import\([[:space:]]*${q}(node:)?fs(/[a-z]+)?${q}[[:space:]]*\)"
-          count=$(grep -rlE "$pattern" console/src --include="*.test.ts" --include="*.test.tsx" 2>/dev/null | wc -l || true)
-          count=${count// /}
-          echo "source-grep test-file count: $count"
-          if [ "$count" -gt 0 ]; then
-            echo "LLM-theater tripwire: $count source-grep tests found"
-            grep -rnE "$pattern" console/src --include="*.test.ts" --include="*.test.tsx" || true
-            exit 1
-          fi
 
   package:
     name: clean-venv install smoke test
@@ -254,39 +123,8 @@ jobs:
           assert (res.files('codeatelier_governance.cost') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.gates') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.scope') / 'ddl.sql').is_file()
-          assert (res.files('codeatelier_governance.console') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.loop') / 'ddl.sql').is_file()
           assert (res.files('codeatelier_governance.presence') / 'ddl.sql').is_file()
           from codeatelier_governance.integrations.anthropic_wrap import wrap_anthropic
           print('clean install OK:', codeatelier_governance.__version__)
           "
-
-  console-version-parity:
-    name: console version parity (app.py vs package.json)
-    runs-on: ubuntu-latest
-    # F7 sub-item #7: the FastAPI ``app = FastAPI(version=...)`` and
-    # the Next.js console ``package.json`` must agree. A drift here
-    # means the served API metadata and the built-client bundle
-    # report different versions, which breaks the observability
-    # story on the dashboard. This job greps both files and fails
-    # if they don't match.
-    steps:
-      - uses: actions/checkout@v4
-      - name: assert versions match
-        run: |
-          APP_VERSION=$(grep -oE 'version="[0-9]+\.[0-9]+\.[0-9]+"' \
-            src/codeatelier_governance/console/app.py \
-            | head -1 | sed -E 's/version="([^"]+)"/\1/')
-          PKG_VERSION=$(python -c "import json; \
-            print(json.load(open('console/package.json'))['version'])")
-          echo "app.py   version: $APP_VERSION"
-          echo "package  version: $PKG_VERSION"
-          if [ -z "$APP_VERSION" ] || [ -z "$PKG_VERSION" ]; then
-            echo "ERROR: could not extract one or both versions"
-            exit 1
-          fi
-          if [ "$APP_VERSION" != "$PKG_VERSION" ]; then
-            echo "ERROR: console version drift detected"
-            exit 1
-          fi
-          echo "OK: console versions match ($APP_VERSION)"

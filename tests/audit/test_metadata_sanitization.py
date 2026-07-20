@@ -1,14 +1,10 @@
-"""BLOCKER C5: metadata sanitization at the audit layer.
+"""Metadata sanitization at the audit layer.
 
-The HTTP-layer ``HaltRequest._sanitize_reason`` validator only fires on
-the ``reason`` field at the API boundary. Any caller that reaches into
-``AuditModule.log`` programmatically previously bypassed it entirely —
-an insider with SDK creds could forge an ANSI escape sequence into the
-audit chain and paint an operator's terminal at log-export time.
-
-These tests pin that the shared sanitizer in
-``codeatelier_governance.audit.sanitization`` is applied recursively to
-every string leaf in ``AuditEvent.metadata``.
+Any caller that reaches into ``AuditModule.log`` programmatically could
+forge an ANSI escape sequence into the audit chain and paint an
+operator's terminal at log-export time. These tests pin that the shared
+sanitizer in ``codeatelier_governance.audit.sanitization`` is applied
+recursively to every string leaf in ``AuditEvent.metadata``.
 """
 from __future__ import annotations
 
@@ -20,7 +16,6 @@ from codeatelier_governance.audit.sanitization import (
     HALT_REASON_MAX_LEN,
     sanitize_string,
 )
-from codeatelier_governance.console.app import HaltRequest
 
 
 def test_programmatic_log_strips_ansi_escapes() -> None:
@@ -64,12 +59,12 @@ def test_metadata_list_values_sanitized() -> None:
         assert "\x07" not in item
 
 
-def test_kill_request_and_audit_event_use_same_sanitizer() -> None:
-    """Same input through both surfaces must produce the same string."""
+def test_sanitize_string_strips_escapes_and_caps_length() -> None:
+    """The shared sanitizer strips control sequences and honors the cap."""
     raw = "a\\nb\nc\x1b[31mred"
-    via_halt = HaltRequest(reason=raw).reason
-    via_helper = sanitize_string(raw, max_len=HALT_REASON_MAX_LEN)
-    assert via_halt == via_helper
+    out = sanitize_string(raw, max_len=HALT_REASON_MAX_LEN)
+    assert "\x1b" not in out
+    assert len(out) <= HALT_REASON_MAX_LEN
 
 
 def test_nfc_normalization_applied() -> None:
