@@ -16,6 +16,8 @@ the Postgres your application already has.
 from codeatelier_governance import GovernanceSDK, ScopePolicy, BudgetPolicy, AuditEvent
 import uuid
 
+session_id = uuid.uuid4()
+
 async with GovernanceSDK(database_url="postgresql://...") as sdk:
     sdk.scope.register(ScopePolicy(
         agent_id="billing-agent",
@@ -36,6 +38,9 @@ async with GovernanceSDK(database_url="postgresql://...") as sdk:
 
 ```python
 from codeatelier_governance import GovernanceSDKSync
+import uuid
+
+session_id = uuid.uuid4()
 
 with GovernanceSDKSync(database_url="postgresql://...") as sdk:
     sdk.scope.check("my-agent", tool="send_email")
@@ -46,7 +51,6 @@ with GovernanceSDKSync(database_url="postgresql://...") as sdk:
 
 ```bash
 pip install code-atelier-governance                      # core SDK
-pip install "code-atelier-governance[console]"            # + governance console GUI
 pip install "code-atelier-governance[openai]"             # + OpenAI wrapper
 pip install "code-atelier-governance[anthropic]"          # + Anthropic wrapper
 pip install "code-atelier-governance[langchain]"          # + LangChain handler
@@ -59,24 +63,21 @@ upgrading v0.5.x deployments to v0.6. `governance migrate` applies the
 base DDL and then runs `alembic upgrade head` automatically, so a
 single command takes a new database all the way to HEAD. See
 `docs/migrations.md` for the full runbook and `docs/configuration.md`
-for every environment variable the SDK and console read.
+for every environment variable the SDK reads.
 
 ## Setup
 
 ```bash
 # One command: DDL + alembic upgrade head.
 governance migrate --database-url postgresql://user:pass@host/db
-
-# Create a console user
-governance console add-user --username admin --role admin
 ```
 
 ## Scaffold a ready-to-run agent (v0.7.2+)
 
 Prefer starting from a working project? The SDK ships a scaffolder that
 writes a full Microsoft AGT agent wired through `scope.check`,
-`cost.preflight`, and `gates.request` — all four enforcement gates on
-from the first line:
+`cost.check_or_raise`, and `gates.request` — enforcement on from the
+first line:
 
 ```bash
 pip install code-atelier-governance
@@ -95,9 +96,9 @@ roadmap.
 |--------|-------------|
 | **Audit** | HMAC-chained, append-only event log with step-level provenance and chain fork detection. Each entry is cryptographically linked to the previous entry at write time. Chain integrity can be verified on-demand via `sdk.audit.verify_chain()` or by enabling `verify_chain_on_read=True`. |
 | **Scope** | Whitelist tools and APIs per agent. Hidden tools removed from agent context. Default deny. |
-| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 25+ models. Combined budget query for low-latency enforcement. Requires `max_tokens` to be declared on each call. |
-| **Gates** | Human-in-the-loop approval with HMAC-signed single-use tokens. Self-approval prevention (fail-closed). |
-| **Loop Detection** | Sliding window detection of repeated tool calls. Auto-halt runaway agents. |
+| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 25+ models. Combined budget query for low-latency enforcement. Uses `max_tokens` for forward-looking projection when declared; warns and falls back to a balance-only check otherwise. |
+| **Gates** | Human-in-the-loop approval with HMAC-signed, single-use tokens bound to the request, action, and key version. |
+| **Loop Detection** | Sliding-window detection of repeated tool calls; raises `LoopDetected` when configured to. |
 | **Presence** | Live/idle/unresponsive/halted agent heartbeat tracking with operator identity. |
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Generates the event log required by EU AI Act Article 12 for all actions routed through the SDK. Produces an Article 12 evidence report from the audit trail. The report does not assert compliance — it provides evidence for actions the SDK observed. Article 12 compliance for your deployment depends on routing all relevant AI actions through the SDK. |
