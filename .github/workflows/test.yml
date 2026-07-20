@@ -261,24 +261,6 @@ jobs:
           print('clean install OK:', codeatelier_governance.__version__)
           "
 
-  validate-cron-artifacts:
-    name: validate cron artifacts
-    runs-on: ubuntu-latest
-    # F7 sub-item #2: tree-diff any cron artifact under automation/
-    # against automation/.cron-baseline.json. Runs in CI, NOT as a
-    # cron job (the DX Consultant fix — running a cron-validator
-    # from cron is a circular dependency). As of v0.6 there are no
-    # cron artifacts checked in, so this job is a no-op stub that
-    # exits 0 with a WARN. It gains teeth automatically when
-    # automation/ is populated.
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-      - name: validate
-        run: python automation/lib/validate_cron_artifacts.py
-
   console-version-parity:
     name: console version parity (app.py vs package.json)
     runs-on: ubuntu-latest
