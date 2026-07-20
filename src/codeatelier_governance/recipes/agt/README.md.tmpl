@@ -5,7 +5,7 @@ wires a Microsoft AGT agent through four Code Atelier governance gates
 for every action:
 
 1. **Scope check** — is the tool allowed for this agent?
-2. **Cost preflight** — would the action exceed the configured budget?
+2. **Cost check** — has the agent's session budget been exhausted?
 3. **HITL gate** — for high-risk actions, block on a human decision.
 4. **Audit log** — append-only, HMAC-chained, every gate outcome.
 
