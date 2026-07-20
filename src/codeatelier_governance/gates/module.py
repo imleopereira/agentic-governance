@@ -60,17 +60,14 @@ MAX_PAYLOAD_BYTES = 64 * 1024
 
 # v0.6.2-followup — downgrade-safe default for v2 tokens.
 #
-# v0.6.2 introduced the v2 (rotation-aware, key-fingerprint-embedded)
-# token format. Minting v2 by default breaks rolling-deploy scenarios
-# where a v0.6.1 pod is still handling grant/deny for tokens minted by
-# an adjacent v0.6.2 pod: the v0.6.1 parser sees a leading ``v2:<hex>:``
-# and chokes on the UUID parse of the "v2" literal → ``bad request_id``.
-#
-# v0.6.2 ships with ``enable_v2_tokens=False`` default — v2 VERIFICATION
-# still works (back-compat for anyone who minted v2 before the flag
-# existed) but new tokens are minted in v1 format. Flip flips to True in
-# v0.6.3 once all rolling-deploy windows are expected to be ≥v0.6.2.
-DEFAULT_ENABLE_V2_TOKENS = False
+# The v2 (rotation-aware, key-fingerprint-embedded) token format is the
+# default. Minting v1 by default was a v0.6.2 rolling-deploy accommodation
+# so a still-running v0.6.1 pod could parse tokens minted by an adjacent
+# v0.6.2 pod, but those windows closed long ago. Keeping the v1 default
+# would also reject freshly minted tokens once the v1 sunset below passes.
+# v1 VERIFICATION stays supported for genuinely old pre-v0.6.2 tokens, up
+# to that sunset.
+DEFAULT_ENABLE_V2_TOKENS = True
 
 # v0.6.2 release date + 90 days. Beyond this cutoff, legacy v1 tokens
 # are REJECTED with TokenVersionTooOldError (closes the "v1 forgery
