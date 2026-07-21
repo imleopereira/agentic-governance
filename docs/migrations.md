@@ -181,8 +181,7 @@ the JSON-schema heads-up on the new `signature` /
 The two tools use two different conventions, on purpose:
 
 - The runtime SDK reads **`GOVERNANCE_DATABASE_URL`** (see
-  `docs/configuration.md`). This is what `GovernanceSDK(...)` and the
-  console backend use.
+  `docs/configuration.md`). This is what `GovernanceSDK(...)` uses.
 - Alembic reads **`SQLALCHEMY_URL`** via the standard `migrations/env.py`
   pattern, OR the `sqlalchemy.url` value baked into `alembic.ini`. This
   is the upstream alembic convention and we did not invent it.
