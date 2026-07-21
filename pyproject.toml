@@ -39,18 +39,14 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/imleopereira/code-atelier-governance"
-Documentation = "https://github.com/imleopereira/code-atelier-governance/blob/production/README.md"
-Issues = "https://github.com/imleopereira/code-atelier-governance/issues"
+Homepage = "https://github.com/imleopereira/agentic-governance"
+Documentation = "https://github.com/imleopereira/agentic-governance/blob/production/README.md"
+Issues = "https://github.com/imleopereira/agentic-governance/issues"
 
 [project.optional-dependencies]
 otel = [
     "opentelemetry-api>=1.30,<2.0",
     "opentelemetry-sdk>=1.30,<2.0",
-]
-console = [
-    "fastapi>=0.110",
-    "uvicorn>=0.30",
 ]
 langchain = [
     "langchain-core>=0.2",
@@ -128,7 +124,6 @@ include-package-data = true
 "codeatelier_governance.cost" = ["*.sql"]
 "codeatelier_governance.gates" = ["*.sql"]
 "codeatelier_governance.scope" = ["*.sql"]
-"codeatelier_governance.console" = ["*.sql"]
 "codeatelier_governance.loop" = ["*.sql"]
 "codeatelier_governance.presence" = ["*.sql"]
 "codeatelier_governance.migrations" = ["*.py", "*.mako", "README"]

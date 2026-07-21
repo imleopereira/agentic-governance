@@ -16,6 +16,8 @@ the Postgres your application already has.
 from codeatelier_governance import GovernanceSDK, ScopePolicy, BudgetPolicy, AuditEvent
 import uuid
 
+session_id = uuid.uuid4()
+
 async with GovernanceSDK(database_url="postgresql://...") as sdk:
     sdk.scope.register(ScopePolicy(
         agent_id="billing-agent",
@@ -36,6 +38,9 @@ async with GovernanceSDK(database_url="postgresql://...") as sdk:
 
 ```python
 from codeatelier_governance import GovernanceSDKSync
+import uuid
+
+session_id = uuid.uuid4()
 
 with GovernanceSDKSync(database_url="postgresql://...") as sdk:
     sdk.scope.check("my-agent", tool="send_email")
@@ -46,7 +51,6 @@ with GovernanceSDKSync(database_url="postgresql://...") as sdk:
 
 ```bash
 pip install code-atelier-governance                      # core SDK
-pip install "code-atelier-governance[console]"            # + governance console GUI
 pip install "code-atelier-governance[openai]"             # + OpenAI wrapper
 pip install "code-atelier-governance[anthropic]"          # + Anthropic wrapper
 pip install "code-atelier-governance[langchain]"          # + LangChain handler
@@ -59,24 +63,21 @@ upgrading v0.5.x deployments to v0.6. `governance migrate` applies the
 base DDL and then runs `alembic upgrade head` automatically, so a
 single command takes a new database all the way to HEAD. See
 `docs/migrations.md` for the full runbook and `docs/configuration.md`
-for every environment variable the SDK and console read.
+for every environment variable the SDK reads.
 
 ## Setup
 
 ```bash
 # One command: DDL + alembic upgrade head.
 governance migrate --database-url postgresql://user:pass@host/db
-
-# Create a console user
-governance console add-user --username admin --role admin
 ```
 
 ## Scaffold a ready-to-run agent (v0.7.2+)
 
 Prefer starting from a working project? The SDK ships a scaffolder that
 writes a full Microsoft AGT agent wired through `scope.check`,
-`cost.preflight`, and `gates.request` — all four enforcement gates on
-from the first line:
+`cost.check_or_raise`, and `gates.request` — enforcement on from the
+first line:
 
 ```bash
 pip install code-atelier-governance
@@ -95,9 +96,9 @@ roadmap.
 |--------|-------------|
 | **Audit** | HMAC-chained, append-only event log with step-level provenance and chain fork detection. Each entry is cryptographically linked to the previous entry at write time. Chain integrity can be verified on-demand via `sdk.audit.verify_chain()` or by enabling `verify_chain_on_read=True`. |
 | **Scope** | Whitelist tools and APIs per agent. Hidden tools removed from agent context. Default deny. |
-| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 25+ models. Combined budget query for low-latency enforcement. Requires `max_tokens` to be declared on each call. |
-| **Gates** | Human-in-the-loop approval with HMAC-signed single-use tokens. Self-approval prevention (fail-closed). |
-| **Loop Detection** | Sliding window detection of repeated tool calls. Auto-halt runaway agents. |
+| **Cost** | Token + USD caps per session/day. Session time limits. Built-in pricing for 25+ models. Combined budget query for low-latency enforcement. Uses `max_tokens` for forward-looking projection when declared; warns and falls back to a balance-only check otherwise. |
+| **Gates** | Human-in-the-loop approval with HMAC-signed, single-use tokens bound to the request, action, and key version. |
+| **Loop Detection** | Sliding-window detection of repeated tool calls; raises `LoopDetected` when configured to. |
 | **Presence** | Live/idle/unresponsive/halted agent heartbeat tracking with operator identity. |
 | **Contracts** | Pre/post conditions on tool calls. Built-in checks: hitl_approved, budget_available, scope_allowed. |
 | **Compliance** | Generates the event log required by EU AI Act Article 12 for all actions routed through the SDK. Produces an Article 12 evidence report from the audit trail. The report does not assert compliance — it provides evidence for actions the SDK observed. Article 12 compliance for your deployment depends on routing all relevant AI actions through the SDK. |
@@ -127,27 +128,15 @@ first call, not at import time.
   graceful degradation.
 - **BREAKING**: Streaming token accounting reconciles at end-of-stream.
   Cost numbers will be more accurate (and often higher) than projected-only.
-- **BREAKING**: `/api/gates/pending` (v1) is now admin-only and caps at
-  500 rows — response carries `Deprecation: true` + `Sunset: Thu, 01 Oct
-  2026`. Migrate HTTP consumers to `/api/v2/gates/pending` which returns
-  `{items, has_more, next_cursor}` with keyset pagination.
-- **v4 is the default console UI.** `NEXT_PUBLIC_CONSOLE_UI_VERSION`
-  defaults to `v4` as of v0.6.2; set it to `v3` at build time to keep
-  the legacy console. `?ui=v3` persists via a `console_ui_version`
-  cookie (SameSite=Lax, 30 days). v3 is removed in v0.7. See
-  `docs/configuration.md` for the full escape-hatch semantics.
 - See `CHANGELOG.md` for full BREAKING blocks + `Upgrade from v0.5.x` +
   `Upgrade from v0.6.0` migration playbooks.
 
 ## What's new in v0.6.0
 
-- **Article 12 evidence export.** `POST /api/compliance/export`
-  packages the compliance report and chain verification into a single
-  HMAC-signed JSON bundle (`bundle_hash` + `bundle_signature`) a
-  compliance officer can hand to an auditor. The v4 Compliance page
-  has an "Export Article 12 evidence" button wired to it, with a
-  Windows-safe filename and screen-reader-announced download
-  lifecycle.
+- **Article 12 evidence export.** `governance report --format article12`
+  produces an HMAC-signed Article 12 evidence bundle (`bundle_hash` +
+  `bundle_signature`) from the audit trail — a single JSON bundle a
+  compliance officer can hand to an auditor.
 - **Ed25519 agent identity.** Per-row Ed25519 signatures over the HMAC
   audit chain, with three keystore backends (`file://`, `env://`,
   `ephemeral`) and graceful degradation to `signature_status='unsigned_local_failure'`
@@ -162,16 +151,12 @@ first call, not at import time.
   record from the audit trail. The report includes a `coverage_pct`
   (with disambiguated null reason) and the new `rotation_aware`
   verification flag.
-- **`kill` → `halt` rename** across SDK, console, and audit. Backward-
+- **`kill` → `halt` rename** across the SDK and audit. Backward-
   compat aliases preserved in v0.6, removed in v0.7. See the table
   below.
 - **F9 wrapper coverage registry.** Opt-in registry that records every
-  wrapped LLM client at import time, surfaced via `GET /api/coverage`
-  and the new `/health/governance` endpoint. Hostname stored as a
-  salted HMAC digest only.
-- **`/health/governance`** — anon: status only; authed: chain-integrity
-  state, key resolution state, append-only grants check, p50/p95
-  latency.
+  wrapped LLM client at import time. Hostname stored as a salted HMAC
+  digest only.
 
 See `CHANGELOG.md` for the full release notes and `docs/migrations.md`
 for the upgrade runbook (run `alembic upgrade head` before starting
@@ -189,7 +174,6 @@ be removed in v0.7.**
 | `is_killed()` | `is_halted()` |
 | `assert_alive()` | `assert_not_halted()` |
 | `KillRequest` | `HaltRequest` |
-| `POST /api/agents/{id}/kill` | `POST /api/agents/{id}/halt` |
 | `kind='agent.killed'` audit events | `kind='agent.halted'` audit events |
 | `_killed_by` / `_killed_at` metadata | `_halted_by` / `_halted_at` metadata |
 | `force_refresh_killed_cache()` | `force_refresh_halted_cache()` |
@@ -222,20 +206,6 @@ from codeatelier_governance.integrations.langchain_handler import GovernanceCall
 handler = GovernanceCallbackHandler(sdk=sdk, agent_id="my-agent", enforce=True)
 ```
 
-## Governance Console
-
-A web dashboard with real-time SSE event streaming, agent topology view,
-HITL approval queue, cost monitoring, and chain verification. Ships as a
-FastAPI backend + Next.js frontend.
-
-```bash
-# Start the console backend
-GOVERNANCE_DATABASE_URL=postgresql://... python -m codeatelier_governance.console
-
-# Start the frontend (dev)
-cd console && npm run dev
-```
-
 ## CLI
 
 ```bash
@@ -244,7 +214,6 @@ governance verify      # Walk HMAC chain, exit 0 (clean) or 1 (tampered)
 governance tail        # Live-follow audit events
 governance budget      # Show cost snapshot for an agent
 governance report      # Generate EU AI Act Article 12 evidence report for actions the SDK observed
-governance console     # User management (add-user, list-users, disable-user, reset-password)
 ```
 
 ## Performance

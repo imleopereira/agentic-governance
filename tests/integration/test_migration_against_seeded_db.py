@@ -46,7 +46,7 @@ ALEMBIC_INI = REPO_ROOT / "src" / "codeatelier_governance" / "alembic.ini"
 # BEFORE any Alembic migration runs. The base Alembic revision
 # ``a1b2c3d4e5f6`` assumes these tables already exist (it adds columns
 # to ``governance_gates_pending``).
-DDL_MODULES = ("audit", "gates", "scope", "cost", "loop", "presence", "console")
+DDL_MODULES = ("audit", "gates", "scope", "cost", "loop", "presence")
 CONTAINER_NAME = f"governance-mig-test-{os.getpid()}"
 
 

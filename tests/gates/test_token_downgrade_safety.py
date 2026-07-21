@@ -1,22 +1,17 @@
-"""v0.6.2-followup — v2 token minting must be opt-in (downgrade-safe).
+"""v2 tokens are the default; v1 minting stays available for downgrades.
 
-Rolling-deploy scenario: operator runs mixed v0.6.1 + v0.6.2 pods
-behind a load balancer. A v0.6.2 pod mints a grant token and hands it
-to a human reviewer. The human clicks approve and the request lands
-on a v0.6.1 pod — which does not understand the ``v2:<hex>:`` prefix
-and rejects the token as ``bad request_id`` (its v1 parser tries to
-UUID-parse the literal string ``"v2"``).
+The v2 (``v2:<key_prefix>:``) token format is rotation-aware and is what
+``GatesModule`` mints by default. Minting v1 was once the default so a
+mixed rolling deploy (a v0.6.1 pod handling grant/deny for a token minted
+by a v0.6.2 pod) would not brick approvals, since the v0.6.1 parser
+cannot read a ``v2:`` prefix. Those windows have long closed, so v2 is
+now the default. Operators who still need the old behavior can opt back
+into v1 minting via ``enable_v2_tokens=False`` or
+``GOVERNANCE_GATES_ENABLE_V2_TOKENS=false``; v2 tokens verify regardless
+of the mint preference.
 
-v0.6.2 SHOULD NOT brick approvals on old pods during the rolling
-window. v0.6.2 therefore defaults ``enable_v2_tokens=False`` (mints v1
-for back-compat). v2 verification still works so anyone who already
-minted v2 tokens in this session (e.g. on a canary pod) continues to
-verify them. The flip-to-v2-by-default moves to v0.6.3 once operators
-expect all pods to be ≥v0.6.2.
-
-Also asserts that the constructor arg wins over the env var, and that
-the env var is honored per the ``.agents/swe.md`` rule on read-at-call-
-time env var access.
+These tests also assert that the constructor arg wins over the env var,
+and that the env var is honored (read at call time).
 """
 from __future__ import annotations
 
@@ -39,10 +34,10 @@ async def _build_audit(secret: bytes) -> AuditModule:
 
 
 @pytest.mark.asyncio
-async def test_default_mints_v1_format_for_downgrade_safety(
+async def test_default_mints_v2_format(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With no flag and no env var, v0.6.2 mints v1 tokens."""
+    """With no flag and no env var, the default mints v2 tokens."""
     monkeypatch.delenv("GOVERNANCE_GATES_ENABLE_V2_TOKENS", raising=False)
     secret = _secrets.token_bytes(32)
     audit = await _build_audit(secret)
@@ -52,11 +47,8 @@ async def test_default_mints_v1_format_for_downgrade_safety(
     finally:
         await audit.close()
 
-    # v1 tokens do NOT start with ``v2:``. A v0.6.1 parser would split
-    # on ":" and treat parts[0] as the request_id UUID — which it is.
-    assert not req.token.startswith(f"{TOKEN_VERSION_V2}:"), (
-        "Default GatesModule minted a v2 token — breaks rolling "
-        "deploys with v0.6.1 pods."
+    assert req.token.startswith(f"{TOKEN_VERSION_V2}:"), (
+        "Default GatesModule should mint a v2 (rotation-aware) token."
     )
     # Round-trip verifies under the current secret.
     parsed_rid, _, _ = parse_token(secret=secret, token=req.token)

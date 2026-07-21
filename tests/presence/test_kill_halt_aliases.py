@@ -150,18 +150,3 @@ async def test_force_refresh_killed_cache_still_works(
     await presence.heartbeat("agent-1")
     await presence.force_refresh_killed_cache()  # legacy name
     assert await presence.is_halted("agent-1") is False
-
-
-# ---------------------------------------------------------------------------
-# Pydantic model alias (console)
-# ---------------------------------------------------------------------------
-
-
-def test_kill_request_is_identity_alias_of_halt_request() -> None:
-    from codeatelier_governance.console import app as console_app
-
-    assert console_app.KillRequest is console_app.HaltRequest
-    # Constructing via either name yields an instance of the SAME class.
-    r = console_app.KillRequest(reason="x")
-    assert isinstance(r, console_app.HaltRequest)
-    assert isinstance(r, console_app.KillRequest)

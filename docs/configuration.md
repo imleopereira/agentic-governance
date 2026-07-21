@@ -1,10 +1,10 @@
 # Configuration Reference
 
 This page is the canonical reference for every environment variable read by
-the Code Atelier Governance SDK, the governance console backend, and the
-console frontend. Each entry lists the variable name, whether it is required,
-its default, what it controls, security-relevant notes, and where it is read
-in the source tree (file:line) so operators can audit the call site.
+the Code Atelier Governance SDK. Each entry lists the variable name, whether
+it is required, its default, what it controls, security-relevant notes, and
+where it is read in the source tree (file:line) so operators can audit the
+call site.
 
 If a variable is not listed here, the SDK does NOT read it. The SDK refuses
 to silently consume undocumented environment variables — every config knob
@@ -15,19 +15,13 @@ variables below.
 
 ## Quick reference — minimum production config
 
-The smallest viable production deployment of the SDK + console requires the
+The smallest viable production deployment of the SDK requires the
 following variables. Everything else has a sensible default.
 
 ```bash
 # --- SDK (host application) ---
 export GOVERNANCE_DATABASE_URL="postgresql+asyncpg://user:pass@host:5432/db"
 export GOVERNANCE_AUDIT_SECRET="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-
-# --- Console backend ---
-export GOVERNANCE_CONSOLE_HOST="127.0.0.1"   # behind a reverse proxy
-export GOVERNANCE_CONSOLE_PORT="8766"
-export GOVERNANCE_CONSOLE_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
-export GOVERNANCE_CONSOLE_CORS_ORIGINS="https://console.example.com"
 
 # --- Optional but strongly recommended ---
 export GOVERNANCE_WORKSPACE_SALT="$(python -c 'import secrets; print(secrets.token_hex(32))')"
@@ -55,12 +49,11 @@ These are read by the SDK runtime. They affect every `GovernanceSDK` and
 |---|---|
 | **Required** | Yes — at startup if no `database_url=` kwarg is passed |
 | **Default** | none (raises `ValueError` if unset and no kwarg) |
-| **Read in** | `src/codeatelier_governance/sdk.py:161`, `src/codeatelier_governance/utils.py:28`, `src/codeatelier_governance/cli/commands.py:42`, `src/codeatelier_governance/console/app.py:79`, `src/codeatelier_governance/console/__main__.py:22` |
+| **Read in** | `src/codeatelier_governance/sdk.py:161`, `src/codeatelier_governance/utils.py:28`, `src/codeatelier_governance/cli/commands.py:42` |
 
-PostgreSQL connection string used by both the SDK runtime and the console
-backend. `postgresql://`, `postgresql+asyncpg://`, and DSNs with
-`?sslmode=require` are all accepted; the SDK normalises the driver scheme
-internally.
+PostgreSQL connection string used by the SDK runtime. `postgresql://`,
+`postgresql+asyncpg://`, and DSNs with `?sslmode=require` are all accepted;
+the SDK normalises the driver scheme internally.
 
 **Security**: this string contains DB credentials. It MUST NOT be logged.
 The SDK's `sanitize_db_error()` helper strips it from any error message
@@ -192,8 +185,8 @@ The value is a base64-encoded 32-byte key.
 
 After rotating the audit chain key with `governance rotate-chain-key`,
 operators add one of these env vars per historical key version so that
-`verify_chain(rotation_aware=True)` and the `/health/governance`
-endpoint can resolve and verify rows that were signed by the older key.
+`verify_chain(rotation_aware=True)` can resolve and verify rows that were
+signed by the older key.
 
 If a row's fingerprint cannot be resolved, the verifier reports
 `chain_integrity_status='unverified'` for that row (NOT `corrupt`) and
@@ -205,244 +198,6 @@ as `GOVERNANCE_AUDIT_SECRET`.
 
 ---
 
-## Console backend variables
-
-Read by `python -m codeatelier_governance.console`.
-
-### `GOVERNANCE_CONSOLE_HOST`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `127.0.0.1` |
-| **Read in** | `src/codeatelier_governance/console/__main__.py:29` |
-
-Bind address for the FastAPI server. The default is loopback-only —
-operators are expected to terminate TLS at a reverse proxy
-(nginx, Caddy, ALB) and forward to localhost.
-
-If `GOVERNANCE_CONSOLE_DEV_MODE=true` is set, the host MUST remain
-`127.0.0.1` — see the DEV_MODE warning below. v0.6 adds a startup guard
-that refuses to launch a non-localhost bind while DEV_MODE is on.
-
-### `GOVERNANCE_CONSOLE_PORT`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `8766` |
-| **Read in** | `src/codeatelier_governance/console/__main__.py:30` |
-
-TCP port the console backend listens on.
-
-### `GOVERNANCE_CONSOLE_WORKERS`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `1` |
-| **Read in** | `src/codeatelier_governance/console/__main__.py:31` |
-
-Uvicorn worker count. Stay at `1` unless you have measured contention —
-the console backend holds a single shared SQLAlchemy engine pool, and
-multiple workers will multiply the connection count by the worker count.
-
-### `GOVERNANCE_CONSOLE_LOG_LEVEL`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `info` |
-| **Read in** | `src/codeatelier_governance/console/__main__.py:32` |
-
-Uvicorn log level. One of `critical`, `error`, `warning`, `info`,
-`debug`, `trace`.
-
-### `GOVERNANCE_CONSOLE_TOKEN`
-
-| Property | Value |
-|---|---|
-| **Required** | Recommended (or use the session/PBKDF2 user auth path) |
-| **Default** | empty string (legacy bearer auth disabled) |
-| **Read in** | `src/codeatelier_governance/console/app.py:81` |
-
-Shared bearer token used by the legacy single-token auth path. If set,
-clients can authenticate by sending `Authorization: Bearer <token>`.
-Most deployments should use the per-user PBKDF2 auth path
-(`governance console add-user ...`) instead and leave this unset; the
-single-token path is preserved for headless scripts and CI.
-
-**Security**: never log. Generate with
-`python -c "import secrets; print(secrets.token_urlsafe(48))"`.
-
-### `GOVERNANCE_CONSOLE_DEV_MODE`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `false` |
-| **Read in** | `src/codeatelier_governance/console/app.py:82` |
-
-> ## DANGER: do NOT enable in production
->
-> When set to `true`, the console backend grants the `admin` role to
-> every caller, regardless of whether they presented credentials. This
-> exists so that local development against a fresh checkout does not
-> need a password. It is a development-only escape hatch.
->
-> v0.6 adds a startup guard that refuses to launch with
-> `GOVERNANCE_CONSOLE_DEV_MODE=true` unless `GOVERNANCE_CONSOLE_HOST`
-> is `127.0.0.1` or `localhost`. A non-localhost bind with DEV_MODE
-> enabled now exits non-zero at startup.
->
-> Do not set this variable in any environment that is reachable from
-> the public internet, from a corporate VPN, or from any host other
-> than the operator's local workstation.
-
-### `GOVERNANCE_CONSOLE_ALLOW_DEV_MODE`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `0` |
-| **Status** | **v0.6.1 — safety kill-switch** |
-
-Two-key safety lock: even with `GOVERNANCE_CONSOLE_DEV_MODE=true` set,
-the dev-mode admin grant only activates if `GOVERNANCE_CONSOLE_ALLOW_DEV_MODE=1`
-is also set. The intent is to make accidental DEV_MODE leakage from a
-shared `.env` or container image impossible without a second
-deliberate flag.
-
-This variable is documented here so that operators can plan for it.
-The startup guard ships in v0.6.1 if it is not already present in the
-v0.6.0 cut you are running.
-
-### `GOVERNANCE_CONSOLE_SESSION_TTL_HOURS`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `8` |
-| **Read in** | `src/codeatelier_governance/console/app.py:83` |
-
-Lifetime in hours of a console login session. After the TTL expires,
-the user is re-prompted for credentials.
-
-### `GOVERNANCE_CONSOLE_CORS_ORIGINS`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `http://localhost:3000` |
-| **Read in** | `src/codeatelier_governance/console/app.py:85` |
-
-Comma-separated list of origins allowed by the CORS middleware. The
-default trusts the local Next.js dev server only; production deployments
-must replace it with the public origin of the console UI.
-
-The startup banner emits a warning if the literal `*` is present.
-
-### `GOVERNANCE_CONSOLE_REDACT_KEYS`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | empty |
-| **Read in** | `src/codeatelier_governance/console/app.py:91` |
-
-Comma-separated list of additional metadata keys to redact from console
-API responses. The console already redacts a built-in list (auth
-keywords, OpenAI/Anthropic/Slack/GitHub/AWS key prefixes, DSNs); this
-variable lets operators extend it without a code change.
-
-### `GOVERNANCE_CONSOLE_USER_RATE_LIMIT`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `60` (requests per minute per user) |
-| **Read in** | `src/codeatelier_governance/console/app.py:139` |
-| **Status** | **New in v0.6** |
-
-Per-user request rate limit on the six endpoints wired by F6#4:
-`/api/policies`, `/api/policies/{id}`, `/api/events/stats`,
-`/api/agents/presence`, `/api/gates/pending`, `/api/gates/recent`.
-Returns HTTP 429 with `Retry-After` when exceeded.
-
----
-
-## Frontend variables
-
-Read by the Next.js console UI in `console/`.
-
-### `NEXT_PUBLIC_CONSOLE_UI_VERSION`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `v4` (flipped from `v3` in v0.6.2) |
-| **Read in** | `console/next.config.ts`, `console/src/middleware.ts`, `console/src/app/(v4)/layout.tsx`, `console/src/components/Sidebar.tsx`, `console/src/components/V3DeprecationBanner.tsx` |
-| **Status** | **Default flipped in v0.6.2** |
-
-Selects which IA shell renders. `v4` (default as of v0.6.2) is the new
-agents-first IA under `console/src/app/(v4)/`; `v3` is the legacy v0.5
-console, still available as an escape hatch and scheduled for removal
-in v0.7. The `?ui=v3` / `?ui=v4` query override handled by
-`middleware.ts` persists via the `console_ui_version` cookie
-(`SameSite=Lax`, path `/`, 30 days); precedence is query → cookie →
-env var → default `v4`.
-
-> ## CRITICAL: this is a build-time variable, not runtime
->
-> Next.js inlines every `NEXT_PUBLIC_*` variable at `next build` time.
-> Setting `NEXT_PUBLIC_CONSOLE_UI_VERSION=v4` in the environment of a
-> running container has **no effect** if the container image was built
-> without it — the value is already baked into the JavaScript bundle
-> shipped to the browser.
->
-> **Worked example** — wrong:
->
-> ```bash
-> docker run -e NEXT_PUBLIC_CONSOLE_UI_VERSION=v4 codeatelier/console:v0.6.0
-> # Browser still loads the v3 shell. The env var is ignored.
-> ```
->
-> **Worked example** — right:
->
-> ```bash
-> # At build time:
-> docker build \
->   --build-arg NEXT_PUBLIC_CONSOLE_UI_VERSION=v4 \
->   -t codeatelier/console:v0.6.0-v4 \
->   .
->
-> # At run time:
-> docker run codeatelier/console:v0.6.0-v4
-> ```
->
-> If you ship a single image and need to flip versions per-environment,
-> build two images, or use a runtime-injected config endpoint instead
-> of a `NEXT_PUBLIC_*` variable.
-
-### `NEXT_PUBLIC_SHOW_V3_BANNER`
-
-| Property | Value |
-|---|---|
-| **Required** | No |
-| **Default** | `0` (banner hidden) |
-| **Read in** | `console/src/components/V3DeprecationBanner.tsx` |
-| **Status** | **New in v0.6** |
-
-Gate for the v3-deprecation amber banner. Hidden by default because
-there is no telemetry pipeline yet. As of v0.6.2 the banner, when
-enabled, shows ONLY when `NEXT_PUBLIC_CONSOLE_UI_VERSION=v3` is set
-explicitly — warning operators who have forced v3 that it will be
-removed in v0.7. Default-install users (now on v4) never see it. Set
-to `1` locally if you want to preview. Same `NEXT_PUBLIC_*` build-time
-caveat as above applies.
-
----
-
 ## Security notes
 
 The following variables are secrets. They MUST NOT be logged, echoed,
@@ -451,15 +206,13 @@ checked into git, or shipped inside container images:
 - `GOVERNANCE_DATABASE_URL` (contains DB credentials)
 - `GOVERNANCE_AUDIT_SECRET`
 - `GOVERNANCE_WORKSPACE_SALT`
-- `GOVERNANCE_CONSOLE_TOKEN`
 - `CODEATELIER_AGENT_KEY_<AGENT_ID>` (every instance)
 - `GOVERNANCE_CHAIN_KEY_<FINGERPRINT_PREFIX>` (every instance)
 
 Use a secret manager and inject these at deploy time. The SDK's
-`sanitize_db_error()` and the console's `redact_secrets()` helpers
-strip the patterns above from any error or response body that leaves
-the process, but you should still treat them as cryptographically
-sensitive end-to-end.
+`sanitize_db_error()` helper strips the patterns above from any error
+message that leaves the process, but you should still treat them as
+cryptographically sensitive end-to-end.
 
 The two pattern-variables (`CODEATELIER_AGENT_KEY_*`,
 `GOVERNANCE_CHAIN_KEY_*`) are particularly dangerous to log because
@@ -481,19 +234,3 @@ pip install "code-atelier-governance[migrations]"
 This installs `psycopg[binary]` (psycopg3) alongside the runtime
 asyncpg driver. See `docs/migrations.md` for the full migration
 runbook including dry-run, rollback, and time-estimate guidance.
-
----
-
-## DEV_MODE warning (recap)
-
-> Setting `GOVERNANCE_CONSOLE_DEV_MODE=true` grants admin to every
-> caller. The v0.6 startup guard refuses to launch when DEV_MODE is on
-> AND the host bind is anything other than `127.0.0.1`/`localhost`. The
-> v0.6.1 follow-up adds `GOVERNANCE_CONSOLE_ALLOW_DEV_MODE=1` as a
-> required second flag so accidental leakage from a shared `.env` is
-> impossible without two deliberate variables.
->
-> If you see DEV_MODE in any production-like environment, treat it as
-> a P0 incident: rotate the audit secret, rotate every console user
-> credential, audit `governance_audit_events` for the window the flag
-> was active, and document the exposure in your incident log.
