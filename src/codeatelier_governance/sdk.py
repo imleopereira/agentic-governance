@@ -74,7 +74,9 @@ class GovernanceConfig:
     # compatibility so callers that pre-emptively set the flag do not
     # break when the real module lands.
     enable_prompts: bool = True
-    # Loop detection: sliding-window repeated-tool-call detection + auto-halt.
+    # Loop detection: sliding-window repeated-tool-call detection. On a policy
+    # threshold it emits an audit event and raises LoopDetected (action='raise');
+    # it detects and reports only — it does NOT halt the agent.
     # Enabled by default.  Set to False to skip LoopModule construction;
     # sdk.loop will not exist and any call to it raises AttributeError.
     enable_loop: bool = True
@@ -487,7 +489,7 @@ class GovernanceSDK:
                 "sdk.loop_disabled",
                 detail=(
                     "enable_loop=False — sdk.loop is not constructed.  "
-                    "Loop detection and auto-halt are off."
+                    "Loop detection is off."
                 ),
             )
 
