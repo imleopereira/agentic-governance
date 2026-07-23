@@ -282,4 +282,41 @@ async def test_verify_chain_requires_session_id_for_non_inmemory_store(
     finally:
         await module.close()
 
+
+# ---------------------------------------------------------------------------
+# Test: trace_session_chain detects deletion (not just tampering/forks)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_trace_session_chain_detects_interior_deletion(
+    store_with_events: tuple[InMemoryAuditStore, UUID, AuditModule],
+) -> None:
+    """trace_session_chain must raise when an interior event is deleted.
+
+    The API markets itself as 'prove it wasn't tampered with', so it must catch
+    interior deletion via the prev_hash linkage, not only in-place HMAC edits.
+    """
+    store, session_id, module = store_with_events
+    event_ids = store._by_session[session_id]
+    del store._events[event_ids[2]]
+    store._by_session[session_id] = event_ids[:2] + event_ids[3:]
+
+    with pytest.raises(ChainIntegrityError):
+        await module.trace_session_chain(session_id)
+    await module.close()
+
+
+@pytest.mark.asyncio
+async def test_trace_session_chain_detects_head_deletion(
+    store_with_events: tuple[InMemoryAuditStore, UUID, AuditModule],
+) -> None:
+    """trace_session_chain must raise when the head (oldest) event is deleted."""
+    store, session_id, module = store_with_events
+    event_ids = store._by_session[session_id]
+    del store._events[event_ids[0]]
+    store._by_session[session_id] = event_ids[1:]
+
+    with pytest.raises(ChainIntegrityError):
+        await module.trace_session_chain(session_id)
+    await module.close()
+
     await module.close()

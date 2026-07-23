@@ -595,7 +595,11 @@ class AuditModule:
         :class:`ChainIntegrityError` with the offending event_id.
 
         This is the API to use when answering "show me everything that
-        happened in this session and prove it wasn't tampered with."
+        happened in this session and prove it wasn't tampered with." It
+        detects in-place tampering (per-row HMAC), head deletion (genesis),
+        interior deletion (linkage), and forks. It does NOT detect tail
+        truncation (dropping the most-recent events leaves a self-consistent
+        chain); that needs an external high-water-mark.
         """
         events = await self._store.get_session_events(session_id)
         for record in events:
@@ -604,9 +608,10 @@ class AuditModule:
                     f"audit chain integrity violation at event {record.event_id}"
                 )
 
-        # Detect chain forks: two events sharing the same prev_hash means
-        # the chain was branched (e.g. an attacker inserted a second root
-        # or spliced a parallel branch).
+        # Detect chain forks first: two events sharing the same prev_hash means
+        # the chain was branched (e.g. an attacker inserted a second root or
+        # spliced a parallel branch). A fork is also a linkage break, so check
+        # it before the linkage pass to give the more specific diagnosis.
         seen_prev: dict[str | None, UUID] = {}
         for record in events:
             key = record.prev_hash
@@ -617,6 +622,25 @@ class AuditModule:
                     f"share prev_hash {key!r}"
                 )
             seen_prev[key] = record.event_id
+
+        # Genesis check: a session's first event has no predecessor. A non-None
+        # head means the true first event(s) were deleted (head truncation).
+        if events and events[0].prev_hash is not None:
+            raise ChainIntegrityError(
+                f"chain head truncated for session {session_id}: first event "
+                f"{events[0].event_id} has prev_hash {events[0].prev_hash!r}, "
+                f"expected None (genesis)"
+            )
+
+        # Linkage check: detects deletion of an interior event (a gap that
+        # leaves every surviving row's HMAC self-consistent).
+        for i in range(1, len(events)):
+            if events[i].prev_hash != events[i - 1].hmac:
+                raise ChainIntegrityError(
+                    f"chain gap at position {i}: prev_hash of event "
+                    f"{events[i].event_id} does not match hmac of preceding "
+                    f"event {events[i - 1].event_id}"
+                )
 
         return events
 
@@ -690,6 +714,19 @@ class AuditModule:
                 )
 
         return True
+
+    def verify_events_hmac(self, records: list[AuditEventRecord]) -> bool:
+        """Verify ONLY each record's HMAC (no linkage / genesis check).
+
+        Detects in-place row tampering. Does NOT detect deletion — for that use
+        :meth:`verify_chain` / :meth:`verify_chain_records` with a single
+        session's FULL chain, which can anchor a genesis and check linkage.
+        This is intended for a bounded, possibly multi-session window (e.g. the
+        compliance report's globally-ordered window), where per-session
+        prev_hash linkage does not apply and would false-positive at every
+        session boundary.
+        """
+        return all(verify_event(r, self._secret) for r in records)
 
     async def verify_chain(
         self,

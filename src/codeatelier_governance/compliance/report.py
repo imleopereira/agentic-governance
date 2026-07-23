@@ -564,12 +564,25 @@ class ReportGenerator:
                 list(result.unresolved_fingerprints),
             )
 
-        # Legacy single-key path (no rotation marker present).
+        # Legacy single-key path (no rotation marker present). On Postgres,
+        # verify each row's HMAC over the loaded window: verify_chain needs an
+        # in-memory index and cannot enumerate a Postgres store without a
+        # session_id. Per-row HMAC detects in-place tampering; full-session
+        # deletion detection is the `governance verify` CLI's job (a global
+        # window spans sessions and cannot anchor a per-session genesis).
         try:
-            await self._audit_module.verify_chain(
-                from_seq=from_seq,
-                to_seq=to_seq,
-            )
+            rows = await self._load_chain_rows(from_seq=from_seq, to_seq=to_seq)
+            if rows:
+                if self._audit_module.verify_events_hmac([r.record for r in rows]):
+                    return ("verified", from_seq, to_seq, False, [])
+                logger.warning(
+                    "compliance.report.chain_integrity_failed",
+                    detail="per-row HMAC mismatch in the verified window",
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            # No Postgres rows (in-memory store, or empty window): fall back to
+            # the in-memory chain verifier, which does anchor a genesis.
+            await self._audit_module.verify_chain(from_seq=from_seq, to_seq=to_seq)
             return ("verified", from_seq, to_seq, False, [])
         except ChainIntegrityError as exc:
             logger.warning(

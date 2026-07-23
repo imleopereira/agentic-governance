@@ -300,13 +300,16 @@ def verify_chain_with_rotation(
           4. Otherwise, verify via ``verify_event`` under the resolved key.
 
     Returns a ``ChainVerifyResult``. ``status`` is:
-        * ``"failed"``    if any row's HMAC does not verify under a resolved
-                          key (tamper detected), OR the prev_hash linkage is
-                          broken / the genesis prev_hash is non-None (an event
-                          was deleted). Tail truncation is not detectable.
+        * ``"failed"``    if any row's HMAC does not verify under a
+                          resolved key (tamper detected).
         * ``"unverified"`` if no failures but at least one row could not
                           be checked because its key was unresolvable.
         * ``"ok"``         if every row verified cleanly.
+
+    Per-row HMAC only: this operates on a bounded, GLOBALLY-ordered window that
+    may span multiple sessions, so it does NOT do prev_hash linkage / genesis
+    (deletion) detection — that is session-scoped and lives in ``verify_chain``
+    / ``verify_chain_records`` / the ``governance verify`` CLI.
 
     This function does NOT modify the existing single-key
     ``verify_event`` — it composes on top of it. The off-by-one rule at
@@ -386,19 +389,16 @@ def verify_chain_with_rotation(
             else:
                 failed += 1
 
-    # Linkage + genesis check (independent of key resolution): a deleted event
-    # leaves the surviving rows individually valid under their keys but breaks
-    # the prev_hash -> hmac linkage. Detects head deletion (the genesis row's
-    # prev_hash must be None) and interior deletion. Assumes `rows` is in
-    # chain_seq order (as documented above). Does NOT detect tail truncation,
-    # which leaves the remaining chain self-consistent.
-    linkage_broken = bool(rows) and rows[0].record.prev_hash is not None
-    for i in range(1, len(rows)):
-        if rows[i].record.prev_hash != rows[i - 1].record.hmac:
-            linkage_broken = True
-            break
-
-    if failed > 0 or linkage_broken:
+    # NOTE: this verifier does per-row HMAC only, deliberately NO prev_hash
+    # linkage / genesis (deletion) check. Its caller feeds a bounded window of
+    # rows ordered by the GLOBAL chain_seq that spans MULTIPLE sessions, while
+    # the prev_hash chain is per-session — so a naive cross-row linkage check
+    # would false-positive at every session boundary and at the window's head.
+    # Deletion detection is session-scoped and lives in verify_chain /
+    # verify_chain_records / the `governance verify` CLI (each given one
+    # session's full chain). Here we only need per-row tamper detection under
+    # the correct (possibly rotated) key.
+    if failed > 0:
         status = "failed"
     elif unverified > 0:
         status = "unverified"
