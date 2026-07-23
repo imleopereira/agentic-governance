@@ -131,12 +131,20 @@ class PresenceModule:
         async with self._lock:
             existing = self._agents.get(agent_id)
             started = existing["started_at"] if existing else now
+            # SECURITY (self-unhalt defense): carry the halt marker forward
+            # like started_at. The heartbeat rewrites 'metadata' wholesale,
+            # so the marker must live at the top level — outside 'metadata'
+            # — exactly as it lives in dedicated DB columns the heartbeat
+            # UPSERT never touches. A heartbeat must never clear a halt.
             self._agents[agent_id] = {
                 "status": AgentStatus.LIVE.value,
                 "last_heartbeat": now,
                 "started_at": started,
                 "metadata": metadata or {},
                 "operator_id": operator_id,
+                "halted_by": existing.get("halted_by") if existing else None,
+                "halted_at": existing.get("halted_at") if existing else None,
+                "halt_reason": existing.get("halt_reason") if existing else None,
             }
 
     async def _heartbeat_postgres(
@@ -159,6 +167,11 @@ class PresenceModule:
                         "(agent_id, status, last_heartbeat, started_at, metadata_json, operator_id) "
                         "VALUES (:agent_id, 'live', NOW(), NOW(), CAST(:meta AS jsonb), :operator_id) "
                         "ON CONFLICT (agent_id) DO UPDATE SET "
+                        # SECURITY (self-unhalt defense): halted_by /
+                        # halted_at / halt_reason are intentionally NOT in
+                        # this SET list, so a heartbeat can never clear a
+                        # halt. The app/agent role also has UPDATE on those
+                        # columns revoked at the grant level (see ddl.sql).
                         "status = 'live', last_heartbeat = NOW(), "
                         "metadata_json = CAST(:meta AS jsonb), "
                         "operator_id = :operator_id"
@@ -327,6 +340,95 @@ class PresenceModule:
                 error_type=type(exc).__name__,
             )
 
+    async def halt(
+        self,
+        agent_id: str,
+        *,
+        halted_by: str,
+        reason: str | None = None,
+    ) -> None:
+        """Write the operator halt marker for ``agent_id``.
+
+        This is the SDK-side equivalent of the console
+        ``POST /api/agents/{agent_id}/halt`` endpoint. The marker is
+        written to the dedicated ``halted_by`` / ``halted_at`` /
+        ``halt_reason`` columns — NOT into ``metadata_json`` — so the
+        agent's own heartbeat (which rewrites ``metadata_json`` wholesale)
+        can never erase it. See the self-unhalt defense notes in
+        ``ddl.sql``.
+
+        In production this runs as the privileged console/halt role. The
+        ordinary application/agent role has UPDATE on the halt-marker
+        columns revoked at the grant level, so only a privileged role can
+        actually persist a halt.
+
+        Args:
+            agent_id: Unique identifier for the agent to halt.
+            halted_by: Operator identity recorded on the marker.
+            reason: Optional free-text halt reason.
+        """
+        engine = self._get_engine()
+        if engine is not None:
+            await self._halt_postgres(engine, agent_id, halted_by, reason)
+        else:
+            await self._halt_memory(agent_id, halted_by, reason)
+
+    async def _halt_memory(
+        self,
+        agent_id: str,
+        halted_by: str,
+        reason: str | None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            data = self._agents.get(agent_id)
+            if data is None:
+                # Halt a not-yet-seen agent so the marker is in place the
+                # moment it first heartbeats. Mirrors the DB path, which
+                # would no-op on a missing row; here we materialise a
+                # minimal row carrying only the marker.
+                now_dt = datetime.now(timezone.utc)
+                data = {
+                    "status": AgentStatus.LIVE.value,
+                    "last_heartbeat": now_dt,
+                    "started_at": now_dt,
+                    "metadata": {},
+                    "operator_id": None,
+                }
+                self._agents[agent_id] = data
+            # Marker lives at the top level, outside 'metadata', so the
+            # heartbeat's wholesale metadata rewrite cannot clear it.
+            data["halted_by"] = halted_by
+            data["halted_at"] = now
+            data["halt_reason"] = reason
+
+    async def _halt_postgres(
+        self,
+        engine: Any,
+        agent_id: str,
+        halted_by: str,
+        reason: str | None,
+    ) -> None:
+        from sqlalchemy import text
+
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE governance_agent_presence "
+                        "SET halted_by = :by, halted_at = NOW(), "
+                        "halt_reason = :reason "
+                        "WHERE agent_id = :aid"
+                    ),
+                    {"by": halted_by, "reason": reason, "aid": agent_id},
+                )
+        except Exception as exc:
+            logger.error(
+                "presence.halt_failed",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+            )
+
     # ------------------------------------------------------------------
     # Halt switch (v0.5.4 hotfix; renamed from "kill" → "halt" in v0.6 F2.5)
     # ------------------------------------------------------------------
@@ -443,13 +545,29 @@ class PresenceModule:
         out: dict[str, dict[str, Any]] = {}
         for aid, data in self._agents.items():
             meta = data.get("metadata") or {}
-            halted_by = meta.get("_halted_by") or meta.get("_killed_by")
+            # Prefer the dedicated top-level marker (written by halt(),
+            # carried across heartbeats), then fall back to the legacy
+            # metadata keys (_halted_* v0.6, _killed_* v0.5.x) for one
+            # release. Back-compat branch removed in v0.7.
+            halted_by = (
+                data.get("halted_by")
+                or meta.get("_halted_by")
+                or meta.get("_killed_by")
+            )
             if halted_by is None:
                 continue
             out[aid] = {
                 "halted_by": halted_by,
-                "halted_at": meta.get("_halted_at") or meta.get("_killed_at"),
-                "reason": meta.get("_halt_reason") or meta.get("_kill_reason"),
+                "halted_at": (
+                    data.get("halted_at")
+                    or meta.get("_halted_at")
+                    or meta.get("_killed_at")
+                ),
+                "reason": (
+                    data.get("halt_reason")
+                    or meta.get("_halt_reason")
+                    or meta.get("_kill_reason")
+                ),
             }
         return out
 
@@ -458,10 +576,13 @@ class PresenceModule:
     ) -> dict[str, dict[str, Any]]:
         """Query DB for all currently-halted agents.
 
-        SELECT agent_id + the three halt metadata fields. Reads BOTH key
-        families (``_halted_*`` written by v0.6, ``_killed_*`` written by
-        v0.5.x) via COALESCE so an SDK upgrade without a console upgrade
-        still fails closed. v0.7 drops the COALESCE fallback.
+        Prefers the dedicated ``halted_by`` / ``halted_at`` /
+        ``halt_reason`` columns (the revoke-protected halt marker written
+        by the console / :meth:`halt`), then falls back to the legacy
+        metadata keys (``_halted_*`` written by v0.6, ``_killed_*``
+        written by v0.5.x) via COALESCE so an SDK upgrade without a
+        console/migration upgrade still fails closed. v0.7 drops the
+        metadata fallback.
         """
         from sqlalchemy import text
 
@@ -469,14 +590,18 @@ class PresenceModule:
             res = await conn.execute(
                 text(
                     "SELECT agent_id, "
-                    "       COALESCE(metadata_json->>'_halted_by', "
+                    "       COALESCE(halted_by, "
+                    "                metadata_json->>'_halted_by', "
                     "                metadata_json->>'_killed_by') AS halted_by, "
-                    "       COALESCE(metadata_json->>'_halted_at', "
+                    "       COALESCE(halted_at::text, "
+                    "                metadata_json->>'_halted_at', "
                     "                metadata_json->>'_killed_at') AS halted_at, "
-                    "       COALESCE(metadata_json->>'_halt_reason', "
+                    "       COALESCE(halt_reason, "
+                    "                metadata_json->>'_halt_reason', "
                     "                metadata_json->>'_kill_reason') AS reason "
                     "FROM governance_agent_presence "
-                    "WHERE metadata_json->>'_halted_by' IS NOT NULL "
+                    "WHERE halted_by IS NOT NULL "
+                    "   OR metadata_json->>'_halted_by' IS NOT NULL "
                     "   OR metadata_json->>'_killed_by' IS NOT NULL"
                 )
             )
