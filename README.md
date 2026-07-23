@@ -244,9 +244,7 @@ application already has.
 - HMAC-SHA256 chain on every audit event (fork-detecting; chain integrity verified on-demand or on each read)
 - Self-approval prevention on HITL gates (fail-closed)
 - 13-point security checklist on every feature
-- PBKDF2-HMAC-SHA256 password hashing (600k iterations)
 - Pydantic strict models with size caps throughout
-- Login rate limiting (5 attempts/IP/60s)
 - Constant-time token comparison
 - All SQL parameterized (zero injection vectors)
 - Error messages sanitized (no DB URLs, SQL, or internal paths leak)
