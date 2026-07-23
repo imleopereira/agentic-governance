@@ -16,7 +16,7 @@ from typing import Any
 
 import structlog
 
-from .errors import AgentHaltedError
+from .errors import AgentHaltedError, HaltPersistenceError
 from .models import AgentStatus
 
 logger = structlog.get_logger(__name__)
@@ -41,10 +41,18 @@ class PresenceModule:
         *,
         database_url: str | None = None,
         engine: Any = None,
+        halt_engine: Any = None,
     ) -> None:
         self._database_url = database_url
         self._engine: Any = engine
         self._owns_engine = False
+        # Optional PRIVILEGED engine used ONLY for the halt WRITE path. When
+        # the self-unhalt REVOKE is applied (ddl.sql), the shared app/agent
+        # engine cannot UPDATE the halt-marker columns, so halt() must run
+        # under a role that can. When None, halt() falls back to the shared
+        # engine (correct for single-role deployments that do NOT apply the
+        # REVOKE). Never used for reads or the agent hot path.
+        self._halt_engine: Any = halt_engine
         # In-memory fallback: {agent_id: {status, last_heartbeat, started_at, metadata}}
         self._agents: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -75,6 +83,18 @@ class PresenceModule:
         )
         self._owns_engine = True
         return self._engine
+
+    def _get_halt_engine(self) -> Any:
+        """Return the privileged halt engine if configured, else the shared engine.
+
+        The halt WRITE runs here so it can use a role that retains UPDATE on
+        the halt-marker columns even when the agent's shared role has them
+        REVOKE'd. Reads and the enforcement hot path always use the shared
+        engine (_get_engine).
+        """
+        if self._halt_engine is not None:
+            return self._halt_engine
+        return self._get_engine()
 
     _MAX_AGENT_ID_LEN = 256
     _MAX_METADATA_BYTES = 65536
@@ -365,17 +385,33 @@ class PresenceModule:
         halted row cannot be deleted. See the self-unhalt defense notes in
         ``ddl.sql``.
 
-        In production this runs as the privileged halt role. The ordinary
-        application/agent role has UPDATE on the halt-marker columns revoked
-        at the grant level, so only a privileged role can actually persist
-        a halt.
+        Deployment (see ddl.sql for the two supported models):
+
+          * Single-role (agent cannot issue raw SQL): do NOT apply the
+            self-unhalt column REVOKE. The write runs under the shared engine;
+            self-unhalt is still blocked by the BEFORE DELETE trigger and by
+            the fact that no SDK method clears a halt.
+          * Hardened / multi-role (agent CAN issue raw SQL): apply the column
+            REVOKE to the agent role and give this module a PRIVILEGED
+            ``halt_engine`` (``presence_halt_database_url`` at the SDK level).
+            The agent role then cannot self-unhalt, and this write runs under
+            the privileged role that can.
+
+        If the REVOKE is applied but no privileged ``halt_engine`` is
+        configured, the write is denied and this method raises
+        :class:`HaltPersistenceError` — it never returns a false success on a
+        kill-switch write.
 
         Args:
             agent_id: Unique identifier for the agent to halt.
             halted_by: Operator identity recorded on the marker.
             reason: Optional free-text halt reason.
+
+        Raises:
+            HaltPersistenceError: the halt write failed or was denied, so the
+                halt did NOT engage.
         """
-        engine = self._get_engine()
+        engine = self._get_halt_engine()
         if engine is not None:
             await self._halt_postgres(engine, agent_id, halted_by, reason)
         else:
@@ -424,11 +460,9 @@ class PresenceModule:
                 # UPSERT, not a bare UPDATE. An operator may halt an agent
                 # that has not heartbeated yet (no row) or whose row is being
                 # deleted by a concurrent close_agent(); a plain UPDATE would
-                # affect 0 rows and the halt would silently not persist, so
-                # halt() would return a false success on a kill-switch write.
-                # The halt runs as the privileged halt role, which holds
-                # INSERT + full UPDATE (the app/agent role has the halt-marker
-                # columns revoked). ON CONFLICT re-halts an existing row.
+                # affect 0 rows. ON CONFLICT re-halts an existing row. This
+                # runs under the halt engine (privileged when the self-unhalt
+                # REVOKE is applied; the shared engine otherwise).
                 result = await conn.execute(
                     text(
                         "INSERT INTO governance_agent_presence "
@@ -441,20 +475,35 @@ class PresenceModule:
                     {"by": halted_by, "reason": reason, "aid": agent_id},
                 )
                 rowcount = result.rowcount
-            if rowcount == 0:
-                # Unreachable for an UPSERT (INSERT-or-UPDATE always touches a
-                # row); a 0-row result means the marker did not persist, so
-                # surface it loudly rather than returning a false success.
-                logger.error(
-                    "presence.halt_not_persisted",
-                    agent_id=agent_id,
-                    halted_by=halted_by,
-                )
         except Exception as exc:
+            # A kill-switch write that fails MUST be loud, never a false
+            # success. The usual cause under the hardened config is a denied
+            # UPDATE on the halt columns (the agent role is REVOKE'd and no
+            # privileged halt engine was configured). Raise so the operator
+            # knows the halt did NOT engage. (halt() is operator-facing, off
+            # the agent hot path, so raising here does not violate Invariant #1.)
             logger.error(
                 "presence.halt_failed",
                 error_type=type(exc).__name__,
                 agent_id=agent_id,
+            )
+            raise HaltPersistenceError(
+                f"Failed to persist halt for agent {agent_id!r} "
+                f"({type(exc).__name__}). If the self-unhalt REVOKE is applied, "
+                f"halt() must run under a privileged connection "
+                f"(PresenceModule(halt_engine=...) / presence_halt_database_url)."
+            ) from exc
+        if rowcount == 0:
+            # Unreachable for an UPSERT (INSERT-or-UPDATE always touches a row);
+            # a 0-row result means the marker did not persist.
+            logger.error(
+                "presence.halt_not_persisted",
+                agent_id=agent_id,
+                halted_by=halted_by,
+            )
+            raise HaltPersistenceError(
+                f"Halt for agent {agent_id!r} affected 0 rows; the marker did "
+                f"not persist."
             )
 
     # ------------------------------------------------------------------
@@ -462,10 +511,11 @@ class PresenceModule:
     # ------------------------------------------------------------------
     #
     # The halt switch is the single fail-closed control an operator has over
-    # a running agent. An operator halt (see :meth:`halt`, run as the
-    # privileged halt role) writes the marker into the dedicated
-    # `governance_agent_presence.halted_by` / `halted_at` / `halt_reason`
-    # columns. THIS module is the SDK-side enforcement of that marker.
+    # a running agent. An operator halt (see :meth:`halt`, run under the halt
+    # engine — a privileged connection in a hardened deployment) writes the
+    # marker into the dedicated `governance_agent_presence.halted_by` /
+    # `halted_at` / `halt_reason` columns. THIS module is the SDK-side
+    # enforcement of that marker.
     #
     # SECURITY (self-unhalt defense): the marker lives ONLY in those
     # dedicated columns, never in `metadata_json`. The agent's own heartbeat

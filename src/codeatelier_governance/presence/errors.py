@@ -2,7 +2,10 @@
 
 Public API:
     AgentHaltedError — raised when an action is attempted by an agent that
-                       an operator has halted via the console halt switch.
+                       an operator has halted (see PresenceModule.halt).
+    HaltPersistenceError — raised when an operator halt could not be persisted
+                       (e.g. the write was denied), so the kill switch did NOT
+                       engage.
 
 Backward-compat alias (removed in v0.7):
     AgentKilledError — alias for AgentHaltedError. Existing v0.5.x imports
@@ -14,8 +17,9 @@ from __future__ import annotations
 class AgentHaltedError(RuntimeError):
     """Raised when an agent action is blocked because the agent has been halted.
 
-    The halt switch is set via the console (`POST /api/agents/{agent_id}/halt`)
-    or the SDK admin API. Once an agent is halted:
+    The halt switch is set via :meth:`PresenceModule.halt` (an operator or
+    admin action, ideally through a privileged connection). Once an agent is
+    halted:
 
       * scope.check() raises this for every subsequent call
       * cost.check_budget() raises this
@@ -24,10 +28,10 @@ class AgentHaltedError(RuntimeError):
         before the call hits the network
 
     The only way to "un-halt" an agent is for an operator to clear the
-    halt marker in `governance_agent_presence.metadata_json` (e.g. via SQL
-    or via a future console "Restore" action). This exception is intentionally
-    NOT recoverable from inside the host application — halt is a human-issued,
-    human-resolved control.
+    dedicated halt columns (`halted_by` / `halted_at` / `halt_reason`) on
+    `governance_agent_presence`, via a privileged connection the agent role
+    does not have. This exception is intentionally NOT recoverable from inside
+    the host application — halt is a human-issued, human-resolved control.
 
     Attributes:
         agent_id: The agent that was halted.
@@ -68,7 +72,8 @@ class AgentHaltedError(RuntimeError):
             parts.append(f": {reason}")
         parts.append(
             ". All scope, cost, gate, and LLM-call enforcement is now fail-closed "
-            "for this agent. Clear the halt marker via the console or SQL to restore."
+            "for this agent. Clear the dedicated halt columns via a privileged "
+            "connection to restore."
         )
         super().__init__(" ".join(parts))
 
@@ -92,3 +97,17 @@ class AgentHaltedError(RuntimeError):
 # names refer to the same class, so `isinstance(err, AgentKilledError)`
 # and `err.__class__ is AgentHaltedError` are both True.
 AgentKilledError = AgentHaltedError
+
+
+class HaltPersistenceError(RuntimeError):
+    """Raised when an operator halt could not be persisted.
+
+    :meth:`PresenceModule.halt` raises this instead of returning a false
+    success when the halt write fails or is denied — for example, the
+    app/agent role lacks UPDATE on the halt-marker columns because it runs
+    under the self-unhalt REVOKE and no privileged halt connection was
+    configured. A kill switch that silently no-ops is worse than one that
+    errors loudly: this makes the operator aware the halt did NOT engage so
+    they can retry through a privileged connection (see
+    ``PresenceModule(halt_engine=...)`` / ``presence_halt_database_url``).
+    """

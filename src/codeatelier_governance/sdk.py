@@ -83,6 +83,17 @@ class GovernanceConfig:
     # Enabled by default.  Set to False to skip PresenceModule construction;
     # sdk.presence will not exist and any call to it raises AttributeError.
     enable_presence: bool = True
+    # Optional PRIVILEGED DSN used ONLY for the operator halt WRITE
+    # (sdk.presence.halt). In a hardened deployment the agent runs under a role
+    # whose UPDATE on the halt-marker columns is REVOKE'd (so it cannot
+    # self-unhalt), which also means the shared app engine cannot WRITE a halt.
+    # Point this at a role that retains UPDATE on those columns so the operator
+    # kill switch actually persists. Env-var equivalent GOVERNANCE_HALT_DATABASE_URL
+    # is resolved in __init__. When unset, halt() uses the shared engine (correct
+    # for single-role deployments that do NOT apply the REVOKE); if the REVOKE is
+    # applied without this DSN, halt() raises HaltPersistenceError instead of a
+    # false success. Reads / the enforcement hot path never use this engine.
+    presence_halt_database_url: str | None = None
     # Routing is an advisory feature that can mutate the model on an LLM
     # call.  It is OFF by default — enable it explicitly at SDK construction
     # time AND register at least one RoutingPolicy for it to take effect on
@@ -319,6 +330,27 @@ class GovernanceSDK:
                 connect_args={"command_timeout": 5},
             )
 
+        # Optional PRIVILEGED engine for the operator halt WRITE only (see
+        # GovernanceConfig.presence_halt_database_url). Resolved from config or
+        # the GOVERNANCE_HALT_DATABASE_URL env var. Kept separate from the
+        # shared engine so the agent's REVOKE'd role cannot self-unhalt while
+        # the operator halt still persists under a privileged role.
+        self._halt_engine: Any = None
+        _halt_dsn = self.config.presence_halt_database_url or os.environ.get(
+            "GOVERNANCE_HALT_DATABASE_URL"
+        )
+        if _halt_dsn is not None:
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            self._halt_engine = create_async_engine(
+                normalize_db_url(_halt_dsn, component="sdk-halt"),
+                pool_pre_ping=True,
+                pool_size=2,
+                max_overflow=5,
+                pool_timeout=3,
+                connect_args={"command_timeout": 5},
+            )
+
         # ------------------------------------------------------------------
         # Audit substrate (always constructed because every other module
         # needs it to log events).  When ``enable_audit=False`` the audit
@@ -495,6 +527,7 @@ class GovernanceSDK:
         if self.config.enable_presence:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
+                halt_engine=self._halt_engine,
             )
             # v0.5.4 halt switch wiring (renamed from "kill" in v0.6),
             # expanded in v0.6.2 P0 to every enforcement module. When an
@@ -1092,6 +1125,10 @@ class GovernanceSDK:
         if self._shared_engine is not None:
             await self._shared_engine.dispose()
             self._shared_engine = None
+        # Dispose the optional privileged halt engine.
+        if self._halt_engine is not None:
+            await self._halt_engine.dispose()
+            self._halt_engine = None
 
     # ------------------------------------------------------------------
     # Stable public API: audit chain verification

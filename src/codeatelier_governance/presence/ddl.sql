@@ -38,11 +38,27 @@ CREATE TABLE IF NOT EXISTS governance_agent_presence (
 -- unwritable by PUBLIC, so an agent running under the app role can never
 -- clear its own halt — the write is rejected at the grant level.
 --
--- Deployments using an explicit application role that holds direct
--- grants must ALSO REVOKE UPDATE on halted_by/halted_at/halt_reason from
--- that role (same runbook caveat as the audit-events REVOKE in
--- migration 978884c6b7f1). The privileged console/halt role retains
--- table-wide UPDATE and is the only writer of the halt marker.
+-- SELF-UNHALT DEFENSE — TWO DEPLOYMENT MODELS. The invariant is enforced by
+-- two independent mechanisms: this column REVOKE (an agent with raw SQL
+-- cannot UPDATE halted_by=NULL) and the BEFORE DELETE trigger below (a
+-- halted row cannot be deleted-then-reinserted).
+--
+--   1. SINGLE-ROLE (the agent cannot issue arbitrary SQL; it only calls SDK
+--      methods): this REVOKE is OPTIONAL. No SDK method clears a halt and the
+--      DELETE trigger blocks close-then-reinsert, so the halt is safe without
+--      it, and halt() writes succeed under the shared app role. If you keep
+--      the REVOKE you MUST also configure a privileged halt connection (model
+--      2), or halt() writes are denied and raise HaltPersistenceError — never
+--      a false success.
+--   2. HARDENED / MULTI-ROLE (the agent CAN issue raw SQL, e.g. a SQL tool or
+--      a compromised agent): apply this REVOKE to the AGENT role AND give the
+--      SDK a PRIVILEGED halt connection — GovernanceConfig
+--      presence_halt_database_url / GOVERNANCE_HALT_DATABASE_URL, used by
+--      PresenceModule ONLY for the halt write. The agent role then cannot
+--      self-unhalt; the privileged role is the sole writer of the marker.
+--      Deployments using an explicit application role with direct grants must
+--      ALSO REVOKE UPDATE on the halt columns from that role (same runbook
+--      caveat as the audit-events REVOKE in migration 978884c6b7f1).
 REVOKE UPDATE ON governance_agent_presence FROM PUBLIC;
 GRANT UPDATE (status, last_heartbeat, metadata_json, operator_id)
     ON governance_agent_presence TO PUBLIC;
