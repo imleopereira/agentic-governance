@@ -106,43 +106,67 @@ async def test_report_generator_defaults_to_last_1000(
 ) -> None:
     """ReportGenerator._run_chain_verification windows by default.
 
-    Logs 1500 events and confirms that the default chain-verification
-    scopes to the most recent ``_CHAIN_VERIFY_WINDOW`` (1000) events by
-    inspecting the arguments passed to ``verify_chain``.
+    Logs 1500 events and confirms the default chain-verification scopes to the
+    most recent ``_CHAIN_VERIFY_WINDOW`` (1000) events, by inspecting the
+    window bounds the verifier returns.
     """
     await _log_n(audit, 1500)
 
     generator = ReportGenerator(
         audit_store=audit_store, audit_module=audit
     )
-    seen_args: dict[str, int | None] = {}
-
-    original = audit.verify_chain
-
-    async def _spy(
-        *,
-        from_seq=None,
-        to_seq=None,
-        session_id=None,
-    ):  # type: ignore[no-untyped-def]
-        seen_args["from_seq"] = from_seq
-        seen_args["to_seq"] = to_seq
-        return await original(
-            from_seq=from_seq, to_seq=to_seq, session_id=session_id
-        )
-
-    audit.verify_chain = _spy  # type: ignore[assignment,method-assign]
-    try:
-        status, fs, ts, _rot, _unres = (
-            await generator.run_chain_verification_windowed()
-        )
-    finally:
-        audit.verify_chain = original  # type: ignore[method-assign]
+    status, fs, ts, _rot, _unres = (
+        await generator.run_chain_verification_windowed()
+    )
 
     assert status == "verified"
-    assert seen_args["from_seq"] is not None
-    assert seen_args["to_seq"] is not None
+    assert fs is not None and ts is not None
     # Window size must be exactly 1000 (inclusive bounds => 999 delta).
-    assert seen_args["to_seq"] - seen_args["from_seq"] == 999  # type: ignore[operator]
-    # And it must be anchored at the head of the chain.
-    assert seen_args["to_seq"] == 1499
+    assert ts - fs == 999
+    # And it must be anchored at the head of the chain (0-based index 1499).
+    assert ts == 1499
+
+
+async def _log_session(audit: AuditModule, n: int, agent: str = "agent-a"):  # type: ignore[no-untyped-def]
+    """Log ``n`` events into one fresh session; return the session_id."""
+    sid = uuid4()
+    for i in range(n):
+        await audit.log(AuditEvent(agent_id=agent, kind=f"ev.{i}", session_id=sid))
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_compliance_detects_interior_deletion(
+    audit_store: InMemoryAuditStore, audit: AuditModule
+) -> None:
+    """The Article 12 verify must FAIL a chain with a deleted interior event.
+
+    This is the round-3 blocker: per-row HMAC alone leaves survivors valid, so
+    the per-session prev_hash->hmac linkage is what catches the deletion.
+    """
+    sid = await _log_session(audit, 5)
+    generator = ReportGenerator(audit_store=audit_store, audit_module=audit)
+
+    status, *_ = await generator.run_chain_verification_windowed()
+    assert status == "verified"  # intact chain verifies
+
+    # Delete an interior event (index 2) directly from the in-memory store.
+    ids = list(audit_store._by_session[sid])
+    del audit_store._events[ids[2]]
+    audit_store._by_session[sid] = ids[:2] + ids[3:]
+
+    status, *_ = await generator.run_chain_verification_windowed()
+    assert status == "failed"  # linkage catches the gap left by the deletion
+
+
+@pytest.mark.asyncio
+async def test_compliance_no_false_alarm_on_intact_multi_session(
+    audit_store: InMemoryAuditStore, audit: AuditModule
+) -> None:
+    """Two intact sessions must verify (no cross-session-boundary false alarm)."""
+    await _log_session(audit, 4)
+    await _log_session(audit, 4)
+    generator = ReportGenerator(audit_store=audit_store, audit_module=audit)
+
+    status, *_ = await generator.run_chain_verification_windowed()
+    assert status == "verified"

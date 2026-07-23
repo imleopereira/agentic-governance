@@ -715,6 +715,28 @@ class AuditModule:
 
         return True
 
+    async def list_all_records(self) -> list[AuditEventRecord]:
+        """Return every stored record in chain (insertion) order.
+
+        In-memory stores only: flattens all sessions in insertion order. A store
+        without an in-memory index (e.g. PostgresAuditStore) returns ``[]`` —
+        callers that need Postgres rows should query them directly. Used by the
+        compliance report's in-memory verification fallback so it can verify
+        per-session instead of cross-session.
+        """
+        store = self._store
+        if not hasattr(store, "_events"):
+            return []
+        from .store import InMemoryAuditStore
+
+        mem: InMemoryAuditStore = store  # type: ignore[assignment]
+        records: list[AuditEventRecord] = []
+        for sid_key in mem._by_session:
+            for eid in mem._by_session[sid_key]:
+                if eid in mem._events:
+                    records.append(mem._events[eid])
+        return records
+
     def verify_events_hmac(self, records: list[AuditEventRecord]) -> bool:
         """Verify ONLY each record's HMAC (no linkage / genesis check).
 
