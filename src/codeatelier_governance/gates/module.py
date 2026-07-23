@@ -14,9 +14,10 @@ Threat model handled:
     * Replay: tokens are single-use; resolved set tracks consumed request_ids.
     * Tampering with action_hash: hmac binds request_id+action_hash+expires_at.
     * Race between two grants: per-module asyncio.Lock serializes resolution.
-    * Self-approval: tokens have to come from outside the agent's process —
-      v0.1 documents this as an operator responsibility (no built-in identity
-      gate; pluggable in v0.2).
+    * Self-approval: NOT prevented in-SDK. There is no built-in approver-
+      identity gate; the same principal can request and resolve an approval.
+      Route approval to a human outside the agent's process (operator
+      responsibility). See the Threat Model.
 """
 from __future__ import annotations
 

@@ -11,12 +11,14 @@ Usage::
 
 Internal SDK failures never raise to LangChain: every callback body is wrapped
 in try/except that logs and continues. Enforcement is the exception. An
-operator halt (``AgentHaltedError``) ALWAYS raises to stop the tool — the kill
-switch is unconditional, even when ``enforce=False``. With ``enforce=True``, a
-scope violation or default-deny (no scope policy registered) also raises: on
-the async callbacks always, and on sync callbacks outside a running event loop.
-Inside a running loop a sync callback cannot block, so enforcement there
-degrades to log-and-warn; use the async callbacks for guaranteed enforcement.
+operator halt (``AgentHaltedError``) raises to stop the tool even when
+``enforce=False`` (the kill switch is not gated on enforce); with
+``enforce=True`` a scope violation or default-deny (no scope policy registered)
+also raises. BOTH block reliably on the async callbacks and on sync callbacks
+run OUTSIDE a running event loop. Inside a running loop a sync callback cannot
+block, so it degrades to log-and-warn there (the check still runs and the
+violation is still logged, but the tool is not stopped inline); use the async
+callbacks for guaranteed enforcement, including the halt.
 """
 from __future__ import annotations
 
@@ -100,13 +102,15 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     failures are logged and swallowed so the handler never breaks the host
     agent. Enforcement is the exception:
 
-      * An operator halt (``AgentHaltedError``) ALWAYS raises to stop the tool
-        — the kill switch is unconditional, even when ``enforce=False``.
+      * An operator halt (``AgentHaltedError``) raises to stop the tool even
+        when ``enforce=False`` (the kill switch is not gated on enforce).
       * With ``enforce=True``, a scope violation or default-deny (no policy
-        registered for the agent) also raises. These block reliably on the
-        async callbacks (``aon_tool_start`` …) and on sync callbacks outside a
-        running event loop; inside a running loop a sync callback cannot block
-        and degrades to log-and-warn.
+        registered for the agent) also raises.
+      * Both block reliably on the async callbacks (``aon_tool_start`` …) and
+        on sync callbacks run OUTSIDE a running event loop. Inside a running
+        loop a sync callback cannot block, so it degrades to log-and-warn
+        there; use the async callbacks for guaranteed enforcement (halt
+        included).
 
     Args:
         sdk: The initialized GovernanceSDK instance.

@@ -306,7 +306,7 @@ All options are passed as keyword arguments to `GovernanceSDK(...)` and stored o
 | `enable_gates` | `True` | HITL approval gates. When `False`, `sdk.gates` is not constructed. |
 | `enable_loop` | `True` | Loop detection. When `False`, `sdk.loop` is not constructed. |
 | `enable_presence` | `True` | Agent heartbeat tracking. When `False`, `sdk.presence` is not constructed. |
-| `enable_prompts` | `True` | Reserved for Prompt Versioning (not yet fully implemented). Forward-compatibility flag — set to `False` only if the stub module causes issues. |
+| `enable_prompts` | `True` | Reserved for a future Prompt Versioning module (not yet implemented). Forward-compatibility flag; read by no code today. |
 | `enable_routing` | `False` | Advisory model routing — substitutes a different model based on registered policies. Off by default to prevent silent model substitution. Requires `enable_cost=True`. |
 
 ### Audit options
