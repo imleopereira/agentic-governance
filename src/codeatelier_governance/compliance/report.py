@@ -839,10 +839,13 @@ class ReportGenerator:
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
                 Over the verified window it detects in-place tampering (per-row
-                HMAC), interior deletion, and reordering (per-session
-                prev_hash->hmac linkage). It does NOT detect head or tail
-                truncation over a window; full-chain deletion detection is the
-                per-session ``governance verify`` CLI's job. Requires
+                HMAC), interior deletion, reordering (per-session
+                prev_hash->hmac linkage), and head-of-session (genesis) deletion
+                when the window starts at the chain head. It does NOT detect
+                whole-session deletion, tail truncation, or events deleted
+                entirely before the window (fundamental hash-chain limits that
+                need an external high-water-mark); the covered range is disclosed
+                via ``chain_verified_from_seq`` / ``_to_seq``. Requires
                 ``audit_module`` to be set. Default ``False``.
 
         Raises:
@@ -957,10 +960,13 @@ class ReportGenerator:
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
                 Over the verified window it detects in-place tampering (per-row
-                HMAC), interior deletion, and reordering (per-session
-                prev_hash->hmac linkage). It does NOT detect head or tail
-                truncation over a window; full-chain deletion detection is the
-                per-session ``governance verify`` CLI's job. Requires
+                HMAC), interior deletion, reordering (per-session
+                prev_hash->hmac linkage), and head-of-session (genesis) deletion
+                when the window starts at the chain head. It does NOT detect
+                whole-session deletion, tail truncation, or events deleted
+                entirely before the window (fundamental hash-chain limits that
+                need an external high-water-mark); the covered range is disclosed
+                via ``chain_verified_from_seq`` / ``_to_seq``. Requires
                 ``audit_module`` to be set. Default ``False``.
 
         Raises:
