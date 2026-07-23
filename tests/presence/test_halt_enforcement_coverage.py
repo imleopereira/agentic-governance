@@ -46,20 +46,21 @@ from codeatelier_governance.scope.module import ScopeModule
 
 
 async def _halt_in_memory(presence: PresenceModule, agent_id: str) -> None:
-    """Simulate the console halt_agent endpoint against the in-memory store.
+    """Halt an agent in the in-memory store via the dedicated marker.
 
-    Mirrors the helper in ``test_halt_switch.py`` so these tests are
-    behaviour-locked to the same marker schema the console writes.
+    Mirrors the helper in ``test_halt_switch.py``: sets the top-level
+    ``halted_by`` / ``halted_at`` / ``halt_reason`` keys (the in-memory
+    analogue of the revoke-protected DB columns), behaviour-locked to the
+    v0.7 columns-only marker schema.
     """
     async with presence._lock:
         if agent_id not in presence._agents:
             raise RuntimeError(
                 f"agent {agent_id!r} not in presence; call heartbeat() first"
             )
-        meta = presence._agents[agent_id].setdefault("metadata", {})
-        meta["_halted_by"] = "test-operator"
-        meta["_halted_at"] = datetime.now(timezone.utc).isoformat()
-        meta["_halt_reason"] = "v0.6.2 halt enforcement coverage"
+        presence._agents[agent_id]["halted_by"] = "test-operator"
+        presence._agents[agent_id]["halted_at"] = datetime.now(timezone.utc).isoformat()
+        presence._agents[agent_id]["halt_reason"] = "v0.6.2 halt enforcement coverage"
         presence._agents[agent_id]["status"] = AgentStatus.UNRESPONSIVE.value
     await presence.force_refresh_halted_cache()
 

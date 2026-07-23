@@ -96,3 +96,25 @@ async def test_close_agent_after_halt_cannot_clear_halt(
     with pytest.raises(AgentHaltedError) as exc_info:
         await presence.assert_not_halted("agent-1")
     assert exc_info.value.halted_by == "leo"
+
+
+@pytest.mark.asyncio
+async def test_halt_before_first_heartbeat_persists(
+    presence: PresenceModule,
+) -> None:
+    """Halting an agent that has never heartbeated must persist the halt.
+
+    On the Postgres path a bare UPDATE would affect 0 rows (no row exists
+    yet) and the halt would silently not take; _halt_postgres is an UPSERT
+    so the marker lands, and the in-memory path materialises a minimal row.
+    Either way the agent is halted the moment it first appears, and its first
+    heartbeat must not clear the halt.
+    """
+    # No heartbeat first: halt an agent that has never been seen.
+    await presence.halt("ghost", halted_by="leo", reason="pre-emptive")
+    await presence.force_refresh_halted_cache()
+    assert await presence.is_halted("ghost") is True
+
+    await presence.heartbeat("ghost", metadata={"foo": "bar"})
+    await presence.force_refresh_halted_cache()
+    assert await presence.is_halted("ghost") is True
