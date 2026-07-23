@@ -339,7 +339,10 @@ class GovernanceSDK:
         _halt_dsn = self.config.presence_halt_database_url or os.environ.get(
             "GOVERNANCE_HALT_DATABASE_URL"
         )
-        if _halt_dsn is not None:
+        # Only wire the privileged halt engine when presence enforcement is on.
+        # With enable_presence=False there is no PresenceModule to run halt(),
+        # so a halt DSN would open a pool nothing ever uses.
+        if _halt_dsn is not None and self.config.enable_presence:
             from sqlalchemy.ext.asyncio import create_async_engine
 
             self._halt_engine = create_async_engine(
@@ -350,6 +353,20 @@ class GovernanceSDK:
                 pool_timeout=3,
                 connect_args={"command_timeout": 5},
             )
+            if self._shared_engine is None:
+                # Degenerate config: halt() would write the marker to the
+                # privileged DB, but is_halted reads the in-memory store and
+                # never fires. Presence enforcement needs the main
+                # GOVERNANCE_DATABASE_URL / database_url so the marker is read
+                # back from Postgres.
+                logger.warning(
+                    "presence.halt_dsn_without_main_db",
+                    detail=(
+                        "A halt DSN is set but no main database_url / shared "
+                        "engine is configured; presence enforcement needs the "
+                        "main DATABASE_URL or halts will not be read back."
+                    ),
+                )
 
         # ------------------------------------------------------------------
         # Audit substrate (always constructed because every other module
