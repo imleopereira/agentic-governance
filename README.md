@@ -242,7 +242,7 @@ application already has.
 ## Security
 
 - HMAC-SHA256 chain on every audit event (fork-detecting; chain integrity verified on-demand or on each read)
-- Self-approval prevention on HITL gates (fail-closed)
+- HITL approval gates with single-use, HMAC-bound tokens: gates block fail-closed until resolved. Self-approval is not prevented in-SDK (no built-in approver-identity gate); route approval to an out-of-process human. See Threat Model.
 - 13-point security checklist on every feature
 - Pydantic strict models with size caps throughout
 - Constant-time token comparison
