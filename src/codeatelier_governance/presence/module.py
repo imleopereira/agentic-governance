@@ -387,10 +387,15 @@ class PresenceModule:
 
         Deployment (see ddl.sql for the two supported models):
 
-          * Single-role (agent cannot issue raw SQL): do NOT apply the
-            self-unhalt column REVOKE. The write runs under the shared engine;
-            self-unhalt is still blocked by the BEFORE DELETE trigger and by
-            the fact that no SDK method clears a halt.
+          * Single-role (agent cannot issue raw SQL): the write runs under the
+            shared engine, and self-unhalt is still blocked by the BEFORE DELETE
+            trigger and by the fact that no SDK method clears a halt. Note the
+            shipped ``ddl.sql`` is hardened-by-default and applies the column
+            REVOKE unconditionally, so running it as a NON-owner role denies
+            live-agent halt() writes (HaltPersistenceError). For halt() to
+            succeed on the shared engine here you must either remove the
+            REVOKE/GRANT lines from ``ddl.sql``, run as the table owner, or set
+            a privileged halt DSN.
           * Hardened / multi-role (agent CAN issue raw SQL): apply the column
             REVOKE to the agent role and give this module a PRIVILEGED
             ``halt_engine`` (``presence_halt_database_url`` at the SDK level).
@@ -463,6 +468,17 @@ class PresenceModule:
                 # affect 0 rows. ON CONFLICT re-halts an existing row. This
                 # runs under the halt engine (privileged when the self-unhalt
                 # REVOKE is applied; the shared engine otherwise).
+                #
+                # KNOWN LIMITATION (misconfigured hardened model): the loud-
+                # failure guarantee only holds for halts of ALREADY-REGISTERED
+                # (live) agents. If the agent role is REVOKE'd but no privileged
+                # halt engine is configured, halting a NOT-YET-REGISTERED agent
+                # (no existing row) takes the INSERT branch, which the agent
+                # role still has INSERT rights for (used by the heartbeat), so
+                # the write SUCCEEDS and no HaltPersistenceError is raised even
+                # though a subsequent live-agent re-halt (UPDATE branch) would
+                # be denied. A full fix needs a privileged-only probe and is
+                # deferred.
                 result = await conn.execute(
                     text(
                         "INSERT INTO governance_agent_presence "

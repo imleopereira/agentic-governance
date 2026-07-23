@@ -161,15 +161,19 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             )
 
     async def _scope_check(self, tool_name: str) -> None:
-        """Run the halt + scope checks. Halt always raises; scope/policy under enforce.
+        """Run the halt + scope checks. Halt raises regardless of enforce; scope/policy under enforce.
 
         ``sdk.scope.check`` runs the operator-halt check first, then the scope
-        policy. The operator halt is a kill switch: it ALWAYS propagates so a
-        halted agent's tool is stopped even in observation mode (matching the
-        ``wrap_openai`` / ``wrap_anthropic`` "enforcement gate 0" behaviour).
-        A scope violation or default-deny (no policy registered for the agent)
-        propagates only when ``enforce=True``; otherwise it is logged and the
-        handler observes without blocking.
+        policy. The operator halt is a kill switch: it raises regardless of
+        ``enforce``, so it is not gated on observation mode. Like scope, though,
+        it only blocks reliably on the async callbacks and on sync callbacks run
+        OUTSIDE a running event loop; inside a running loop a sync callback
+        cannot block, so the halt degrades to log-and-warn there (the check
+        still runs and the halt is still logged, but the tool is not stopped
+        inline). A scope violation or default-deny (no policy registered for the
+        agent) propagates only when ``enforce=True``; otherwise it is logged and
+        the handler observes without blocking. Use the async callbacks for
+        guaranteed enforcement, including the halt.
         """
         try:
             await self._sdk.scope.check(self._agent_id, tool=tool_name)

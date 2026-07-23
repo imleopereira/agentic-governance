@@ -44,12 +44,19 @@ CREATE TABLE IF NOT EXISTS governance_agent_presence (
 -- halted row cannot be deleted-then-reinserted).
 --
 --   1. SINGLE-ROLE (the agent cannot issue arbitrary SQL; it only calls SDK
---      methods): this REVOKE is OPTIONAL. No SDK method clears a halt and the
---      DELETE trigger blocks close-then-reinsert, so the halt is safe without
---      it, and halt() writes succeed under the shared app role. If you keep
---      the REVOKE you MUST also configure a privileged halt connection (model
---      2), or halt() writes are denied and raise HaltPersistenceError — never
---      a false success.
+--      methods): the REVOKE below is not required for safety in this model. No
+--      SDK method clears a halt and the DELETE trigger blocks
+--      close-then-reinsert, so the halt is safe without it. NOTE: the shipped
+--      DDL is hardened-by-default and applies the REVOKE unconditionally, so a
+--      single-role deployment that runs this DDL as a NON-owner role gets every
+--      live-agent halt() DENIED (HaltPersistenceError) on the shared engine.
+--      For halt() to succeed on the shared engine in a single-role deployment
+--      you must do ONE of:
+--        (a) remove the REVOKE/GRANT lines below before running this DDL; OR
+--        (b) run under the table OWNER role (the owner keeps UPDATE regardless
+--            of the PUBLIC REVOKE); OR
+--        (c) configure a privileged halt DSN (model 2 below) that retains
+--            UPDATE on the halt columns.
 --   2. HARDENED / MULTI-ROLE (the agent CAN issue raw SQL, e.g. a SQL tool or
 --      a compromised agent): apply this REVOKE to the AGENT role AND give the
 --      SDK a PRIVILEGED halt connection — GovernanceConfig
