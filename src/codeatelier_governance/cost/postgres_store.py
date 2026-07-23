@@ -223,10 +223,16 @@ class PostgresCostStore(CostStore):
         This combines ``get_session_usage`` and ``get_agent_daily_usage``
         into one query to halve the pre-call enforcement latency.
 
-        The race condition (two concurrent checks both read $0 and both
-        pass) is mitigated by the atomic UPSERT in track() — counters
-        never go backward. FOR UPDATE is not used here because Postgres
-        does not support FOR UPDATE on the nullable side of an outer join.
+        NOTE: this is a READ used by the pre-call check, with no reservation.
+        The atomic UPSERT in track() prevents lost updates (the recorded total
+        is always correct), but it does NOT prevent OVER-ADMISSION: N concurrent
+        callers can all read the same pre-track balance, all pass the cap check,
+        then all track — overshooting the cap by up to (N-1) x per-call cost.
+        The cap is therefore a soft ceiling under concurrency, not a hard limit;
+        closing that window would require a reserve-then-settle counter (an
+        atomic increment-and-check inside the enforcement path). FOR UPDATE is
+        not used here because Postgres does not support it on the nullable side
+        of an outer join.
         """
         async with self._engine.begin() as conn:
             res = await conn.execute(

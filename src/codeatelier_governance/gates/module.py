@@ -233,8 +233,15 @@ class GatesModule:
         """Wire the PresenceModule for halt-switch enforcement (v0.6.2 P0).
 
         Called by GovernanceSDK during construction after both modules exist.
-        Once set, ``request()`` and ``wait_for()`` — the agent-driven entry
-        points — fail-closed with ``AgentHaltedError`` for a halted agent.
+        Once set, ``request()`` — the agent-driven entry point that mints a new
+        approval — fails closed with ``AgentHaltedError`` for a halted agent,
+        so a halted agent cannot open new approval requests.
+
+        ``wait_for()`` does NOT re-check the halt on each poll: it only awaits
+        resolution of an ALREADY-issued request (it holds a ``request_id``, not
+        the ``agent_id``), and the agent's post-approval action is separately
+        halt-gated by scope/cost and the wrapped LLM clients, so a halted agent
+        gains nothing by awaiting a pending gate.
 
         ``grant()`` and ``deny()`` intentionally DO NOT call
         ``assert_not_halted``: those are operator-facing and need to remain

@@ -1090,11 +1090,12 @@ these issues.
 
 ### Security
 
-- **Self-approval prevention (fail-closed)** — HITL gates now compare the
-  granting `operator_id` against the session's `user_id`; an agent cannot
-  approve its own action. Requests with no `operator_id` return HTTP 403
-  with an actionable error. DDL adds `operator_id` column to the gates
-  table.
+- **HITL approval gates (fail-closed)** — approval gates block until an
+  out-of-process human resolves them, using single-use approval tokens
+  HMAC-bound to the request, action, and key version, compared in constant
+  time. The SDK does NOT gate on approver identity — there is no built-in
+  self-approval prevention; route approval to a human outside the agent's
+  control. See the Threat Model.
 - **Chain fork detection** — `audit.trace_session_chain` raises
   `ChainIntegrityError` when two events share the same `prev_hash`,
   surfacing tamper attempts or concurrent-write corruption that would

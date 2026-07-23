@@ -69,10 +69,9 @@ class GovernanceConfig:
     enable_gates: bool = True
     enable_scope: bool = True
     enable_cost: bool = True
-    # Reserved for a future PromptsModule (stub lives at
-    # codeatelier_governance.prompts).  Kept in the config for forward
-    # compatibility so callers that pre-emptively set the flag do not
-    # break when the real module lands.
+    # Reserved for a future PromptsModule (not yet implemented). Kept in the
+    # config for forward compatibility so callers that pre-emptively set the
+    # flag do not break when the real module lands.
     enable_prompts: bool = True
     # Loop detection: sliding-window repeated-tool-call detection. On a policy
     # threshold it emits an audit event and raises LoopDetected (action='raise');
@@ -784,6 +783,21 @@ class GovernanceSDK:
                     f"'import secrets; print(secrets.token_hex(32))')"
                 )
             return data
+        # No secret configured. The SDK will still persist an HMAC-chained
+        # audit trail, but under a per-process random key that no other worker
+        # or restart can reproduce, so the chain becomes unverifiable across
+        # workers/restarts and the key is never registered for rotation. Emit a
+        # LOUD structlog error (warnings.warn alone is routinely filtered in
+        # production) so the misconfiguration is visible in prod logs.
+        logger.error(
+            "sdk.audit_secret_missing",
+            detail=(
+                "No GOVERNANCE_AUDIT_SECRET set; using a per-process ephemeral "
+                "secret. The audit chain will NOT be verifiable across workers "
+                "or restarts. Set GOVERNANCE_AUDIT_SECRET before relying on a "
+                "durable, verifiable audit trail."
+            ),
+        )
         warnings.warn(
             "No GOVERNANCE_AUDIT_SECRET set; generating an ephemeral secret. "
             "Audit chain verification will not survive restarts. "
