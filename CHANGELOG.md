@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — privileged halt path + chain-verification hardening
+
+### Added
+
+- **Config ``presence_halt_database_url`` / env ``GOVERNANCE_HALT_DATABASE_URL``**
+  — an optional PRIVILEGED DSN used ONLY for the operator halt write
+  (``sdk.presence.halt()``) in the hardened multi-role deployment, where
+  the agent role has its ``UPDATE`` on the halt-marker columns REVOKE'd
+  and this connection is the sole writer of the marker. Holds privileged
+  DB credentials; must not be logged or committed.
+- **Public exception ``HaltPersistenceError``** — raised when the halt
+  write fails or is denied.
+
+### Changed
+
+- **``sdk.presence.halt()`` now RAISES ``HaltPersistenceError``** on a
+  denied or failed write instead of returning a false success. Under the
+  hardened config the usual cause is a denied ``UPDATE`` on the halt
+  columns with no privileged halt connection configured. This is a
+  behaviour change: callers that previously saw a silent success on a
+  failed kill-switch write now see a loud error.
+- **Compliance chain verification now does per-session ``prev_hash``
+  linkage**, so the EU AI Act Article 12 report detects interior
+  deletion or reordering of audit events within a session, not just
+  head/tail tampering.
+
 ## v0.7.2 (unreleased) — AGT recipe scaffolder
 
 Distribution-first CLI command that scaffolds a ready-to-run Microsoft
@@ -38,8 +64,10 @@ slim.
 
 ### Not changed
 
-- No schema changes, no migrations, no runtime behaviour changes. The
-  scaffolder is a build-time convenience and never touches Postgres.
+- The scaffolder itself introduces no schema changes, no migrations, and
+  no runtime behaviour changes. It is a build-time convenience and never
+  touches Postgres. (Runtime behaviour changes on this branch are tracked
+  under the Unreleased section above.)
 
 ## v0.7.1 (unreleased) — platform-bridge-aware approvals
 

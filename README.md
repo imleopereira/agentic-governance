@@ -309,6 +309,12 @@ All options are passed as keyword arguments to `GovernanceSDK(...)` and stored o
 | `enable_prompts` | `True` | Reserved for a future Prompt Versioning module (not yet implemented). Forward-compatibility flag; read by no code today. |
 | `enable_routing` | `False` | Advisory model routing — substitutes a different model based on registered policies. Off by default to prevent silent model substitution. Requires `enable_cost=True`. |
 
+### Privileged halt connection
+
+| Option | Env var | Description |
+|--------|---------|-------------|
+| `presence_halt_database_url` | `GOVERNANCE_HALT_DATABASE_URL` | Optional PRIVILEGED DSN used ONLY for the operator halt write (`sdk.presence.halt()`) in the hardened multi-role deployment. In that model the agent role has its `UPDATE` on the halt-marker columns (`halted_by` / `halted_at` / `halt_reason`) REVOKE'd so it cannot self-unhalt; this connection retains that `UPDATE` and is the sole writer of the halt marker. Holds PRIVILEGED DB credentials, so treat it like `GOVERNANCE_DATABASE_URL`: never log or commit it. Leave unset in a single-role deployment, where `halt()` runs under the shared engine. |
+
 ### Audit options
 
 | Flag | Default | Description |
