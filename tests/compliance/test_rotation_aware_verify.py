@@ -5,9 +5,11 @@ Pins that ``ReportGenerator._run_chain_verification``:
   * Uses the legacy single-key verifier when the chain contains NO
     rotation marker rows. ``rotation_aware`` is ``False``,
     ``unresolved_fingerprints`` is ``[]``.
-  * Uses ``verify_chain_with_rotation`` when at least one
-    ``audit.chain_key_rotation`` row is present. ``rotation_aware`` is
-    ``True``.
+  * Uses ``verify_chain_with_rotation`` on a POSTGRES store when at least one
+    ``audit.chain_key_rotation`` row is present (``rotation_aware`` True). An
+    in-memory store verifies its own records regardless of markers
+    (``rotation_aware`` False), so it can never be forced into a zero-row
+    rotated verify.
   * Returns ``unverified`` (NOT ``verified`` / ``failed``) when the
     rotation-aware verifier reports unresolved key fingerprints, and
     surfaces those fingerprints in the result.
@@ -197,4 +199,38 @@ async def test_inmemory_rotation_marker_still_detects_deletion(
     audit_store._by_session[sid] = ids[:2] + ids[3:]
 
     status, *_ = await gen.run_chain_verification_windowed()
+    assert status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_rotated_branch_detects_interior_deletion(
+    audit: AuditModule, audit_store: InMemoryAuditStore,
+) -> None:
+    """The Postgres rotation branch FAILS on an interior-deleted row set.
+
+    Drives the real rotated path (verify_chain_with_rotation mocked "ok") over
+    rows with a middle row removed, so per-session linkage must catch the gap.
+    """
+    sid = uuid4()
+    for _ in range(5):
+        await audit.log(AuditEvent(agent_id="a", kind="tool.call", session_id=sid))
+    rows = await _real_rows(audit)
+    gapped = rows[:2] + rows[3:]  # drop the middle row -> broken linkage
+
+    gen = ReportGenerator(audit_store=audit_store, audit_module=audit)
+    _as_postgres_rotation(gen, gapped)
+
+    def fake_verify(rows_arg, key_versions, uri_map):  # noqa: ANN001
+        return ChainVerifyResult(
+            verified=len(rows_arg), failed=0, unverified=0,
+            status="ok", unresolved_fingerprints=[],
+        )
+
+    with patch(
+        "codeatelier_governance.compliance.report.verify_chain_with_rotation",
+        side_effect=fake_verify,
+    ):
+        status, _fs, _ts, rot, _unres = await gen.run_chain_verification_windowed()
+
+    assert rot is True
     assert status == "failed"

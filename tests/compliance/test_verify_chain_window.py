@@ -170,3 +170,39 @@ async def test_compliance_no_false_alarm_on_intact_multi_session(
 
     status, *_ = await generator.run_chain_verification_windowed()
     assert status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_compliance_detects_head_of_session_deletion(
+    audit_store: InMemoryAuditStore, audit: AuditModule
+) -> None:
+    """Deleting a session's FIRST (genesis) event must FAIL via the genesis check.
+
+    from_seq defaults to 0 for a short chain, so genesis assertion is on; the
+    surviving events still link cleanly, so only the genesis check catches it.
+    """
+    sid = await _log_session(audit, 5)
+    generator = ReportGenerator(audit_store=audit_store, audit_module=audit)
+    status, *_ = await generator.run_chain_verification_windowed()
+    assert status == "verified"
+
+    ids = list(audit_store._by_session[sid])
+    del audit_store._events[ids[0]]  # delete the genesis event
+    audit_store._by_session[sid] = ids[1:]
+
+    status, *_ = await generator.run_chain_verification_windowed()
+    assert status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_compliance_empty_window_is_unverified_not_verified(
+    audit_store: InMemoryAuditStore, audit: AuditModule
+) -> None:
+    """A non-overlapping / empty verify window must be 'unverified', not vacuous 'verified'."""
+    await _log_session(audit, 3)
+    generator = ReportGenerator(audit_store=audit_store, audit_module=audit)
+
+    status, *_ = await generator.run_chain_verification_windowed(
+        from_seq=100, to_seq=200
+    )
+    assert status == "unverified"

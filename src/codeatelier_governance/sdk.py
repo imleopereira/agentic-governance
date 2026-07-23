@@ -343,6 +343,21 @@ class GovernanceSDK:
         # With enable_presence=False there is no PresenceModule to run halt(),
         # so a halt DSN would open a pool nothing ever uses.
         if _halt_dsn is not None and self.config.enable_presence:
+            if self._shared_engine is None:
+                # Fail hard: a halt DSN with no main database_url silently
+                # breaks the kill switch. halt() would persist the marker to the
+                # privileged DB, but is_halted reads the MAIN store (in-memory
+                # here) and would never see it, so a "halted" agent keeps
+                # running. Surface the misconfiguration at construction, not at
+                # incident time.
+                raise ValueError(
+                    "presence_halt_database_url / GOVERNANCE_HALT_DATABASE_URL "
+                    "is set but no main database_url is configured. The halt "
+                    "marker would be written to the privileged DB but never read "
+                    "back, so the kill switch would not enforce. Set database_url "
+                    "(the main GOVERNANCE_DATABASE_URL) as well, or unset the "
+                    "halt DSN."
+                )
             from sqlalchemy.ext.asyncio import create_async_engine
 
             self._halt_engine = create_async_engine(
@@ -353,20 +368,6 @@ class GovernanceSDK:
                 pool_timeout=3,
                 connect_args={"command_timeout": 5},
             )
-            if self._shared_engine is None:
-                # Degenerate config: halt() would write the marker to the
-                # privileged DB, but is_halted reads the in-memory store and
-                # never fires. Presence enforcement needs the main
-                # GOVERNANCE_DATABASE_URL / database_url so the marker is read
-                # back from Postgres.
-                logger.warning(
-                    "presence.halt_dsn_without_main_db",
-                    detail=(
-                        "A halt DSN is set but no main database_url / shared "
-                        "engine is configured; presence enforcement needs the "
-                        "main DATABASE_URL or halts will not be read back."
-                    ),
-                )
 
         # ------------------------------------------------------------------
         # Audit substrate (always constructed because every other module
