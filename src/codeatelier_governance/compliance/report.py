@@ -483,7 +483,8 @@ class ReportGenerator:
     ) -> tuple[ChainIntegrityStatus, int | None, int | None, bool, list[str]]:
         """Run HMAC chain verification via the audit module and return the status string.
 
-        Returns a tuple ``(status, verified_from_seq, verified_to_seq)``.
+        Returns ``(status, verified_from_seq, verified_to_seq, rotation_aware,
+        unresolved_fingerprints)``.
         ``status`` is one of :class:`ChainIntegrityStatus` literals:
         ``"verified"`` — chain checked and passed.
         ``"failed"`` — chain checked and found a broken or missing link.
@@ -512,6 +513,33 @@ class ReportGenerator:
                 # Inclusive window: (head - 999) .. head spans 1000 events.
                 from_seq = max(0, head_candidate - (window - 1))
                 to_seq = head_candidate
+
+        # In-memory store (no database_url): verify the in-memory records
+        # directly, REGARDLESS of rotation markers. The rotation-aware verifier
+        # and _load_chain_rows are Postgres-only; routing an in-memory store
+        # through the rotated branch below loads ZERO rows and vacuously
+        # "verifies" (an attacker could log a single
+        # kind='audit.chain_key_rotation' event to force that path and hide a
+        # tampered chain). Per-row HMAC + per-session linkage instead.
+        if self._database_url is None:
+            records = await self._audit_module.list_all_records()
+            if from_seq is not None or to_seq is not None:
+                start = from_seq or 0
+                end = (to_seq + 1) if to_seq is not None else len(records)
+                records = records[start:end]
+            if not self._audit_module.verify_events_hmac(records):
+                logger.warning(
+                    "compliance.report.chain_integrity_failed",
+                    detail="per-row HMAC mismatch in the verified window",
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            linkage_err = self._check_per_session_linkage(records)
+            if linkage_err is not None:
+                logger.warning(
+                    "compliance.report.chain_gap", detail=linkage_err
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            return ("verified", from_seq, to_seq, False, [])
 
         # BLOCKER C1: detect rotation markers and dispatch to the
         # rotation-aware verifier when present. The legacy single-key
@@ -585,22 +613,11 @@ class ReportGenerator:
         # session boundaries. Head/tail truncation over a window is not
         # detectable here; that is the `governance verify` CLI's job on a
         # single session's full chain.
+        # Postgres only (the in-memory store returns above). _load_chain_rows
+        # loads the windowed rows.
         try:
             rows = await self._load_chain_rows(from_seq=from_seq, to_seq=to_seq)
             records = [r.record for r in rows]
-            if not records:
-                # In-memory store (no database_url): _load_chain_rows returns
-                # []. Verify the in-memory records directly. Use per-row HMAC +
-                # per-session linkage, NOT verify_chain(session_id=None), which
-                # flattens all sessions and cross-session-links (false "failed"
-                # on an intact multi-session chain). from_seq/to_seq are 0-based
-                # indices into the flattened record list (same ordering the old
-                # verify_chain used), so apply the same window here.
-                records = await self._audit_module.list_all_records()
-                if from_seq is not None or to_seq is not None:
-                    start = from_seq or 0
-                    end = (to_seq + 1) if to_seq is not None else len(records)
-                    records = records[start:end]
             if not self._audit_module.verify_events_hmac(records):
                 logger.warning(
                     "compliance.report.chain_integrity_failed",
