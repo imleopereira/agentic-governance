@@ -229,4 +229,57 @@ async def test_verify_chain_partial_range(
             to_seq=3,
         )
 
+
+# ---------------------------------------------------------------------------
+# Test: head truncation (deleting the oldest events) is caught by genesis
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_verify_chain_head_truncation_raises(
+    store_with_events: tuple[InMemoryAuditStore, UUID, AuditModule],
+) -> None:
+    """Deleting the chain head (oldest event) must be caught by the genesis check.
+
+    The surviving rows each still HMAC-verify and their mutual linkage is
+    intact, so only the genesis check (the first row's prev_hash must be None)
+    detects that the true first event was removed.
+    """
+    store, session_id, module = store_with_events
+
+    event_ids = store._by_session[session_id]
+    head_id = event_ids[0]
+    del store._events[head_id]
+    store._by_session[session_id] = event_ids[1:]
+
+    with pytest.raises(ChainIntegrityError) as exc_info:
+        await module.verify_chain(session_id=session_id)
+    msg = str(exc_info.value).lower()
+    assert "head truncated" in msg or "genesis" in msg
+    await module.close()
+
+
+# ---------------------------------------------------------------------------
+# Test: verify_chain(session_id=None) must not return a vacuous True on a
+# store that cannot enumerate all events (e.g. Postgres)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_verify_chain_requires_session_id_for_non_inmemory_store(
+    secret_bytes: bytes,
+) -> None:
+    """verify_chain() with no session_id must raise, not silently verify zero events."""
+
+    class _NoIndexStore:
+        # Deliberately lacks an ``_events`` attribute, like PostgresAuditStore.
+        async def get_session_events(self, session_id: UUID) -> list[AuditEventRecord]:
+            return []
+
+        async def close(self) -> None:
+            return None
+
+    module = AuditModule(_NoIndexStore(), secret=secret_bytes)  # type: ignore[arg-type]
+    try:
+        with pytest.raises(ValueError, match="session_id is required"):
+            await module.verify_chain()
+    finally:
+        await module.close()
+
     await module.close()

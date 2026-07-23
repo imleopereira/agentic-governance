@@ -5,6 +5,12 @@ its immutable fields PLUS the previous event's HMAC in the same session.
 This forms a tamper-evident chain: modifying any byte of any past event
 breaks the HMAC of that event AND every event that follows it.
 
+Deletion is caught by the prev_hash linkage plus a genesis check: removing an
+interior event breaks the following row's linkage, and removing the head
+leaves a non-None genesis prev_hash. The chain alone does NOT detect tail
+truncation — dropping the most-recent events leaves a self-consistent chain —
+which requires an external high-water-mark (expected head/count).
+
 Verification is constant-time via ``hmac.compare_digest``.
 """
 from __future__ import annotations
@@ -294,8 +300,10 @@ def verify_chain_with_rotation(
           4. Otherwise, verify via ``verify_event`` under the resolved key.
 
     Returns a ``ChainVerifyResult``. ``status`` is:
-        * ``"failed"``    if any row's HMAC does not verify under a
-                          resolved key (tamper detected).
+        * ``"failed"``    if any row's HMAC does not verify under a resolved
+                          key (tamper detected), OR the prev_hash linkage is
+                          broken / the genesis prev_hash is non-None (an event
+                          was deleted). Tail truncation is not detectable.
         * ``"unverified"`` if no failures but at least one row could not
                           be checked because its key was unresolvable.
         * ``"ok"``         if every row verified cleanly.
@@ -378,7 +386,19 @@ def verify_chain_with_rotation(
             else:
                 failed += 1
 
-    if failed > 0:
+    # Linkage + genesis check (independent of key resolution): a deleted event
+    # leaves the surviving rows individually valid under their keys but breaks
+    # the prev_hash -> hmac linkage. Detects head deletion (the genesis row's
+    # prev_hash must be None) and interior deletion. Assumes `rows` is in
+    # chain_seq order (as documented above). Does NOT detect tail truncation,
+    # which leaves the remaining chain self-consistent.
+    linkage_broken = bool(rows) and rows[0].record.prev_hash is not None
+    for i in range(1, len(rows)):
+        if rows[i].record.prev_hash != rows[i - 1].record.hmac:
+            linkage_broken = True
+            break
+
+    if failed > 0 or linkage_broken:
         status = "failed"
     elif unverified > 0:
         status = "unverified"

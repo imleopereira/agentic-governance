@@ -711,6 +711,8 @@ class ReportGenerator:
             verify_chain: When ``True``, runs HMAC chain verification via the
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
+                Detects tampering, head/interior deletion, and reordering; it
+                does NOT detect tail truncation (see ``audit.verify_chain``).
                 Requires ``audit_module`` to be set. Default ``False``.
 
         Raises:
@@ -824,6 +826,8 @@ class ReportGenerator:
             verify_chain: When ``True``, runs HMAC chain verification via the
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
+                Detects tampering, head/interior deletion, and reordering; it
+                does NOT detect tail truncation (see ``audit.verify_chain``).
                 Requires ``audit_module`` to be set. Default ``False``.
 
         Raises:
