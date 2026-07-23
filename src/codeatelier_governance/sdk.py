@@ -69,12 +69,13 @@ class GovernanceConfig:
     enable_gates: bool = True
     enable_scope: bool = True
     enable_cost: bool = True
-    # Reserved for a future PromptsModule (stub lives at
-    # codeatelier_governance.prompts).  Kept in the config for forward
-    # compatibility so callers that pre-emptively set the flag do not
-    # break when the real module lands.
+    # Reserved for a future PromptsModule (not yet implemented). Kept in the
+    # config for forward compatibility so callers that pre-emptively set the
+    # flag do not break when the real module lands.
     enable_prompts: bool = True
-    # Loop detection: sliding-window repeated-tool-call detection + auto-halt.
+    # Loop detection: sliding-window repeated-tool-call detection. On a policy
+    # threshold it emits an audit event and raises LoopDetected (action='raise');
+    # it detects and reports only — it does NOT halt the agent.
     # Enabled by default.  Set to False to skip LoopModule construction;
     # sdk.loop will not exist and any call to it raises AttributeError.
     enable_loop: bool = True
@@ -82,6 +83,17 @@ class GovernanceConfig:
     # Enabled by default.  Set to False to skip PresenceModule construction;
     # sdk.presence will not exist and any call to it raises AttributeError.
     enable_presence: bool = True
+    # Optional PRIVILEGED DSN used ONLY for the operator halt WRITE
+    # (sdk.presence.halt). In a hardened deployment the agent runs under a role
+    # whose UPDATE on the halt-marker columns is REVOKE'd (so it cannot
+    # self-unhalt), which also means the shared app engine cannot WRITE a halt.
+    # Point this at a role that retains UPDATE on those columns so the operator
+    # kill switch actually persists. Env-var equivalent GOVERNANCE_HALT_DATABASE_URL
+    # is resolved in __init__. When unset, halt() uses the shared engine (correct
+    # for single-role deployments that do NOT apply the REVOKE); if the REVOKE is
+    # applied without this DSN, halt() raises HaltPersistenceError instead of a
+    # false success. Reads / the enforcement hot path never use this engine.
+    presence_halt_database_url: str | None = None
     # Routing is an advisory feature that can mutate the model on an LLM
     # call.  It is OFF by default — enable it explicitly at SDK construction
     # time AND register at least one RoutingPolicy for it to take effect on
@@ -318,6 +330,45 @@ class GovernanceSDK:
                 connect_args={"command_timeout": 5},
             )
 
+        # Optional PRIVILEGED engine for the operator halt WRITE only (see
+        # GovernanceConfig.presence_halt_database_url). Resolved from config or
+        # the GOVERNANCE_HALT_DATABASE_URL env var. Kept separate from the
+        # shared engine so the agent's REVOKE'd role cannot self-unhalt while
+        # the operator halt still persists under a privileged role.
+        self._halt_engine: Any = None
+        _halt_dsn = self.config.presence_halt_database_url or os.environ.get(
+            "GOVERNANCE_HALT_DATABASE_URL"
+        )
+        # Only wire the privileged halt engine when presence enforcement is on.
+        # With enable_presence=False there is no PresenceModule to run halt(),
+        # so a halt DSN would open a pool nothing ever uses.
+        if _halt_dsn is not None and self.config.enable_presence:
+            if self._shared_engine is None:
+                # Fail hard: a halt DSN with no main database_url silently
+                # breaks the kill switch. halt() would persist the marker to the
+                # privileged DB, but is_halted reads the MAIN store (in-memory
+                # here) and would never see it, so a "halted" agent keeps
+                # running. Surface the misconfiguration at construction, not at
+                # incident time.
+                raise ValueError(
+                    "presence_halt_database_url / GOVERNANCE_HALT_DATABASE_URL "
+                    "is set but no main database_url is configured. The halt "
+                    "marker would be written to the privileged DB but never read "
+                    "back, so the kill switch would not enforce. Set database_url "
+                    "(the main GOVERNANCE_DATABASE_URL) as well, or unset the "
+                    "halt DSN."
+                )
+            from sqlalchemy.ext.asyncio import create_async_engine
+
+            self._halt_engine = create_async_engine(
+                normalize_db_url(_halt_dsn, component="sdk-halt"),
+                pool_pre_ping=True,
+                pool_size=2,
+                max_overflow=5,
+                pool_timeout=3,
+                connect_args={"command_timeout": 5},
+            )
+
         # ------------------------------------------------------------------
         # Audit substrate (always constructed because every other module
         # needs it to log events).  When ``enable_audit=False`` the audit
@@ -487,13 +538,14 @@ class GovernanceSDK:
                 "sdk.loop_disabled",
                 detail=(
                     "enable_loop=False — sdk.loop is not constructed.  "
-                    "Loop detection and auto-halt are off."
+                    "Loop detection is off."
                 ),
             )
 
         if self.config.enable_presence:
             self.presence = PresenceModule(
                 database_url=database_url, engine=self._shared_engine,
+                halt_engine=self._halt_engine,
             )
             # v0.5.4 halt switch wiring (renamed from "kill" in v0.6),
             # expanded in v0.6.2 P0 to every enforcement module. When an
@@ -782,6 +834,21 @@ class GovernanceSDK:
                     f"'import secrets; print(secrets.token_hex(32))')"
                 )
             return data
+        # No secret configured. The SDK will still persist an HMAC-chained
+        # audit trail, but under a per-process random key that no other worker
+        # or restart can reproduce, so the chain becomes unverifiable across
+        # workers/restarts and the key is never registered for rotation. Emit a
+        # LOUD structlog error (warnings.warn alone is routinely filtered in
+        # production) so the misconfiguration is visible in prod logs.
+        logger.error(
+            "sdk.audit_secret_missing",
+            detail=(
+                "No GOVERNANCE_AUDIT_SECRET set; using a per-process ephemeral "
+                "secret. The audit chain will NOT be verifiable across workers "
+                "or restarts. Set GOVERNANCE_AUDIT_SECRET before relying on a "
+                "durable, verifiable audit trail."
+            ),
+        )
         warnings.warn(
             "No GOVERNANCE_AUDIT_SECRET set; generating an ephemeral secret. "
             "Audit chain verification will not survive restarts. "
@@ -1076,6 +1143,10 @@ class GovernanceSDK:
         if self._shared_engine is not None:
             await self._shared_engine.dispose()
             self._shared_engine = None
+        # Dispose the optional privileged halt engine.
+        if self._halt_engine is not None:
+            await self._halt_engine.dispose()
+            self._halt_engine = None
 
     # ------------------------------------------------------------------
     # Stable public API: audit chain verification

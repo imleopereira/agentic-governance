@@ -483,7 +483,8 @@ class ReportGenerator:
     ) -> tuple[ChainIntegrityStatus, int | None, int | None, bool, list[str]]:
         """Run HMAC chain verification via the audit module and return the status string.
 
-        Returns a tuple ``(status, verified_from_seq, verified_to_seq)``.
+        Returns ``(status, verified_from_seq, verified_to_seq, rotation_aware,
+        unresolved_fingerprints)``.
         ``status`` is one of :class:`ChainIntegrityStatus` literals:
         ``"verified"`` — chain checked and passed.
         ``"failed"`` — chain checked and found a broken or missing link.
@@ -512,6 +513,39 @@ class ReportGenerator:
                 # Inclusive window: (head - 999) .. head spans 1000 events.
                 from_seq = max(0, head_candidate - (window - 1))
                 to_seq = head_candidate
+
+        # In-memory store (no database_url): verify the in-memory records
+        # directly, REGARDLESS of rotation markers. The rotation-aware verifier
+        # and _load_chain_rows are Postgres-only; routing an in-memory store
+        # through the rotated branch below loads ZERO rows and vacuously
+        # "verifies" (an attacker could log a single
+        # kind='audit.chain_key_rotation' event to force that path and hide a
+        # tampered chain). Per-row HMAC + per-session linkage instead.
+        if self._database_url is None:
+            records = await self._audit_module.list_all_records()
+            if from_seq is not None or to_seq is not None:
+                start = from_seq or 0
+                end = (to_seq + 1) if to_seq is not None else len(records)
+                records = records[start:end]
+            if not records:
+                # Nothing in scope (empty store or a non-overlapping window):
+                # NOT "verified" — that would be a vacuous green over zero rows.
+                return ("unverified", from_seq, to_seq, False, [])
+            if not self._audit_module.verify_events_hmac(records):
+                logger.warning(
+                    "compliance.report.chain_integrity_failed",
+                    detail="per-row HMAC mismatch in the verified window",
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            linkage_err = self._check_per_session_linkage(
+                records, assert_genesis=(from_seq is None or from_seq == 0)
+            )
+            if linkage_err is not None:
+                logger.warning(
+                    "compliance.report.chain_gap", detail=linkage_err
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            return ("verified", from_seq, to_seq, False, [])
 
         # BLOCKER C1: detect rotation markers and dispatch to the
         # rotation-aware verifier when present. The legacy single-key
@@ -550,8 +584,28 @@ class ReportGenerator:
             # could otherwise hide tampering by ensuring the verifier
             # cannot read it.
             status: ChainIntegrityStatus
-            if result.status == "ok":
-                status = "verified"
+            if not rows:
+                # No rows in scope (empty / non-overlapping window): NOT
+                # "verified" — verify_chain_with_rotation([]) reports "ok" over
+                # zero rows, which would be a vacuous green.
+                status = "unverified"
+            elif result.status == "ok":
+                # verify_chain_with_rotation does per-row HMAC only. Add the
+                # key-INDEPENDENT per-session prev_hash->hmac linkage so
+                # interior deletion / reordering is caught on rotated chains
+                # too — this is the ONLY rotation-aware verify path, so without
+                # it a rotated chain would have no deletion detection anywhere.
+                linkage_err = self._check_per_session_linkage(
+                    [r.record for r in rows],
+                    assert_genesis=(from_seq is None or from_seq == 0),
+                )
+                if linkage_err is None:
+                    status = "verified"
+                else:
+                    logger.warning(
+                        "compliance.report.chain_gap", detail=linkage_err
+                    )
+                    status = "failed"
             elif result.status == "failed":
                 status = "failed"
             else:
@@ -564,12 +618,35 @@ class ReportGenerator:
                 list(result.unresolved_fingerprints),
             )
 
-        # Legacy single-key path (no rotation marker present).
+        # Legacy single-key path (no rotation marker present). Verify each row's
+        # HMAC (in-place tamper detection) AND per-session prev_hash->hmac
+        # linkage (interior deletion / reordering). Linkage is grouped by
+        # session so a global, cross-session window does not false-alarm at
+        # session boundaries. Head/tail truncation over a window is not
+        # detectable here; that is the `governance verify` CLI's job on a
+        # single session's full chain.
+        # Postgres only (the in-memory store returns above). _load_chain_rows
+        # loads the windowed rows.
         try:
-            await self._audit_module.verify_chain(
-                from_seq=from_seq,
-                to_seq=to_seq,
+            rows = await self._load_chain_rows(from_seq=from_seq, to_seq=to_seq)
+            records = [r.record for r in rows]
+            if not records:
+                # No rows in scope (empty / non-overlapping window): not verified.
+                return ("unverified", from_seq, to_seq, False, [])
+            if not self._audit_module.verify_events_hmac(records):
+                logger.warning(
+                    "compliance.report.chain_integrity_failed",
+                    detail="per-row HMAC mismatch in the verified window",
+                )
+                return ("failed", from_seq, to_seq, False, [])
+            linkage_err = self._check_per_session_linkage(
+                records, assert_genesis=(from_seq is None or from_seq == 0)
             )
+            if linkage_err is not None:
+                logger.warning(
+                    "compliance.report.chain_gap", detail=linkage_err
+                )
+                return ("failed", from_seq, to_seq, False, [])
             return ("verified", from_seq, to_seq, False, [])
         except ChainIntegrityError as exc:
             logger.warning(
@@ -607,12 +684,63 @@ class ReportGenerator:
             from_seq=from_seq, to_seq=to_seq
         )
 
-    async def _current_chain_head(self) -> int | None:
-        """Return the 0-based index of the last event available to verify.
+    @staticmethod
+    def _check_per_session_linkage(
+        records: list[AuditEventRecord],
+        *,
+        assert_genesis: bool = False,
+    ) -> str | None:
+        """Return an error string if any session's prev_hash->hmac link breaks.
 
-        For the in-memory store this is ``len(events) - 1`` across all
-        sessions. For Postgres, this is ``COUNT(*) - 1``.  Returns ``None``
-        when no events are available.
+        Groups records by session_id (preserving chain order) and checks, WITHIN
+        each session, that ``records[i].prev_hash == records[i-1].hmac``. Detects
+        interior deletion and reordering. Key-INDEPENDENT (compares stored
+        hashes, never recomputes an HMAC), so it works across key rotations
+        where per-row HMAC verification needs the historical key.
+
+        ``assert_genesis`` (set by the caller ONLY when the verification window
+        starts at the chain head, i.e. from_seq is None or 0) additionally
+        requires each session's first record to have ``prev_hash is None``,
+        catching head-of-session (genesis) deletion. It is off by default
+        because a window that starts mid-chain legitimately has a non-None
+        first prev_hash for a session whose head is before the window.
+
+        Note: this cannot detect deletion of an ENTIRE session or truncation of
+        the newest events — those leave the remaining chain self-consistent and
+        need an external high-water-mark / session manifest (a fundamental
+        property of hash chains). Returns None if every checked link holds.
+        """
+        from collections import defaultdict
+
+        by_session: dict[Any, list[AuditEventRecord]] = defaultdict(list)
+        for r in records:
+            by_session[r.session_id].append(r)
+        for sid, recs in by_session.items():
+            if assert_genesis and recs and recs[0].prev_hash is not None:
+                return (
+                    f"chain head truncated in session {sid}: first event "
+                    f"{recs[0].event_id} has prev_hash {recs[0].prev_hash!r}, "
+                    f"expected None (genesis)"
+                )
+            for i in range(1, len(recs)):
+                if recs[i].prev_hash != recs[i - 1].hmac:
+                    return (
+                        f"chain gap in session {sid} at position {i}: prev_hash "
+                        f"of event {recs[i].event_id} does not match hmac of "
+                        f"preceding event {recs[i - 1].event_id}"
+                    )
+        return None
+
+    async def _current_chain_head(self) -> int | None:
+        """Return the newest sequence value available to verify (window head).
+
+        For the in-memory store this is the 0-based ``len(events) - 1`` across
+        all sessions (verify_chain treats the window as list indices). For
+        Postgres this is ``MAX(chain_seq)`` — the actual newest sequence value,
+        NOT ``COUNT(*) - 1``: chain_seq is a 1-based BIGSERIAL that
+        _load_chain_rows filters on directly and it has gaps after rolled-back
+        inserts, so COUNT(*)-1 would silently exclude the newest event(s) from
+        the window. Returns ``None`` when no events are available.
         """
         # In-memory path
         if self._audit_store is not None:
@@ -630,13 +758,12 @@ class ReportGenerator:
             try:
                 async with engine.connect() as conn:
                     res = await conn.execute(
-                        text("SELECT COUNT(*) FROM governance_audit_events")
+                        text("SELECT MAX(chain_seq) FROM governance_audit_events")
                     )
                     row = res.first()
-                    if row is None:
+                    if row is None or row[0] is None:
                         return None
-                    total = int(row[0])
-                    return (total - 1) if total > 0 else None
+                    return int(row[0])
             finally:
                 await engine.dispose()
         return None
@@ -711,7 +838,15 @@ class ReportGenerator:
             verify_chain: When ``True``, runs HMAC chain verification via the
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
-                Requires ``audit_module`` to be set. Default ``False``.
+                Over the verified window it detects in-place tampering (per-row
+                HMAC), interior deletion, reordering (per-session
+                prev_hash->hmac linkage), and head-of-session (genesis) deletion
+                when the window starts at the chain head. It does NOT detect
+                whole-session deletion, tail truncation, or events deleted
+                entirely before the window (fundamental hash-chain limits that
+                need an external high-water-mark); the covered range is disclosed
+                via ``chain_verified_from_seq`` / ``_to_seq``. Requires
+                ``audit_module`` to be set. Default ``False``.
 
         Raises:
             ValueError: If ``verify_chain=True`` is requested but no
@@ -824,7 +959,15 @@ class ReportGenerator:
             verify_chain: When ``True``, runs HMAC chain verification via the
                 ``audit_module`` provided at construction time and sets
                 ``chain_integrity_status`` to ``"verified"`` or ``"failed"``.
-                Requires ``audit_module`` to be set. Default ``False``.
+                Over the verified window it detects in-place tampering (per-row
+                HMAC), interior deletion, reordering (per-session
+                prev_hash->hmac linkage), and head-of-session (genesis) deletion
+                when the window starts at the chain head. It does NOT detect
+                whole-session deletion, tail truncation, or events deleted
+                entirely before the window (fundamental hash-chain limits that
+                need an external high-water-mark); the covered range is disclosed
+                via ``chain_verified_from_seq`` / ``_to_seq``. Requires
+                ``audit_module`` to be set. Default ``False``.
 
         Raises:
             ValueError: If ``verify_chain=True`` is requested but no

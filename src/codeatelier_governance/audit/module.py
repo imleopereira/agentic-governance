@@ -75,8 +75,11 @@ def _hash_payload(value: Any) -> str:
     """Stable SHA-256 hash of a Python value for input/output_hash fields.
 
     Falls back to repr() for un-serializable values rather than failing — the
-    audit log should never block the host call. Caps input size at 64 KiB to
-    prevent pathological inputs from inflating the hash cost.
+    audit log should never block the host call. Caps the HASHED byte count at
+    64 KiB. NOTE: the value is fully serialized (json.dumps/repr) BEFORE the
+    slice, so this bounds hash cost but NOT the serialization cost of a very
+    large argument; callers should avoid passing multi-MB values to
+    @audit.track-decorated functions.
     """
     if value is None:
         return hashlib.sha256(b"null").hexdigest()
@@ -592,7 +595,11 @@ class AuditModule:
         :class:`ChainIntegrityError` with the offending event_id.
 
         This is the API to use when answering "show me everything that
-        happened in this session and prove it wasn't tampered with."
+        happened in this session and prove it wasn't tampered with." It
+        detects in-place tampering (per-row HMAC), head deletion (genesis),
+        interior deletion (linkage), and forks. It does NOT detect tail
+        truncation (dropping the most-recent events leaves a self-consistent
+        chain); that needs an external high-water-mark.
         """
         events = await self._store.get_session_events(session_id)
         for record in events:
@@ -601,9 +608,10 @@ class AuditModule:
                     f"audit chain integrity violation at event {record.event_id}"
                 )
 
-        # Detect chain forks: two events sharing the same prev_hash means
-        # the chain was branched (e.g. an attacker inserted a second root
-        # or spliced a parallel branch).
+        # Detect chain forks first: two events sharing the same prev_hash means
+        # the chain was branched (e.g. an attacker inserted a second root or
+        # spliced a parallel branch). A fork is also a linkage break, so check
+        # it before the linkage pass to give the more specific diagnosis.
         seen_prev: dict[str | None, UUID] = {}
         for record in events:
             key = record.prev_hash
@@ -614,6 +622,25 @@ class AuditModule:
                     f"share prev_hash {key!r}"
                 )
             seen_prev[key] = record.event_id
+
+        # Genesis check: a session's first event has no predecessor. A non-None
+        # head means the true first event(s) were deleted (head truncation).
+        if events and events[0].prev_hash is not None:
+            raise ChainIntegrityError(
+                f"chain head truncated for session {session_id}: first event "
+                f"{events[0].event_id} has prev_hash {events[0].prev_hash!r}, "
+                f"expected None (genesis)"
+            )
+
+        # Linkage check: detects deletion of an interior event (a gap that
+        # leaves every surviving row's HMAC self-consistent).
+        for i in range(1, len(events)):
+            if events[i].prev_hash != events[i - 1].hmac:
+                raise ChainIntegrityError(
+                    f"chain gap at position {i}: prev_hash of event "
+                    f"{events[i].event_id} does not match hmac of preceding "
+                    f"event {events[i - 1].event_id}"
+                )
 
         return events
 
@@ -637,18 +664,38 @@ class AuditModule:
         self,
         records: list[AuditEventRecord],
     ) -> bool:
-        """Verify HMAC integrity for an ordered list of AuditEventRecord objects.
+        """Verify HMAC integrity for a full session chain (in chain order).
 
-        Performs two passes:
+        Performs three passes:
+        0. Genesis check — the first record's ``prev_hash`` must be ``None``.
+           A non-None head means the true first event(s) were deleted (head
+           truncation), which the linkage pass alone cannot see.
         1. Per-event HMAC check — detects in-place row tampering.
-        2. Linkage check — verifies that ``records[i].prev_hash == records[i-1].hmac``
-           for every consecutive pair, detecting event deletion (a gap in the chain
-           that leaves no broken HMAC on any remaining row).
+        2. Linkage check — verifies ``records[i].prev_hash == records[i-1].hmac``
+           for every consecutive pair, detecting deletion of an interior event
+           (a gap that leaves no broken HMAC on any remaining row).
 
-        Used internally by ``verify_chain`` and ``get_events`` when
-        ``verify_chain_on_read=True``. Raises :class:`ChainIntegrityError`
-        at the first failing link. Returns ``True`` if all links are clean.
+        Detects in-place tampering, head deletion, interior deletion, and
+        reordering. It CANNOT detect truncation of the most-recent events
+        (tail deletion): dropping the last N rows leaves a self-consistent
+        chain. Detecting that requires an external high-water-mark (expected
+        head/count) tracked outside the chain.
+
+        Expects the FULL session chain in order (as returned by
+        :meth:`get_events`), not an arbitrary slice — the genesis check
+        assumes ``records[0]`` is the chain head. Used internally by
+        ``verify_chain`` and ``get_events`` when ``verify_chain_on_read=True``.
+        Raises :class:`ChainIntegrityError` at the first failing check.
+        Returns ``True`` if all checks pass.
         """
+        # Pass 0: genesis check — the chain head has no predecessor.
+        if records and records[0].prev_hash is not None:
+            raise ChainIntegrityError(
+                f"chain head truncated: first event {records[0].event_id} has "
+                f"prev_hash {records[0].prev_hash!r}, expected None (genesis); "
+                f"one or more earlier events were deleted"
+            )
+
         # Pass 1: per-event HMAC check
         for idx, record in enumerate(records):
             if not verify_event(record, self._secret):
@@ -668,6 +715,41 @@ class AuditModule:
 
         return True
 
+    async def list_all_records(self) -> list[AuditEventRecord]:
+        """Return every stored record in chain (insertion) order.
+
+        In-memory stores only: flattens all sessions in insertion order. A store
+        without an in-memory index (e.g. PostgresAuditStore) returns ``[]`` —
+        callers that need Postgres rows should query them directly. Used by the
+        compliance report's in-memory verification fallback so it can verify
+        per-session instead of cross-session.
+        """
+        store = self._store
+        if not hasattr(store, "_events"):
+            return []
+        from .store import InMemoryAuditStore
+
+        mem: InMemoryAuditStore = store  # type: ignore[assignment]
+        records: list[AuditEventRecord] = []
+        for sid_key in mem._by_session:
+            for eid in mem._by_session[sid_key]:
+                if eid in mem._events:
+                    records.append(mem._events[eid])
+        return records
+
+    def verify_events_hmac(self, records: list[AuditEventRecord]) -> bool:
+        """Verify ONLY each record's HMAC (no linkage / genesis check).
+
+        Detects in-place row tampering. Does NOT detect deletion — for that use
+        :meth:`verify_chain` / :meth:`verify_chain_records` with a single
+        session's FULL chain, which can anchor a genesis and check linkage.
+        This is intended for a bounded, possibly multi-session window (e.g. the
+        compliance report's globally-ordered window), where per-session
+        prev_hash linkage does not apply and would false-positive at every
+        session boundary.
+        """
+        return all(verify_event(r, self._secret) for r in records)
+
     async def verify_chain(
         self,
         *,
@@ -680,6 +762,12 @@ class AuditModule:
         Fetches events in insertion order and verifies each link sequentially.
         If any link fails, raises :class:`ChainIntegrityError` with the
         sequence number (0-based) of the first bad link.
+
+        Detects in-place tampering, head deletion (via the genesis check, when
+        the window starts at seq 0), interior deletion, and reordering. It
+        CANNOT detect tail truncation — dropping the most-recent events leaves
+        a self-consistent chain — which requires an external high-water-mark
+        (expected head/count) tracked outside the chain.
 
         Parameters
         ----------
@@ -727,12 +815,32 @@ class AuditModule:
                     all_ids.extend(mem._by_session[sid_key])
                 events = [mem._events[eid] for eid in all_ids if eid in mem._events]
             else:
-                events = []
+                # A store without an in-memory index (e.g. PostgresAuditStore)
+                # cannot enumerate "everything" here. Returning True would be a
+                # vacuous green over ZERO events — a false assurance of chain
+                # integrity. Fail loud and require an explicit session_id.
+                raise ValueError(
+                    "verify_chain: session_id is required for this store; "
+                    "whole-store verification is only supported for the "
+                    "in-memory store. Pass session_id=... to verify a "
+                    "session's chain."
+                )
 
         # Apply the sequence slice.
         start = from_seq if from_seq is not None else 0
         end = (to_seq + 1) if to_seq is not None else len(events)
         window = events[start:end]
+
+        # Pass 0: genesis check — only when the window starts at the chain head
+        # (start == 0). A non-None head means the true first event(s) were
+        # deleted. Skipped for an explicit mid-chain slice, whose first row
+        # legitimately has a non-None prev_hash.
+        if start == 0 and window and window[0].prev_hash is not None:
+            raise ChainIntegrityError(
+                f"chain head truncated: first event {window[0].event_id} has "
+                f"prev_hash {window[0].prev_hash!r}, expected None (genesis); "
+                f"one or more earlier events were deleted"
+            )
 
         # Pass 1: per-event HMAC check
         for idx, record in enumerate(window):

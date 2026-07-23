@@ -59,6 +59,26 @@ the SDK normalises the driver scheme internally.
 The SDK's `sanitize_db_error()` helper strips it from any error message
 that propagates back to the host application.
 
+### `GOVERNANCE_HALT_DATABASE_URL`
+
+| Property | Value |
+|---|---|
+| **Required** | No |
+| **Default** | none (falls back to the shared `GOVERNANCE_DATABASE_URL` engine for the halt write) |
+| **Config kwarg** | `presence_halt_database_url` on `GovernanceConfig` |
+
+Optional PRIVILEGED PostgreSQL connection string used ONLY for the
+operator halt write (`sdk.presence.halt()`) in the hardened multi-role
+deployment. In that model the agent's own role has its `UPDATE` on the
+halt-marker columns (`halted_by` / `halted_at` / `halt_reason`) REVOKE'd
+so the agent cannot self-unhalt; this connection retains that `UPDATE`
+and is the sole writer of the halt marker. Leave unset in a single-role
+deployment, where `halt()` runs under the shared engine.
+
+**Security**: this string contains PRIVILEGED DB credentials (a role that
+can write the kill-switch marker). Treat it exactly like
+`GOVERNANCE_DATABASE_URL`: never log, never check into git.
+
 ### `GOVERNANCE_AUDIT_SECRET`
 
 | Property | Value |
@@ -204,6 +224,7 @@ The following variables are secrets. They MUST NOT be logged, echoed,
 checked into git, or shipped inside container images:
 
 - `GOVERNANCE_DATABASE_URL` (contains DB credentials)
+- `GOVERNANCE_HALT_DATABASE_URL` (contains PRIVILEGED DB credentials)
 - `GOVERNANCE_AUDIT_SECRET`
 - `GOVERNANCE_WORKSPACE_SALT`
 - `CODEATELIER_AGENT_KEY_<AGENT_ID>` (every instance)

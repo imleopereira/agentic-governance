@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — privileged halt path + chain-verification hardening
+
+### Added
+
+- **Config ``presence_halt_database_url`` / env ``GOVERNANCE_HALT_DATABASE_URL``**
+  — an optional PRIVILEGED DSN used ONLY for the operator halt write
+  (``sdk.presence.halt()``) in the hardened multi-role deployment, where
+  the agent role has its ``UPDATE`` on the halt-marker columns REVOKE'd
+  and this connection is the sole writer of the marker. Holds privileged
+  DB credentials; must not be logged or committed.
+- **Public exception ``HaltPersistenceError``** — raised when the halt
+  write fails or is denied.
+
+### Changed
+
+- **``sdk.presence.halt()`` now RAISES ``HaltPersistenceError``** on a
+  denied or failed write instead of returning a false success. Under the
+  hardened config the usual cause is a denied ``UPDATE`` on the halt
+  columns with no privileged halt connection configured. This is a
+  behaviour change: callers that previously saw a silent success on a
+  failed kill-switch write now see a loud error.
+- **Compliance chain verification now does per-session ``prev_hash``
+  linkage**, so the EU AI Act Article 12 report detects interior
+  deletion or reordering of audit events within a session, not just
+  head/tail tampering.
+
 ## v0.7.2 (unreleased) — AGT recipe scaffolder
 
 Distribution-first CLI command that scaffolds a ready-to-run Microsoft
@@ -38,8 +64,10 @@ slim.
 
 ### Not changed
 
-- No schema changes, no migrations, no runtime behaviour changes. The
-  scaffolder is a build-time convenience and never touches Postgres.
+- The scaffolder itself introduces no schema changes, no migrations, and
+  no runtime behaviour changes. It is a build-time convenience and never
+  touches Postgres. (Runtime behaviour changes on this branch are tracked
+  under the Unreleased section above.)
 
 ## v0.7.1 (unreleased) — platform-bridge-aware approvals
 
@@ -1090,11 +1118,12 @@ these issues.
 
 ### Security
 
-- **Self-approval prevention (fail-closed)** — HITL gates now compare the
-  granting `operator_id` against the session's `user_id`; an agent cannot
-  approve its own action. Requests with no `operator_id` return HTTP 403
-  with an actionable error. DDL adds `operator_id` column to the gates
-  table.
+- **HITL approval gates (fail-closed)** — approval gates block until an
+  out-of-process human resolves them, using single-use approval tokens
+  HMAC-bound to the request, action, and key version, compared in constant
+  time. The SDK does NOT gate on approver identity — there is no built-in
+  self-approval prevention; route approval to a human outside the agent's
+  control. See the Threat Model.
 - **Chain fork detection** — `audit.trace_session_chain` raises
   `ChainIntegrityError` when two events share the same `prev_hash`,
   surfacing tamper attempts or concurrent-write corruption that would

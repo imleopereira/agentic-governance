@@ -16,7 +16,7 @@ from typing import Any
 
 import structlog
 
-from .errors import AgentHaltedError
+from .errors import AgentHaltedError, HaltPersistenceError
 from .models import AgentStatus
 
 logger = structlog.get_logger(__name__)
@@ -41,10 +41,18 @@ class PresenceModule:
         *,
         database_url: str | None = None,
         engine: Any = None,
+        halt_engine: Any = None,
     ) -> None:
         self._database_url = database_url
         self._engine: Any = engine
         self._owns_engine = False
+        # Optional PRIVILEGED engine used ONLY for the halt WRITE path. When
+        # the self-unhalt REVOKE is applied (ddl.sql), the shared app/agent
+        # engine cannot UPDATE the halt-marker columns, so halt() must run
+        # under a role that can. When None, halt() falls back to the shared
+        # engine (correct for single-role deployments that do NOT apply the
+        # REVOKE). Never used for reads or the agent hot path.
+        self._halt_engine: Any = halt_engine
         # In-memory fallback: {agent_id: {status, last_heartbeat, started_at, metadata}}
         self._agents: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
@@ -76,6 +84,18 @@ class PresenceModule:
         self._owns_engine = True
         return self._engine
 
+    def _get_halt_engine(self) -> Any:
+        """Return the privileged halt engine if configured, else the shared engine.
+
+        The halt WRITE runs here so it can use a role that retains UPDATE on
+        the halt-marker columns even when the agent's shared role has them
+        REVOKE'd. Reads and the enforcement hot path always use the shared
+        engine (_get_engine).
+        """
+        if self._halt_engine is not None:
+            return self._halt_engine
+        return self._get_engine()
+
     _MAX_AGENT_ID_LEN = 256
     _MAX_METADATA_BYTES = 65536
     _MAX_AGENTS = 10000
@@ -93,9 +113,9 @@ class PresenceModule:
         Args:
             agent_id: Unique identifier for the agent.
             metadata: Optional JSON-serialisable metadata dict.
-            operator_id: Optional ID of the human operator who owns this agent.
-                Used by the console to enforce self-approval prevention on HITL
-                gates.
+            operator_id: Optional ID of the human operator who owns this
+                agent. Recorded for provenance and surfaced by list_agents();
+                the SDK does not use it to enforce any approver-identity gate.
         """
         if not agent_id or len(agent_id) > self._MAX_AGENT_ID_LEN:
             logger.warning(
@@ -131,12 +151,20 @@ class PresenceModule:
         async with self._lock:
             existing = self._agents.get(agent_id)
             started = existing["started_at"] if existing else now
+            # SECURITY (self-unhalt defense): carry the halt marker forward
+            # like started_at. The heartbeat rewrites 'metadata' wholesale,
+            # so the marker must live at the top level — outside 'metadata'
+            # — exactly as it lives in dedicated DB columns the heartbeat
+            # UPSERT never touches. A heartbeat must never clear a halt.
             self._agents[agent_id] = {
                 "status": AgentStatus.LIVE.value,
                 "last_heartbeat": now,
                 "started_at": started,
                 "metadata": metadata or {},
                 "operator_id": operator_id,
+                "halted_by": existing.get("halted_by") if existing else None,
+                "halted_at": existing.get("halted_at") if existing else None,
+                "halt_reason": existing.get("halt_reason") if existing else None,
             }
 
     async def _heartbeat_postgres(
@@ -159,6 +187,11 @@ class PresenceModule:
                         "(agent_id, status, last_heartbeat, started_at, metadata_json, operator_id) "
                         "VALUES (:agent_id, 'live', NOW(), NOW(), CAST(:meta AS jsonb), :operator_id) "
                         "ON CONFLICT (agent_id) DO UPDATE SET "
+                        # SECURITY (self-unhalt defense): halted_by /
+                        # halted_at / halt_reason are intentionally NOT in
+                        # this SET list, so a heartbeat can never clear a
+                        # halt. The app/agent role also has UPDATE on those
+                        # columns revoked at the grant level (see ddl.sql).
                         "status = 'live', last_heartbeat = NOW(), "
                         "metadata_json = CAST(:meta AS jsonb), "
                         "operator_id = :operator_id"
@@ -215,6 +248,12 @@ class PresenceModule:
 
     async def _close_agent_memory(self, agent_id: str) -> None:
         async with self._lock:
+            existing = self._agents.get(agent_id)
+            # SECURITY (self-unhalt defense): a halted agent is NOT removed,
+            # mirroring the DB trigger, so it cannot close-then-heartbeat to
+            # clear its own halt. Clear the halt first to close it.
+            if existing is not None and existing.get("halted_by") is not None:
+                return
             self._agents.pop(agent_id, None)
 
     async def _close_agent_postgres(self, engine: Any, agent_id: str) -> None:
@@ -222,10 +261,13 @@ class PresenceModule:
 
         try:
             async with engine.begin() as conn:
+                # SECURITY (self-unhalt defense): only delete a NON-halted
+                # row, so a halted agent cannot close-then-heartbeat to clear
+                # its own halt. A DB trigger enforces this against raw DELETE.
                 await conn.execute(
                     text(
                         "DELETE FROM governance_agent_presence "
-                        "WHERE agent_id = :agent_id"
+                        "WHERE agent_id = :agent_id AND halted_by IS NULL"
                     ),
                     {"agent_id": agent_id},
                 )
@@ -327,28 +369,184 @@ class PresenceModule:
                 error_type=type(exc).__name__,
             )
 
+    async def halt(
+        self,
+        agent_id: str,
+        *,
+        halted_by: str,
+        reason: str | None = None,
+    ) -> None:
+        """Write the operator halt marker for ``agent_id``.
+
+        Records an operator-initiated halt. The marker is written to the
+        dedicated ``halted_by`` / ``halted_at`` / ``halt_reason`` columns —
+        NOT into ``metadata_json`` — so the agent's own heartbeat (which
+        rewrites ``metadata_json`` wholesale) can never erase it, and a
+        halted row cannot be deleted. See the self-unhalt defense notes in
+        ``ddl.sql``.
+
+        Deployment (see ddl.sql for the two supported models):
+
+          * Single-role (agent cannot issue raw SQL): the write runs under the
+            shared engine, and self-unhalt is still blocked by the BEFORE DELETE
+            trigger and by the fact that no SDK method clears a halt. Note the
+            shipped ``ddl.sql`` is hardened-by-default and applies the column
+            REVOKE unconditionally, so running it as a NON-owner role denies
+            live-agent halt() writes (HaltPersistenceError). For halt() to
+            succeed on the shared engine here you must either remove the
+            REVOKE/GRANT lines from ``ddl.sql``, run as the table owner, or set
+            a privileged halt DSN.
+          * Hardened / multi-role (agent CAN issue raw SQL): apply the column
+            REVOKE to the agent role and give this module a PRIVILEGED
+            ``halt_engine`` (``presence_halt_database_url`` at the SDK level).
+            The agent role then cannot self-unhalt, and this write runs under
+            the privileged role that can.
+
+        If the REVOKE is applied but no privileged ``halt_engine`` is
+        configured, the write is denied and this method raises
+        :class:`HaltPersistenceError` — it never returns a false success on a
+        kill-switch write.
+
+        Args:
+            agent_id: Unique identifier for the agent to halt.
+            halted_by: Operator identity recorded on the marker.
+            reason: Optional free-text halt reason.
+
+        Raises:
+            HaltPersistenceError: the halt write failed or was denied, so the
+                halt did NOT engage.
+        """
+        engine = self._get_halt_engine()
+        if engine is not None:
+            await self._halt_postgres(engine, agent_id, halted_by, reason)
+        else:
+            await self._halt_memory(agent_id, halted_by, reason)
+
+    async def _halt_memory(
+        self,
+        agent_id: str,
+        halted_by: str,
+        reason: str | None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        async with self._lock:
+            data = self._agents.get(agent_id)
+            if data is None:
+                # Halt a not-yet-seen agent so the marker is in place the
+                # moment it first heartbeats. Mirrors the DB path, which
+                # would no-op on a missing row; here we materialise a
+                # minimal row carrying only the marker.
+                now_dt = datetime.now(timezone.utc)
+                data = {
+                    "status": AgentStatus.LIVE.value,
+                    "last_heartbeat": now_dt,
+                    "started_at": now_dt,
+                    "metadata": {},
+                    "operator_id": None,
+                }
+                self._agents[agent_id] = data
+            # Marker lives at the top level, outside 'metadata', so the
+            # heartbeat's wholesale metadata rewrite cannot clear it.
+            data["halted_by"] = halted_by
+            data["halted_at"] = now
+            data["halt_reason"] = reason
+
+    async def _halt_postgres(
+        self,
+        engine: Any,
+        agent_id: str,
+        halted_by: str,
+        reason: str | None,
+    ) -> None:
+        from sqlalchemy import text
+
+        try:
+            async with engine.begin() as conn:
+                # UPSERT, not a bare UPDATE. An operator may halt an agent
+                # that has not heartbeated yet (no row) or whose row is being
+                # deleted by a concurrent close_agent(); a plain UPDATE would
+                # affect 0 rows. ON CONFLICT re-halts an existing row. This
+                # runs under the halt engine (privileged when the self-unhalt
+                # REVOKE is applied; the shared engine otherwise).
+                #
+                # KNOWN LIMITATION (misconfigured hardened model): the loud-
+                # failure guarantee only holds for halts of ALREADY-REGISTERED
+                # (live) agents. If the agent role is REVOKE'd but no privileged
+                # halt engine is configured, halting a NOT-YET-REGISTERED agent
+                # (no existing row) takes the INSERT branch, which the agent
+                # role still has INSERT rights for (used by the heartbeat), so
+                # the write SUCCEEDS and no HaltPersistenceError is raised even
+                # though a subsequent live-agent re-halt (UPDATE branch) would
+                # be denied. A full fix needs a privileged-only probe and is
+                # deferred.
+                result = await conn.execute(
+                    text(
+                        "INSERT INTO governance_agent_presence "
+                        "(agent_id, halted_by, halted_at, halt_reason) "
+                        "VALUES (:aid, :by, NOW(), :reason) "
+                        "ON CONFLICT (agent_id) DO UPDATE SET "
+                        "halted_by = :by, halted_at = NOW(), "
+                        "halt_reason = :reason"
+                    ),
+                    {"by": halted_by, "reason": reason, "aid": agent_id},
+                )
+                rowcount = result.rowcount
+        except Exception as exc:
+            # A kill-switch write that fails MUST be loud, never a false
+            # success. The usual cause under the hardened config is a denied
+            # UPDATE on the halt columns (the agent role is REVOKE'd and no
+            # privileged halt engine was configured). Raise so the operator
+            # knows the halt did NOT engage. (halt() is operator-facing, off
+            # the agent hot path, so raising here does not violate Invariant #1.)
+            logger.error(
+                "presence.halt_failed",
+                error_type=type(exc).__name__,
+                agent_id=agent_id,
+            )
+            raise HaltPersistenceError(
+                f"Failed to persist halt for agent {agent_id!r} "
+                f"({type(exc).__name__}). If the self-unhalt REVOKE is applied, "
+                f"halt() must run under a privileged connection "
+                f"(PresenceModule(halt_engine=...) / presence_halt_database_url)."
+            ) from exc
+        if rowcount == 0:
+            # Unreachable for an UPSERT (INSERT-or-UPDATE always touches a row);
+            # a 0-row result means the marker did not persist.
+            logger.error(
+                "presence.halt_not_persisted",
+                agent_id=agent_id,
+                halted_by=halted_by,
+            )
+            raise HaltPersistenceError(
+                f"Halt for agent {agent_id!r} affected 0 rows; the marker did "
+                f"not persist."
+            )
+
     # ------------------------------------------------------------------
-    # Halt switch (v0.5.4 hotfix; renamed from "kill" → "halt" in v0.6 F2.5)
+    # Halt switch (fail-closed operator kill switch)
     # ------------------------------------------------------------------
     #
     # The halt switch is the single fail-closed control an operator has over
-    # a running agent. When an operator clicks "Halt" in the console
-    # (POST /api/agents/{agent_id}/halt), the console writes a marker into
-    # `governance_agent_presence.metadata_json` containing `_halted_by`,
-    # `_halted_at`, `_halt_reason`. THIS module is the SDK-side enforcement
-    # of that marker.
+    # a running agent. An operator halt (see :meth:`halt`, run under the halt
+    # engine — a privileged connection in a hardened deployment) writes the
+    # marker into the dedicated `governance_agent_presence.halted_by` /
+    # `halted_at` / `halt_reason` columns. THIS module is the SDK-side
+    # enforcement of that marker.
     #
-    # Backward-compat (v0.6 → removed in v0.7): v0.5.4 wrote the marker under
-    # `_killed_by` / `_killed_at` / `_kill_reason`. Historic rows in customer
-    # databases still carry those keys. This module READS BOTH key families
-    # (prefer `_halted_*`, fall back to `_killed_*`) so upgrading the SDK
-    # without running the console upgrade first still fails closed on halted
-    # agents. v0.7 drops the fallback branch.
+    # SECURITY (self-unhalt defense): the marker lives ONLY in those
+    # dedicated columns, never in `metadata_json`. The agent's own heartbeat
+    # rewrites `metadata_json` wholesale on every beat, so a marker stored
+    # there could be erased by the very agent it is meant to stop. The
+    # columns are unwritable by the app/agent role (column-level REVOKE) and
+    # a halted row cannot be DELETEd (BEFORE DELETE trigger), so neither a
+    # heartbeat nor a close-then-reinsert can clear a halt. The legacy
+    # metadata-key representation (`_halted_*` / `_killed_*`) was read for
+    # back-compat through v0.6 and removed in v0.7; migration a7f2haltcols
+    # backfilled any such markers into the columns.
     #
-    # IMPORTANT: as of v0.5.4 we do NOT use `status='unresponsive'` to detect
-    # halts, because `check_stale()` also writes that status for heartbeat
-    # timeouts. Conflating the two would block agents that simply went idle.
-    # The metadata marker is the unambiguous halt signal.
+    # NOTE: we do NOT use `status='unresponsive'` to detect halts, because
+    # `check_stale()` also writes that status for heartbeat timeouts.
+    # Conflating the two would block agents that simply went idle.
     #
     # Cache strategy: 5-second TTL in-memory dict. On every is_halted() /
     # assert_not_halted() call, if the cache is older than TTL, refresh from
@@ -361,10 +559,9 @@ class PresenceModule:
         """Return True if the agent has been halted by an operator.
 
         Reads from a 5-second TTL cache. On cache miss or stale, refreshes
-        from `governance_agent_presence` looking for any row where a halt
-        marker is present under either the v0.6 (`_halted_by`) or the
-        v0.5.x back-compat (`_killed_by`) key. On DB error, falls back to
-        the existing cache (Invariant #1: never crashes the host).
+        from `governance_agent_presence` looking for any row whose dedicated
+        `halted_by` column is set. On DB error, falls back to the existing
+        cache (Invariant #1: never crashes the host).
 
         This method is the source of truth for halt state inside the SDK.
         Called by:
@@ -436,20 +633,23 @@ class PresenceModule:
     def _derive_halted_from_memory(self) -> dict[str, dict[str, Any]]:
         """Extract halt markers from the in-memory _agents fallback.
 
-        Reads BOTH `_halted_*` (v0.6) and `_killed_*` (v0.5.x back-compat)
-        keys. Prefers the new keys when both are present. Back-compat
-        branch removed in v0.7.
+        Reads ONLY the dedicated top-level ``halted_by`` / ``halted_at`` /
+        ``halt_reason`` keys written by :meth:`halt` and carried across
+        heartbeats (the in-memory analogue of the revoke-protected DB
+        columns). The legacy ``metadata`` fallback (``_halted_*`` /
+        ``_killed_*``) was removed in v0.7: the heartbeat rewrites
+        ``metadata`` wholesale, which made a marker stored there
+        self-clearable by the halted agent.
         """
         out: dict[str, dict[str, Any]] = {}
         for aid, data in self._agents.items():
-            meta = data.get("metadata") or {}
-            halted_by = meta.get("_halted_by") or meta.get("_killed_by")
+            halted_by = data.get("halted_by")
             if halted_by is None:
                 continue
             out[aid] = {
                 "halted_by": halted_by,
-                "halted_at": meta.get("_halted_at") or meta.get("_killed_at"),
-                "reason": meta.get("_halt_reason") or meta.get("_kill_reason"),
+                "halted_at": data.get("halted_at"),
+                "reason": data.get("halt_reason"),
             }
         return out
 
@@ -458,26 +658,27 @@ class PresenceModule:
     ) -> dict[str, dict[str, Any]]:
         """Query DB for all currently-halted agents.
 
-        SELECT agent_id + the three halt metadata fields. Reads BOTH key
-        families (``_halted_*`` written by v0.6, ``_killed_*`` written by
-        v0.5.x) via COALESCE so an SDK upgrade without a console upgrade
-        still fails closed. v0.7 drops the COALESCE fallback.
+        Reads ONLY the dedicated, revoke-protected ``halted_by`` /
+        ``halted_at`` / ``halt_reason`` columns written by :meth:`halt`.
+
+        The legacy metadata-key fallback (``_halted_*`` / ``_killed_*``)
+        was removed in v0.7. It was a self-unhalt vector: the agent's own
+        heartbeat rewrites ``metadata_json`` wholesale, so a halt marker
+        stored there could be cleared by the very agent it was meant to
+        stop. Migration ``a7f2haltcols`` backfilled any pre-existing
+        metadata markers into these columns, so nothing is lost — the halt
+        now lives only where the app/agent role cannot write it.
         """
         from sqlalchemy import text
 
         async with engine.connect() as conn:
             res = await conn.execute(
                 text(
-                    "SELECT agent_id, "
-                    "       COALESCE(metadata_json->>'_halted_by', "
-                    "                metadata_json->>'_killed_by') AS halted_by, "
-                    "       COALESCE(metadata_json->>'_halted_at', "
-                    "                metadata_json->>'_killed_at') AS halted_at, "
-                    "       COALESCE(metadata_json->>'_halt_reason', "
-                    "                metadata_json->>'_kill_reason') AS reason "
+                    "SELECT agent_id, halted_by, "
+                    "       halted_at::text AS halted_at, "
+                    "       halt_reason AS reason "
                     "FROM governance_agent_presence "
-                    "WHERE metadata_json->>'_halted_by' IS NOT NULL "
-                    "   OR metadata_json->>'_killed_by' IS NOT NULL"
+                    "WHERE halted_by IS NOT NULL"
                 )
             )
             rows = list(res.mappings())

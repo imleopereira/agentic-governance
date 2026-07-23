@@ -51,7 +51,10 @@ class AuditStore(ABC):
 
         Implementations:
             - InMemoryAuditStore uses a per-session asyncio.Lock
-            - PostgresAuditStore uses pg_advisory_xact_lock(hashtext(session_id))
+            - PostgresAuditStore uses pg_advisory_xact_lock over a 64-bit key
+              derived from the first 8 bytes of the session UUID (see
+              _session_lock_key) — deliberately NOT hashtext(session_id),
+              which is only 32-bit and would collide via the birthday bound
 
         Different sessions never block each other.
 

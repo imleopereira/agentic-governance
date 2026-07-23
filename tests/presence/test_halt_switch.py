@@ -3,8 +3,8 @@
 Mirrors the v0.5.4 ``test_kill_switch.py`` suite but uses the v0.6 ``halt``
 vocabulary: ``is_halted``, ``assert_not_halted``, ``AgentHaltedError``,
 ``_halted_cache``, ``_halted_cache_at``, ``force_refresh_halted_cache``,
-and the ``_halted_by`` / ``_halted_at`` / ``_halt_reason`` presence
-metadata keys.
+and the dedicated ``halted_by`` / ``halted_at`` / ``halt_reason`` presence
+columns (the in-memory analogue is the matching top-level marker keys).
 
 ``test_kill_switch.py`` stays in the tree and exercises the v0.5.x
 back-compat aliases against the same module. This file is the forward
@@ -33,7 +33,14 @@ async def _halt_agent_in_memory(
     reason: str = "test",
     halted_at: str | None = None,
 ) -> None:
-    """Simulate the console halt_agent endpoint in the in-memory store."""
+    """Halt an agent in the in-memory store via the dedicated marker.
+
+    Sets the top-level ``halted_by`` / ``halted_at`` / ``halt_reason`` keys
+    — the in-memory analogue of the revoke-protected DB columns written by
+    :meth:`PresenceModule.halt`. (Through v0.6 an operator halt was written
+    into ``metadata_json``; v0.7 moved it to dedicated columns because a
+    metadata marker was self-clearable by the agent's own heartbeat.)
+    """
     if halted_at is None:
         halted_at = datetime.now(timezone.utc).isoformat()
     async with presence._lock:
@@ -41,10 +48,9 @@ async def _halt_agent_in_memory(
             raise RuntimeError(
                 f"agent {agent_id!r} not in presence; call heartbeat() first"
             )
-        meta = presence._agents[agent_id].setdefault("metadata", {})
-        meta["_halted_by"] = halted_by
-        meta["_halted_at"] = halted_at
-        meta["_halt_reason"] = reason
+        presence._agents[agent_id]["halted_by"] = halted_by
+        presence._agents[agent_id]["halted_at"] = halted_at
+        presence._agents[agent_id]["halt_reason"] = reason
         presence._agents[agent_id]["status"] = AgentStatus.UNRESPONSIVE.value
 
 
@@ -135,17 +141,22 @@ async def test_assert_not_halted_raises_for_halted_agent(
 
 
 # ---------------------------------------------------------------------------
-# 3. v0.5.x back-compat: presence module reads `_killed_*` keys too
+# 3. v0.7: legacy `_killed_*` / `_halted_*` metadata markers are NOT honored
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_legacy_killed_metadata_still_halts_agent(
+async def test_legacy_metadata_marker_does_not_halt_agent(
     presence: PresenceModule,
 ) -> None:
-    """A presence row written by v0.5.4 with `_killed_*` keys must still
-    fail closed under v0.6. This is the upgrade-without-console-upgrade
-    case — the SDK must read BOTH key families for one release."""
+    """v0.7 reads the halt from the dedicated columns only, never metadata.
+
+    A halt marker stored in ``metadata_json`` (the pre-v0.7 representation)
+    is self-clearable by the agent's own heartbeat, so v0.7 stopped honoring
+    it. Migration a7f2haltcols backfilled any real pre-v0.7 markers into the
+    columns, so a row carrying ONLY the legacy metadata keys must now read as
+    NOT halted — otherwise the agent could re-open the self-unhalt vector by
+    writing the keys back into its own metadata."""
     await presence.heartbeat("agent-1")
     async with presence._lock:
         meta = presence._agents["agent-1"].setdefault("metadata", {})
@@ -153,11 +164,8 @@ async def test_legacy_killed_metadata_still_halts_agent(
         meta["_killed_at"] = "2026-04-14T00:00:00+00:00"
         meta["_kill_reason"] = "v0.5.4 marker"
     await presence.force_refresh_halted_cache()
-    assert await presence.is_halted("agent-1") is True
-    with pytest.raises(AgentHaltedError) as exc_info:
-        await presence.assert_not_halted("agent-1")
-    assert exc_info.value.halted_by == "legacy-op"
-    assert exc_info.value.reason == "v0.5.4 marker"
+    assert await presence.is_halted("agent-1") is False
+    await presence.assert_not_halted("agent-1")  # must not raise
 
 
 # ---------------------------------------------------------------------------

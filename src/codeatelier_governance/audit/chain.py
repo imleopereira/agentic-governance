@@ -5,6 +5,12 @@ its immutable fields PLUS the previous event's HMAC in the same session.
 This forms a tamper-evident chain: modifying any byte of any past event
 breaks the HMAC of that event AND every event that follows it.
 
+Deletion is caught by the prev_hash linkage plus a genesis check: removing an
+interior event breaks the following row's linkage, and removing the head
+leaves a non-None genesis prev_hash. The chain alone does NOT detect tail
+truncation — dropping the most-recent events leaves a self-consistent chain —
+which requires an external high-water-mark (expected head/count).
+
 Verification is constant-time via ``hmac.compare_digest``.
 """
 from __future__ import annotations
@@ -300,6 +306,11 @@ def verify_chain_with_rotation(
                           be checked because its key was unresolvable.
         * ``"ok"``         if every row verified cleanly.
 
+    Per-row HMAC only: this operates on a bounded, GLOBALLY-ordered window that
+    may span multiple sessions, so it does NOT do prev_hash linkage / genesis
+    (deletion) detection — that is session-scoped and lives in ``verify_chain``
+    / ``verify_chain_records`` / the ``governance verify`` CLI.
+
     This function does NOT modify the existing single-key
     ``verify_event`` — it composes on top of it. The off-by-one rule at
     rotation boundaries is encoded here, not in ``verify_event``.
@@ -378,6 +389,15 @@ def verify_chain_with_rotation(
             else:
                 failed += 1
 
+    # NOTE: this verifier does per-row HMAC only, deliberately NO prev_hash
+    # linkage / genesis (deletion) check. Its caller feeds a bounded window of
+    # rows ordered by the GLOBAL chain_seq that spans MULTIPLE sessions, while
+    # the prev_hash chain is per-session — so a naive cross-row linkage check
+    # would false-positive at every session boundary and at the window's head.
+    # Deletion detection is session-scoped and lives in verify_chain /
+    # verify_chain_records / the `governance verify` CLI (each given one
+    # session's full chain). Here we only need per-row tamper detection under
+    # the correct (possibly rotated) key.
     if failed > 0:
         status = "failed"
     elif unverified > 0:

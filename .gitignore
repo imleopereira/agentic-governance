@@ -35,36 +35,15 @@ htmlcov/
 # QA harness
 qa/
 
-# Console frontend build artifacts (the source in console/ DOES ship)
-console/node_modules/
-console/.next/
-console/out/
-console/.env.local
-# NOTE: console/package-lock.json IS tracked — actions/setup-node cache
-# keys off it, and supply-chain integrity demands it live with the code.
-
 # Local automation (cron scripts, logs)
 scripts/automation/logs/
 scripts/automation/*.sh
 scripts/automation/install-cron.sh
 
-# Internal planning docs (PRDs, strategy, roadmaps) — never commit to this repo
+# Internal-only local files (planning docs, personas, internal tests, local
+# tooling config) — never committed to this public repo.
 decisions/
-
-# Agent/persona definitions — local operational setup, not shipped artifact
 .agents/
-
-# Internal integration tests — hit real platform with real tokens; never
-# commit (contain ingest URLs, bearer tokens, platform Postgres creds)
 tests-internal/
-
-# Internal planning / PRDs / roadmaps co-located with this repo
 governance-internal/
-
-# Playwright test output
-console/test-results/
-console/playwright-report/
-
-# Mem Palace local tool config — file-routing rules for a local memory-
-# organisation tool, not a shipped artifact. Never commit.
 mempalace.yaml

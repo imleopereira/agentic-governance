@@ -14,9 +14,12 @@ DB-backed integration is in tests/presence/test_kill_switch_postgres.py
 (marked @pytest.mark.postgres, skipped without GOVERNANCE_TEST_DB_URL).
 
 The tests here use the in-memory PresenceModule (no engine). The kill
-cache then derives from `_agents[*]["metadata"]["_killed_by"]`, exercising
-the same `_derive_killed_from_memory()` code path that runs when
-`_get_engine()` returns None.
+cache then derives from the dedicated top-level `_agents[*]["halted_by"]`
+marker (the in-memory analogue of the revoke-protected DB columns),
+exercising the same `_derive_halted_from_memory()` code path that runs when
+`_get_engine()` returns None. Through v0.6 the marker lived in
+`metadata_json`; v0.7 moved it to dedicated columns because a metadata
+marker was self-clearable by the agent's own heartbeat.
 """
 from __future__ import annotations
 
@@ -46,12 +49,15 @@ async def _kill_agent_in_memory(
     reason: str = "test",
     killed_at: str | None = None,
 ) -> None:
-    """Simulate the console kill_agent endpoint in the in-memory store.
+    """Halt an agent in the in-memory store via the dedicated marker.
 
-    Mirrors what `console/app.py:1788-1802` does: writes `_killed_by`,
-    `_killed_at`, `_kill_reason` into metadata and sets status to
-    'unresponsive'. The presence module's kill-cache reads the metadata
-    fields, NOT the status (status is overloaded with stale-heartbeat).
+    Sets the top-level ``halted_by`` / ``halted_at`` / ``halt_reason`` keys
+    — the in-memory analogue of the revoke-protected DB columns written by
+    :meth:`PresenceModule.halt` — and sets status to 'unresponsive'. The
+    presence module's halt-cache reads the dedicated marker, NOT the status
+    (status is overloaded with stale-heartbeat). Through v0.6 this marker
+    lived in ``metadata_json``; v0.7 moved it to dedicated columns because a
+    metadata marker was self-clearable by the agent's own heartbeat.
     """
     if killed_at is None:
         killed_at = datetime.now(timezone.utc).isoformat()
@@ -60,10 +66,9 @@ async def _kill_agent_in_memory(
             raise RuntimeError(
                 f"agent {agent_id!r} not in presence; call heartbeat() first"
             )
-        meta = presence._agents[agent_id].setdefault("metadata", {})
-        meta["_killed_by"] = killed_by
-        meta["_killed_at"] = killed_at
-        meta["_kill_reason"] = reason
+        presence._agents[agent_id]["halted_by"] = killed_by
+        presence._agents[agent_id]["halted_at"] = killed_at
+        presence._agents[agent_id]["halt_reason"] = reason
         presence._agents[agent_id]["status"] = AgentStatus.UNRESPONSIVE.value
 
 
@@ -201,7 +206,7 @@ async def test_cache_warm_no_refresh_within_ttl(
     # Now mutate the in-memory store to "un-kill" without forcing a refresh.
     # If the cache is honoured, is_killed should still return True.
     async with presence._lock:
-        presence._agents["agent-1"]["metadata"].pop("_killed_by")
+        presence._agents["agent-1"].pop("halted_by", None)
     assert await presence.is_killed("agent-1") is True  # still cached
 
 
@@ -218,7 +223,7 @@ async def test_cache_refresh_after_ttl_expiry(
 
     # Un-kill in the in-memory store
     async with presence._lock:
-        presence._agents["agent-1"]["metadata"].pop("_killed_by")
+        presence._agents["agent-1"].pop("halted_by", None)
 
     # Fast-forward time past TTL by patching monotonic
     base = time.monotonic()
@@ -439,10 +444,10 @@ async def test_metadata_without_killed_marker_not_killed(
 async def test_kill_with_partial_metadata_still_kills(
     presence: PresenceModule,
 ) -> None:
-    """Even if killed_at + reason are missing, _killed_by alone triggers kill."""
+    """Even if halted_at + reason are missing, halted_by alone triggers halt."""
     await presence.heartbeat("agent-1")
     async with presence._lock:
-        presence._agents["agent-1"].setdefault("metadata", {})["_killed_by"] = "leo"
+        presence._agents["agent-1"]["halted_by"] = "leo"
     await presence.force_refresh_killed_cache()
     assert await presence.is_killed("agent-1") is True
     with pytest.raises(AgentKilledError) as exc_info:
@@ -485,17 +490,17 @@ async def test_unicode_agent_id_killed(
 async def test_un_kill_via_metadata_removal(
     presence: PresenceModule,
 ) -> None:
-    """Removing _killed_by + force_refresh restores the agent."""
+    """Removing the halt marker + force_refresh restores the agent."""
     await presence.heartbeat("agent-1")
     await _kill_agent_in_memory(presence, "agent-1")
     await presence.force_refresh_killed_cache()
     assert await presence.is_killed("agent-1") is True
 
-    # SQL-equivalent un-kill: drop the marker
+    # SQL-equivalent un-kill: drop the marker (privileged UPDATE clearing
+    # the dedicated halt columns; the app/agent role cannot do this).
     async with presence._lock:
-        meta = presence._agents["agent-1"]["metadata"]
-        for k in ("_killed_by", "_killed_at", "_kill_reason"):
-            meta.pop(k, None)
+        for k in ("halted_by", "halted_at", "halt_reason"):
+            presence._agents["agent-1"].pop(k, None)
 
     await presence.force_refresh_killed_cache()
     assert await presence.is_killed("agent-1") is False

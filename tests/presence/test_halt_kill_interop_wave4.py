@@ -1,8 +1,10 @@
 """DA Wave 4: halt/kill interop edge-case tests.
 
-Tests 9–12 from DA Wave 4 findings. Covers:
-  * _fetch_halted_from_postgres reads legacy `_killed_*` keys.
-  * _halted_* keys win over `_killed_*` when both are present.
+Tests 9–12 from DA Wave 4 findings, updated for the v0.7 columns-only halt
+marker. Covers:
+  * _fetch_halted_from_postgres reads the dedicated `halted_by` column.
+  * Legacy `_halted_*` / `_killed_*` metadata markers are NOT honored (v0.7
+    stopped reading them; a7f2haltcols backfilled real ones into columns).
   * AgentHaltedError accepts v0.5.x `killed_by=` kwargs and exposes both.
   * scope.check() on a halted agent raises AgentHaltedError (not a
     separate AgentKilledError class).
@@ -57,33 +59,37 @@ class _FakeEngine:
 
 
 @pytest.mark.asyncio
-async def test_fetch_halted_from_postgres_reads_legacy_killed_keys() -> None:
-    """A row with ONLY legacy `_killed_*` keys must still appear as halted."""
+async def test_fetch_halted_from_postgres_reads_halted_by_column() -> None:
+    """A row whose dedicated `halted_by` column is set appears as halted."""
     presence = PresenceModule()
-    # The query itself uses COALESCE(`_halted_by`, `_killed_by`) so the
-    # simulated row shape already carries the coalesced result.
+    # v0.7: the query selects the dedicated columns directly (no metadata
+    # COALESCE). The fake row carries the column values the query returns.
     engine = _FakeEngine(
         [
             {
                 "agent_id": "legacy-agent",
-                "halted_by": "operator-42",  # from _killed_by
+                "halted_by": "operator-42",
                 "halted_at": "2026-04-15T00:00:00+00:00",
-                "reason": "legacy v0.5.x halt",
+                "reason": "backfilled from a pre-v0.7 marker",
             }
         ]
     )
     result = await presence._fetch_halted_from_postgres(engine)
     assert "legacy-agent" in result
     assert result["legacy-agent"]["halted_by"] == "operator-42"
-    assert result["legacy-agent"]["reason"] == "legacy v0.5.x halt"
+    assert result["legacy-agent"]["reason"] == "backfilled from a pre-v0.7 marker"
 
 
 @pytest.mark.asyncio
-async def test_fetch_halted_from_postgres_new_key_wins_over_legacy() -> None:
-    """When BOTH keys are set, `_halted_*` wins via the query's COALESCE."""
+async def test_derive_halted_from_memory_ignores_metadata_markers() -> None:
+    """v0.7: metadata `_halted_*` / `_killed_*` markers are NOT honored.
+
+    Only the dedicated top-level marker halts an agent. A row carrying the
+    halt solely in `metadata` (which the agent's own heartbeat rewrites
+    wholesale) must derive as NOT halted, closing the self-unhalt vector.
+    """
     presence = PresenceModule()
-    # The in-memory path runs the SAME precedence rule: _halted_by wins.
-    presence._agents["dual-agent"] = {
+    presence._agents["meta-only-agent"] = {
         "metadata": {
             "_halted_by": "new-op",
             "_halted_at": "2026-04-15T12:00:00+00:00",
@@ -94,9 +100,7 @@ async def test_fetch_halted_from_postgres_new_key_wins_over_legacy() -> None:
         }
     }
     derived = presence._derive_halted_from_memory()
-    assert derived["dual-agent"]["halted_by"] == "new-op"
-    assert derived["dual-agent"]["halted_at"] == "2026-04-15T12:00:00+00:00"
-    assert derived["dual-agent"]["reason"] == "new reason"
+    assert "meta-only-agent" not in derived
 
 
 def test_agent_halted_error_killed_kwargs_compat() -> None:
@@ -123,14 +127,13 @@ async def test_scope_check_raises_halted_error_not_killed_error() -> None:
     from codeatelier_governance.scope.models import ScopePolicy
 
     presence = PresenceModule()
-    # Seed an in-memory halt marker for the agent.
+    # Seed the dedicated top-level halt marker (v0.7: metadata markers are no
+    # longer honored).
     presence._agents["halted-x"] = {
         "status": "unresponsive",
-        "metadata": {
-            "_halted_by": "op",
-            "_halted_at": "2026-04-15T00:00:00+00:00",
-            "_halt_reason": "because",
-        },
+        "halted_by": "op",
+        "halted_at": "2026-04-15T00:00:00+00:00",
+        "halt_reason": "because",
     }
     await presence.force_refresh_halted_cache()
 

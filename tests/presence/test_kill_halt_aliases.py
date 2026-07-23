@@ -90,7 +90,7 @@ async def test_is_killed_matches_is_halted(presence: PresenceModule) -> None:
     )
 
     async with presence._lock:
-        presence._agents["agent-1"].setdefault("metadata", {})["_halted_by"] = "op"
+        presence._agents["agent-1"]["halted_by"] = "op"
     await presence.force_refresh_halted_cache()
     assert await presence.is_killed("agent-1") is True
     assert await presence.is_halted("agent-1") is True
@@ -105,7 +105,7 @@ async def test_assert_alive_matches_assert_not_halted(
     await presence.assert_not_halted("agent-1")  # live → no raise
 
     async with presence._lock:
-        presence._agents["agent-1"].setdefault("metadata", {})["_halted_by"] = "op"
+        presence._agents["agent-1"]["halted_by"] = "op"
     await presence.force_refresh_halted_cache()
     with pytest.raises(AgentHaltedError):
         await presence.assert_alive("agent-1")
@@ -119,7 +119,7 @@ async def test_killed_cache_property_proxies_halted_cache(
 ) -> None:
     await presence.heartbeat("agent-1")
     async with presence._lock:
-        presence._agents["agent-1"].setdefault("metadata", {})["_halted_by"] = "op"
+        presence._agents["agent-1"]["halted_by"] = "op"
     await presence.force_refresh_halted_cache()
 
     # Read side: legacy name returns v0.5.x-shaped entries.

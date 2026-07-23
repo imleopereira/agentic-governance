@@ -9,9 +9,16 @@ Usage::
     handler = GovernanceCallbackHandler(sdk=sdk, agent_id="my-agent")
     # Pass handler to LangChain as a callback
 
-The handler is an OBSERVATION surface: it never raises to LangChain even if
-the governance SDK has an internal failure. Every callback body is wrapped in
-try/except that logs and continues.
+Internal SDK failures never raise to LangChain: every callback body is wrapped
+in try/except that logs and continues. Enforcement is the exception. An
+operator halt (``AgentHaltedError``) raises to stop the tool even when
+``enforce=False`` (the kill switch is not gated on enforce); with
+``enforce=True`` a scope violation or default-deny (no scope policy registered)
+also raises. BOTH block reliably on the async callbacks and on sync callbacks
+run OUTSIDE a running event loop. Inside a running loop a sync callback cannot
+block, so it degrades to log-and-warn there (the check still runs and the
+violation is still logged, but the tool is not stopped inline); use the async
+callbacks for guaranteed enforcement, including the halt.
 """
 from __future__ import annotations
 
@@ -30,7 +37,8 @@ except ImportError:
 
 
 from codeatelier_governance.audit.models import AuditEvent
-from codeatelier_governance.scope.errors import ScopeViolation
+from codeatelier_governance.presence import AgentHaltedError
+from codeatelier_governance.scope.errors import PolicyNotRegistered, ScopeViolation
 
 from typing import TYPE_CHECKING
 
@@ -38,6 +46,21 @@ if TYPE_CHECKING:
     from codeatelier_governance.sdk import GovernanceSDK
 
 logger = structlog.get_logger(__name__)
+
+
+_warned_degraded_enforcement = False
+
+
+def _log_task_exception(task: Any) -> None:
+    """Surface an error from a fire-and-forget governance task (no silent drop)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "langchain.deferred_governance_error",
+            error_type=type(exc).__name__,
+        )
 
 
 def _run_async(coro: Any) -> Any:
@@ -48,9 +71,25 @@ def _run_async(coro: Any) -> Any:
         loop = None
 
     if loop is not None and loop.is_running():
-        # We're inside a running loop — schedule as a task.
-        # This happens when LangChain calls sync callbacks from async code.
+        # Inside a running loop (LangChain dispatched a SYNC callback from
+        # async code), so we cannot block on the coroutine to completion:
+        # scope enforcement here is NON-BLOCKING, a ScopeViolation raised
+        # inside the task cannot stop the tool call inline. Warn once and
+        # surface any error via a done-callback rather than dropping it
+        # silently. Use the async callbacks for guaranteed enforcement.
+        global _warned_degraded_enforcement
+        if not _warned_degraded_enforcement:
+            _warned_degraded_enforcement = True
+            logger.warning(
+                "langchain.enforcement_non_blocking",
+                detail=(
+                    "sync callback dispatched inside a running event loop; "
+                    "scope enforcement is non-blocking in this context. Use "
+                    "the async callbacks for guaranteed enforcement."
+                ),
+            )
         future = asyncio.ensure_future(coro)
+        future.add_done_callback(_log_task_exception)
         return future
     else:
         return asyncio.run(coro)
@@ -59,12 +98,28 @@ def _run_async(coro: Any) -> Any:
 class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
     """LangChain callback handler that maps hooks to governance audit events.
 
-    All callbacks are wrapped in try/except: the handler never raises to
-    LangChain. Scope violations are logged as audit events but not raised.
+    Observation surfaces (audit.log, cost.track) never raise: internal SDK
+    failures are logged and swallowed so the handler never breaks the host
+    agent. Enforcement is the exception:
+
+      * An operator halt (``AgentHaltedError``) raises to stop the tool even
+        when ``enforce=False`` (the kill switch is not gated on enforce).
+      * With ``enforce=True``, a scope violation or default-deny (no policy
+        registered for the agent) also raises.
+      * Both block reliably on the async callbacks (``aon_tool_start`` …) and
+        on sync callbacks run OUTSIDE a running event loop. Inside a running
+        loop a sync callback cannot block, so it degrades to log-and-warn
+        there; use the async callbacks for guaranteed enforcement (halt
+        included).
 
     Args:
         sdk: The initialized GovernanceSDK instance.
         agent_id: The agent identifier for audit and scope checks.
+        enforce: When True, scope violations and default-deny raise from the
+            tool callbacks (an operator halt raises regardless). Default False
+            (observe only).
+        session_id: Session UUID for loop detection and cost tracking;
+            generated if not provided.
     """
 
     def __init__(
@@ -106,15 +161,47 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             )
 
     async def _scope_check(self, tool_name: str) -> None:
-        """Run a scope check. Logs violations; re-raises when enforce=True."""
+        """Run the halt + scope checks. Halt raises regardless of enforce; scope/policy under enforce.
+
+        ``sdk.scope.check`` runs the operator-halt check first, then the scope
+        policy. The operator halt is a kill switch: it raises regardless of
+        ``enforce``, so it is not gated on observation mode. Like scope, though,
+        it only blocks reliably on the async callbacks and on sync callbacks run
+        OUTSIDE a running event loop; inside a running loop a sync callback
+        cannot block, so the halt degrades to log-and-warn there (the check
+        still runs and the halt is still logged, but the tool is not stopped
+        inline). A scope violation or default-deny (no policy registered for the
+        agent) propagates only when ``enforce=True``; otherwise it is logged and
+        the handler observes without blocking. Use the async callbacks for
+        guaranteed enforcement, including the halt.
+        """
         try:
             await self._sdk.scope.check(self._agent_id, tool=tool_name)
+        except AgentHaltedError:
+            # Kill switch: always stop the tool, regardless of enforce.
+            logger.warning(
+                "governance.langchain_handler.halted",
+                agent_id=self._agent_id,
+                tool=tool_name,
+            )
+            raise
         except ScopeViolation:
             # Already logged by scope module as scope.violation audit event.
             logger.warning(
                 "governance.langchain_handler.scope_violation",
                 agent_id=self._agent_id,
                 tool=tool_name,
+            )
+            if self._enforce:
+                raise
+        except PolicyNotRegistered:
+            # Default-deny: no scope policy for this agent. Fail-closed under
+            # enforce, matching filter_tools() on the LLM-start path.
+            logger.warning(
+                "governance.langchain_handler.scope_not_registered",
+                agent_id=self._agent_id,
+                tool=tool_name,
+                detail="No scope policy registered for this agent.",
             )
             if self._enforce:
                 raise
@@ -371,7 +458,10 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             _run_async(
                 self._audit_log("tool.call", {"tool": str(tool_name)})
             )
-        except ScopeViolation:
+        except AgentHaltedError:
+            # Kill switch: always stop the tool (see _scope_check).
+            raise
+        except (ScopeViolation, PolicyNotRegistered):
             if self._enforce:
                 raise
         except Exception as exc:  # noqa: BLE001
@@ -564,7 +654,10 @@ class GovernanceCallbackHandler(BaseCallbackHandler):  # type: ignore[misc]
             await self._scope_check(str(tool_name))
             await self._loop_record(str(tool_name))
             await self._audit_log("tool.call", {"tool": str(tool_name)})
-        except ScopeViolation:
+        except AgentHaltedError:
+            # Kill switch: always stop the tool (see _scope_check).
+            raise
+        except (ScopeViolation, PolicyNotRegistered):
             if self._enforce:
                 raise
         except Exception as exc:  # noqa: BLE001

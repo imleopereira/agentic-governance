@@ -211,7 +211,17 @@ async def _run_migrate(database_url: str) -> None:
 
 
 async def _run_verify(database_url: str, session_id: UUID) -> int:
-    """Walk the HMAC chain for a session. Returns exit code 0 (clean) or 1 (tampered)."""
+    """Verify the HMAC chain for a session. Returns 0 (clean) or 1 (tampered).
+
+    Checks, in order: the genesis row (the first event's prev_hash must be
+    None), each row's HMAC, and the prev_hash -> hmac linkage between
+    consecutive rows. This detects in-place tampering, head deletion, interior
+    deletion, and reordering. It does NOT detect tail truncation — dropping the
+    newest events leaves a self-consistent chain, which requires an external
+    high-water-mark — and it verifies under the current GOVERNANCE_AUDIT_SECRET
+    only: a chain that spans a key rotation needs the library's rotation-aware
+    verifier (``audit.chain.verify_chain_with_rotation``).
+    """
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -247,8 +257,8 @@ async def _run_verify(database_url: str, session_id: UUID) -> int:
             sys.stderr.write(f"No events found for session {session_id}.\n")
             return 1
 
-        for row in rows:
-            record = AuditEventRecord(
+        records = [
+            AuditEventRecord(
                 event_id=row["event_id"],
                 session_id=row["session_id"],
                 agent_id=row["agent_id"],
@@ -261,12 +271,35 @@ async def _run_verify(database_url: str, session_id: UUID) -> int:
                 hmac=row["hmac_value"],
                 created_at=row["created_at"],
             )
+            for row in rows
+        ]
+
+        # Genesis: the session's first event must have no predecessor. A
+        # non-None head means the true first event(s) were deleted.
+        if records[0].prev_hash is not None:
+            sys.stdout.write(
+                f"TAMPERED: chain head truncated for session {session_id} "
+                f"(first event {records[0].event_id} has a prev_hash; earlier "
+                f"events were deleted).\n"
+            )
+            return 1
+
+        # Per-row HMAC + prev_hash -> hmac linkage. Linkage catches deletion of
+        # an interior event that leaves every surviving row individually valid.
+        for i, record in enumerate(records):
             if not verify_event(record, secret):
                 sys.stdout.write(f"TAMPERED: {record.event_id}\n")
                 return 1
+            if i > 0 and record.prev_hash != records[i - 1].hmac:
+                sys.stdout.write(
+                    f"TAMPERED: chain gap before event {record.event_id} "
+                    f"(prev_hash does not match the preceding event; an event "
+                    f"was deleted).\n"
+                )
+                return 1
 
         sys.stdout.write(
-            f"OK: {len(rows)} events verified for session {session_id}.\n"
+            f"OK: {len(records)} events verified for session {session_id}.\n"
         )
         return 0
     finally:

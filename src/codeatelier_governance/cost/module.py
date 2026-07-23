@@ -552,8 +552,14 @@ class CostModule:
         When ``projected_tokens`` is provided, the check is forward-looking:
         it evaluates ``current_balance + projected_tokens > limit`` instead
         of just ``current_balance > limit``. This ensures the LAST call
-        before a hard limit is also blocked, eliminating the one-call-behind
+        before the limit is also blocked, eliminating the one-call-behind
         gap in the previous implementation.
+
+        Concurrency caveat: this is a check-then-track gate with no reservation,
+        so under CONCURRENT calls the cap is a SOFT ceiling, not a hard limit —
+        N callers can each pass the check before any of them tracks, overshooting
+        by up to (N-1) x per-call cost. See
+        ``PostgresCostStore.get_session_and_daily_usage`` for the full analysis.
 
         **Fail-closed semantics on storage failure.** If we cannot read the
         counter (DB unreachable, query timeout, etc.) we cannot verify the

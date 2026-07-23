@@ -251,3 +251,70 @@ async def test_enforce_false_does_not_raise(
         if ev and ev.kind == "scope.violation":
             events.append(ev)
     assert len(events) >= 1
+
+
+# -- Operator halt (kill switch) + default-deny enforcement -------------------
+
+
+async def _wire_halted_agent(sdk: FakeSDK, agent_id: str) -> None:
+    """Wire an in-memory presence module into scope and halt the agent."""
+    from codeatelier_governance.presence import PresenceModule
+
+    presence = PresenceModule()
+    await presence.heartbeat(agent_id)
+    await presence.halt(agent_id, halted_by="operator", reason="incident")
+    await presence.force_refresh_halted_cache()
+    sdk.scope.set_presence_module(presence)
+
+
+@pytest.mark.asyncio
+async def test_operator_halt_raises_even_without_enforce(sdk: FakeSDK) -> None:
+    """An operator halt is a kill switch: it stops the tool even with enforce=False."""
+    from codeatelier_governance.presence import AgentHaltedError
+
+    await _wire_halted_agent(sdk, "test-agent")
+    handler = GovernanceCallbackHandler(  # type: ignore[arg-type]
+        sdk=sdk, agent_id="test-agent", enforce=False
+    )
+
+    # "read_file" is an ALLOWED tool, so only the halt can stop it.
+    with pytest.raises(AgentHaltedError):
+        await handler.aon_tool_start(serialized={"name": "read_file"}, input_str="x")
+
+
+@pytest.mark.asyncio
+async def test_operator_halt_raises_with_enforce(sdk: FakeSDK) -> None:
+    """The halt also raises under enforce=True via the async callback."""
+    from codeatelier_governance.presence import AgentHaltedError
+
+    await _wire_halted_agent(sdk, "test-agent")
+    handler = GovernanceCallbackHandler(  # type: ignore[arg-type]
+        sdk=sdk, agent_id="test-agent", enforce=True
+    )
+
+    with pytest.raises(AgentHaltedError):
+        await handler.aon_tool_start(serialized={"name": "read_file"}, input_str="x")
+
+
+@pytest.mark.asyncio
+async def test_default_deny_raises_under_enforce(sdk: FakeSDK) -> None:
+    """An unregistered agent's tool is default-denied under enforce=True."""
+    from codeatelier_governance.scope.errors import PolicyNotRegistered
+
+    handler = GovernanceCallbackHandler(  # type: ignore[arg-type]
+        sdk=sdk, agent_id="no-policy-agent", enforce=True
+    )
+
+    with pytest.raises(PolicyNotRegistered):
+        await handler.aon_tool_start(serialized={"name": "read_file"}, input_str="x")
+
+
+@pytest.mark.asyncio
+async def test_default_deny_observed_without_enforce(sdk: FakeSDK) -> None:
+    """Without enforce, an unregistered agent's tool is logged but not blocked."""
+    handler = GovernanceCallbackHandler(  # type: ignore[arg-type]
+        sdk=sdk, agent_id="no-policy-agent", enforce=False
+    )
+
+    # Must NOT raise.
+    await handler.aon_tool_start(serialized={"name": "read_file"}, input_str="x")
