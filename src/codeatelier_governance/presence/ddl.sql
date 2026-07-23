@@ -46,3 +46,26 @@ CREATE TABLE IF NOT EXISTS governance_agent_presence (
 REVOKE UPDATE ON governance_agent_presence FROM PUBLIC;
 GRANT UPDATE (status, last_heartbeat, metadata_json, operator_id)
     ON governance_agent_presence TO PUBLIC;
+
+-- SECURITY (self-unhalt defense, part 2): a halted agent's row must not be
+-- DELETE-able. Unlike the heartbeat UPDATE, DELETE is table-level and cannot
+-- be revoked per column, so close_agent could otherwise delete the whole row
+-- (halt marker included) and a re-INSERT would recreate it unhalted. This
+-- trigger refuses to delete a row while it carries an operator halt marker;
+-- an operator must clear the halt first (a privileged UPDATE the app role
+-- cannot make). Non-halted rows delete normally, so close_agent still works.
+CREATE OR REPLACE FUNCTION governance_presence_no_delete_while_halted()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.halted_by IS NOT NULL THEN
+        RAISE EXCEPTION 'governance_agent_presence: cannot delete a halted agent (halted_by=%); clear the halt first', OLD.halted_by;
+    END IF;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_presence_no_delete_halted ON governance_agent_presence;
+CREATE TRIGGER trg_presence_no_delete_halted
+    BEFORE DELETE ON governance_agent_presence
+    FOR EACH ROW
+    EXECUTE FUNCTION governance_presence_no_delete_while_halted();

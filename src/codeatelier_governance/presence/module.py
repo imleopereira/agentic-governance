@@ -228,6 +228,12 @@ class PresenceModule:
 
     async def _close_agent_memory(self, agent_id: str) -> None:
         async with self._lock:
+            existing = self._agents.get(agent_id)
+            # SECURITY (self-unhalt defense): a halted agent is NOT removed,
+            # mirroring the DB trigger, so it cannot close-then-heartbeat to
+            # clear its own halt. Clear the halt first to close it.
+            if existing is not None and existing.get("halted_by") is not None:
+                return
             self._agents.pop(agent_id, None)
 
     async def _close_agent_postgres(self, engine: Any, agent_id: str) -> None:
@@ -235,10 +241,13 @@ class PresenceModule:
 
         try:
             async with engine.begin() as conn:
+                # SECURITY (self-unhalt defense): only delete a NON-halted
+                # row, so a halted agent cannot close-then-heartbeat to clear
+                # its own halt. A DB trigger enforces this against raw DELETE.
                 await conn.execute(
                     text(
                         "DELETE FROM governance_agent_presence "
-                        "WHERE agent_id = :agent_id"
+                        "WHERE agent_id = :agent_id AND halted_by IS NULL"
                     ),
                     {"agent_id": agent_id},
                 )

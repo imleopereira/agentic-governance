@@ -68,3 +68,31 @@ async def test_heartbeat_after_halt_still_applies_new_metadata(
 
     await presence.force_refresh_halted_cache()
     assert await presence.is_halted("agent-1") is True
+
+
+@pytest.mark.asyncio
+async def test_close_agent_after_halt_cannot_clear_halt(
+    presence: PresenceModule,
+) -> None:
+    """A halted agent must not clear its own halt via close_agent + heartbeat.
+
+    close_agent() removes the presence row and a following heartbeat
+    re-creates it. On the first fix (which only guarded the heartbeat UPDATE)
+    the recreated row came back unhalted. The halt must survive this second
+    write path too: close_agent refuses to remove a halted agent in memory,
+    and a BEFORE DELETE trigger blocks the DELETE in Postgres.
+    """
+    await presence.heartbeat("agent-1")
+    await presence.halt("agent-1", halted_by="leo", reason="incident")
+    await presence.force_refresh_halted_cache()
+    assert await presence.is_halted("agent-1") is True
+
+    # The self-unhalt attempt via a different write path: close, then beat.
+    await presence.close_agent("agent-1")
+    await presence.heartbeat("agent-1", metadata={"foo": "bar"})
+    await presence.force_refresh_halted_cache()
+
+    assert await presence.is_halted("agent-1") is True
+    with pytest.raises(AgentHaltedError) as exc_info:
+        await presence.assert_not_halted("agent-1")
+    assert exc_info.value.halted_by == "leo"
