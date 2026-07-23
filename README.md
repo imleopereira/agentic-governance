@@ -206,6 +206,11 @@ from codeatelier_governance.integrations.langchain_handler import GovernanceCall
 handler = GovernanceCallbackHandler(sdk=sdk, agent_id="my-agent", enforce=True)
 ```
 
+LangChain enforcement (`enforce=True`) raises on a scope violation through the
+async callbacks, which is the common async-agent path. In a sync callback
+dispatched from inside a running event loop it logs and warns rather than
+blocking, so use the async callbacks for guaranteed enforcement.
+
 ## CLI
 
 ```bash

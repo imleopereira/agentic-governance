@@ -9,9 +9,12 @@ Usage::
     handler = GovernanceCallbackHandler(sdk=sdk, agent_id="my-agent")
     # Pass handler to LangChain as a callback
 
-The handler is an OBSERVATION surface: it never raises to LangChain even if
-the governance SDK has an internal failure. Every callback body is wrapped in
-try/except that logs and continues.
+Internal SDK failures never raise to LangChain: every callback body is wrapped
+in try/except that logs and continues. With ``enforce=True``, scope violations
+DO raise to stop the tool: on the async callbacks always, and on sync callbacks
+outside a running event loop. Inside a running loop a sync callback cannot
+block, so enforcement there degrades to log-and-warn; use the async callbacks
+for guaranteed enforcement.
 """
 from __future__ import annotations
 
@@ -40,6 +43,21 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+_warned_degraded_enforcement = False
+
+
+def _log_task_exception(task: Any) -> None:
+    """Surface an error from a fire-and-forget governance task (no silent drop)."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "langchain.deferred_governance_error",
+            error_type=type(exc).__name__,
+        )
+
+
 def _run_async(coro: Any) -> Any:
     """Run an async coroutine from a sync context, handling event loop scenarios."""
     try:
@@ -48,9 +66,25 @@ def _run_async(coro: Any) -> Any:
         loop = None
 
     if loop is not None and loop.is_running():
-        # We're inside a running loop — schedule as a task.
-        # This happens when LangChain calls sync callbacks from async code.
+        # Inside a running loop (LangChain dispatched a SYNC callback from
+        # async code), so we cannot block on the coroutine to completion:
+        # scope enforcement here is NON-BLOCKING, a ScopeViolation raised
+        # inside the task cannot stop the tool call inline. Warn once and
+        # surface any error via a done-callback rather than dropping it
+        # silently. Use the async callbacks for guaranteed enforcement.
+        global _warned_degraded_enforcement
+        if not _warned_degraded_enforcement:
+            _warned_degraded_enforcement = True
+            logger.warning(
+                "langchain.enforcement_non_blocking",
+                detail=(
+                    "sync callback dispatched inside a running event loop; "
+                    "scope enforcement is non-blocking in this context. Use "
+                    "the async callbacks for guaranteed enforcement."
+                ),
+            )
         future = asyncio.ensure_future(coro)
+        future.add_done_callback(_log_task_exception)
         return future
     else:
         return asyncio.run(coro)
